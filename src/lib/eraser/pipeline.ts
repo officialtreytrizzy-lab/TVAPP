@@ -1,6 +1,6 @@
 // Orchestrates the REAL in-browser object-removal pipeline and drives the
 // one-folder local job state machine with real progress at each phase.
-// Reapplied on top of the current main branch so object-mask segmentation stays wired before tracking.
+// Precision mode: keep user masks tight, track only selected pixels, and avoid temporal blur smearing.
 import { extractFrames } from './frames';
 import { expandScribbleToObjectMask, countMaskPixels } from './segment';
 import { trackMask, smoothMasks } from './track';
@@ -61,11 +61,9 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   const { jobId, video, sourceUrl, fps, duration, selectedTime, maskCanvas, cancelRef, onPhase } = input;
   const guard = () => { if (cancelRef.cancelled) throw new Error('__CANCELLED__'); };
 
-  // mask_ready -> segmenting (build clean binary mask from scribble)
   guard();
-  await step(jobId, 'segmenting', 24, 'Segmenting object from your mark...', 'segmenting: scribble -> local object mask', onPhase);
+  await step(jobId, 'segmenting', 24, 'Preparing tight object mask from your mark...', 'segmenting: tight user mask -> selected target', onPhase);
 
-  // extract frames at a higher working resolution (better fills) while staying tractable.
   const ext = await extractFrames(
     video,
     { fps, duration, maxSide: 960, maxFrames: 300 },
@@ -75,7 +73,6 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   guard();
   const { frames, timestamps, procW, procH, frameCount } = ext;
 
-  // map selected time to nearest extracted frame
   let keyIndex = 0;
   let bestDt = Infinity;
   for (let i = 0; i < timestamps.length; i++) {
@@ -94,20 +91,17 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   await eraserApi.progress({
     jobId,
     progress: 32,
-    statusMessage: 'Object mask built on keyframe.',
-    log: `keyframe=${keyIndex} scribble px=${scribblePx} object mask px=${keyMaskPx}`,
+    statusMessage: 'Tight mask built on keyframe.',
+    log: `keyframe=${keyIndex} scribble px=${scribblePx} tight mask px=${keyMaskPx}`,
   });
 
-  // segmenting -> tracking_mask
   guard();
-  await step(jobId, 'tracking_mask', 36, 'Tracking marked object across the full clip...', 'tracking_mask: guarded local block tracking', onPhase);
+  await step(jobId, 'tracking_mask', 36, 'Tracking only the pixels you selected...', 'tracking_mask: selected-pixel matching', onPhase);
   const { masks, confidence } = trackMask(frames, keyIndex, keyMask, (frac) =>
-    onPhase?.('tracking_mask', 36 + frac * 12, `Tracking object (${Math.round(frac * 100)}%)...`)
+    onPhase?.('tracking_mask', 36 + frac * 12, `Tracking selected pixels (${Math.round(frac * 100)}%)...`)
   );
   guard();
 
-  // Flag low-confidence ranges so the UI can ask for a correction keyframe instead
-  // of blindly erasing the wrong area.
   const lowConfidenceFrames: number[] = [];
   for (let i = 0; i < confidence.length; i++) {
     const m = masks[i];
@@ -118,18 +112,16 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   const lcLog = lowConfidenceFrames.length
     ? `low tracking confidence on ${lowConfidenceFrames.length} frame(s), first @ frame ${lowConfidenceFrames[0]}`
     : 'tracking confidence OK on all masked frames';
-  await eraserApi.progress({ jobId, progress: 50, statusMessage: 'Object tracked through clip.', log: `tracked ${masks.length} frames; ${lcLog}` });
+  await eraserApi.progress({ jobId, progress: 50, statusMessage: 'Selected target tracked through clip.', log: `tracked ${masks.length} frames; ${lcLog}` });
   if (lowConfidenceFrames.length) {
-    onPhase?.('tracking_mask', 50, `Tracking confidence dropped around frame ${lowConfidenceFrames[0]}. Add another keyframe if the preview misses the object.`);
+    onPhase?.('tracking_mask', 50, `Tracking confidence dropped around frame ${lowConfidenceFrames[0]}. Add another keyframe if the preview misses the target.`);
   }
 
-  // tracking_mask -> smoothing_masks
-  await step(jobId, 'smoothing_masks', 52, 'Smoothing masks over time...', 'smoothing_masks: temporal hole fill', onPhase);
+  await step(jobId, 'smoothing_masks', 52, 'Checking for tiny mask gaps...', 'smoothing_masks: minimal temporal gap fill', onPhase);
   const smoothed = smoothMasks(masks, procW, procH);
   guard();
 
-  // smoothing_masks -> inpainting
-  await step(jobId, 'inpainting', 54, 'Inpainting removed region across frames...', 'inpainting: PDE/diffusion fill', onPhase);
+  await step(jobId, 'inpainting', 54, 'Filling the selected pixels without extra blur...', 'inpainting: tight fill no temporal smear', onPhase);
   const inpaintedFrames: ImageData[] = new Array(frameCount);
   for (let i = 0; i < frameCount; i++) {
     guard();
@@ -137,7 +129,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
     const copy = new ImageData(new Uint8ClampedArray(src.data), src.width, src.height);
     const m = smoothed[i];
     const hasMask = m.some((v) => v === 1);
-    if (hasMask) inpaint(copy, m, { iterations: 50, feather: 3 });
+    if (hasMask) inpaint(copy, m, { iterations: 16, feather: 1, grow: 0 });
     inpaintedFrames[i] = copy;
     const frac = (i + 1) / frameCount;
     const p = 54 + frac * 26;
@@ -147,28 +139,12 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
     onPhase?.('inpainting', p, `Inpainting frames (${i + 1}/${frameCount})...`);
   }
 
-  // temporal flicker reduction: blend each inpainted-masked pixel with neighbours
-  for (let i = 1; i < frameCount - 1; i++) {
-    const m = smoothed[i];
-    const a = inpaintedFrames[i - 1].data;
-    const b = inpaintedFrames[i].data;
-    const c = inpaintedFrames[i + 1].data;
-    for (let p = 0; p < procW * procH; p++) {
-      if (!m[p]) continue;
-      const o = p * 4;
-      b[o] = (a[o] + 2 * b[o] + c[o]) / 4;
-      b[o + 1] = (a[o + 1] + 2 * b[o + 1] + c[o + 1]) / 4;
-      b[o + 2] = (a[o + 2] + 2 * b[o + 2] + c[o + 2]) / 4;
-    }
-  }
+  // Do not temporally blend inpainted pixels. Averaging neighbouring frames made
+  // the cleaned area look like a visible moving blur/smear.
 
-  // inpainting -> rebuilding_video
   guard();
   await step(jobId, 'rebuilding_video', 82, 'Rebuilding video from processed frames...', 'rebuilding_video: encode at original FPS', onPhase);
 
-  // Output at the ORIGINAL source resolution (no silent downgrade). We render each
-  // processed (proc-res) frame onto a small buffer, then scale it up to the source
-  // dimensions on the export canvas, preserving the original aspect ratio.
   const outW = video.videoWidth || procW;
   const outH = video.videoHeight || procH;
   const procBuf = document.createElement('canvas');
@@ -187,11 +163,9 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
       }
     }
     procCtx.putImageData(inpaintedFrames[idx], 0, 0);
-    // scale proc frame up to source resolution (aspect ratio identical -> no distortion)
     ctx.drawImage(procBuf, 0, 0, procW, procH, 0, 0, outW, outH);
   };
 
-  // attaching_audio + generating_preview happen inside encode (audio muxed in)
   await step(jobId, 'attaching_audio', 90, 'Reattaching original audio...', 'attaching_audio: muxing source audio track', onPhase);
   await step(jobId, 'generating_preview', 94, 'Generating preview & final export...', 'generating_preview: MediaRecorder mux', onPhase);
 
@@ -208,13 +182,10 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
 
   await eraserApi.progress({ jobId, progress: 97, statusMessage: 'Saving cleaned video locally...', log: `encoded ${outW}x${outH} mime=${enc.mimeType} audio=${enc.hasAudio ? 'yes' : 'no'}` });
 
-  // Persist the REAL file into IndexedDB so the result survives a refresh in this browser.
-  // The tab-local blob URL is kept only for instant in-session preview/download.
   let savedUrl = '';
   try {
     savedUrl = await eraserApi.uploadOutput(jobId, enc.blob, enc.mimeType);
   } catch (e) {
-    // If local save fails, fall back to the blob URL for this session but log it.
     await eraserApi.progress({ jobId, statusMessage: 'Cleaned video ready (local save failed; session-only URL).', log: `local output save failed: ${(e as Error).message}` });
   }
 
