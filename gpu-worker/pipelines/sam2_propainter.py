@@ -1,17 +1,14 @@
 """Static-mask ProPainter pipeline for the Modal video eraser worker.
 
-This version targets the current failing case: a small fixed sparkle/logo near
-the bottom-right of the video. It prepares the uploaded mask as a static video
-mask, calls the real ProPainter inference script when available, and muxes the
-result back with the original audio.
-
-For moving objects, the next layer is SAM2 mask propagation before this
-ProPainter step. For fixed logos/watermarks, this static mask path is the right
-first production route.
+This version targets fixed logo/watermark cleanup first. It prepares the
+uploaded mask as a static video mask, calls ProPainter, then restores the result
+back to the source video's resolution, frame rate, and audio. The frontend can
+request either source-quality export or a higher-quality/lower-compression MP4.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -30,7 +27,7 @@ def required_env(name: str) -> str:
     return value
 
 
-def run(cmd: list[str], cwd: Path | None = None) -> None:
+def run(cmd: list[str], cwd: Path | None = None) -> str:
     completed = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -40,6 +37,7 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stdout[-6000:] or f"Command failed: {' '.join(cmd)}")
+    return completed.stdout
 
 
 def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -60,6 +58,36 @@ def read_video_meta(input_video: Path) -> tuple[float, int, int]:
     if width <= 0 or height <= 0:
         raise RuntimeError("Could not read video dimensions")
     return fps, width, height
+
+
+def ffprobe_json(input_video: Path) -> dict:
+    try:
+        out = run([
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(input_video),
+        ])
+        return json.loads(out)
+    except Exception:
+        return {}
+
+
+def source_video_bitrate(input_video: Path) -> int | None:
+    meta = ffprobe_json(input_video)
+    for stream in meta.get("streams", []):
+        if stream.get("codec_type") == "video":
+            bit_rate = stream.get("bit_rate")
+            if bit_rate and str(bit_rate).isdigit():
+                return int(bit_rate)
+    bit_rate = meta.get("format", {}).get("bit_rate")
+    if bit_rate and str(bit_rate).isdigit():
+        return int(bit_rate)
+    return None
 
 
 def prepare_source_mp4(input_video: Path, source_mp4: Path) -> None:
@@ -94,17 +122,16 @@ def prepare_source_mp4(input_video: Path, source_mp4: Path) -> None:
             "-preset",
             "veryfast",
             "-crf",
-            "20",
+            "18",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "160k",
+            "192k",
             "-shortest",
             str(source_mp4),
         ])
-
 
 
 def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: int) -> None:
@@ -155,14 +182,22 @@ def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: 
     cv2.imwrite(str(output_mask), clipped)
 
 
-def processing_size(width: int, height: int) -> tuple[int, int]:
-    # ProPainter memory requirements are high. Keep vertical clips reasonable for
-    # A10G while preserving aspect ratio. Values must be divisible by 8.
-    max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", "768"))
+def processing_size(width: int, height: int, quality: str) -> tuple[int, int]:
+    # Default to source dimensions for 720x1280-style clips so ProPainter does
+    # not unnecessarily downgrade the render. Env override is still available
+    # if a GPU needs a lower cap.
+    default_max_side = max(width, height)
+    if quality == "higher":
+        default_max_side = max(default_max_side, 1440)
+    max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", str(default_max_side)))
     scale = min(1.0, max_side / max(width, height))
     proc_w = max(8, int(width * scale) // 8 * 8)
     proc_h = max(8, int(height * scale) // 8 * 8)
     return proc_w, proc_h
+
+
+def even_dimension(value: int) -> int:
+    return value if value % 2 == 0 else value - 1
 
 
 def find_propainter_output(result_root: Path) -> Path:
@@ -172,9 +207,28 @@ def find_propainter_output(result_root: Path) -> Path:
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path) -> None:
+def export_settings(quality: str, source_bitrate: int | None) -> tuple[str, str, list[str]]:
+    if quality == "higher":
+        # Lower CRF = less compression. Higher mode can create a larger file,
+        # but it avoids adding compression noise after inpainting.
+        return "slow", "11", ["-b:a", "256k"]
+
+    # Source mode keeps the same dimensions/fps/audio and uses a high-quality
+    # encode. If source bitrate is known, avoid going below it.
+    if source_bitrate and source_bitrate > 0:
+        target = max(source_bitrate, 8_000_000)
+        return "medium", "14", ["-b:a", "192k", "-maxrate", str(int(target * 1.35)), "-bufsize", str(int(target * 2))]
+    return "medium", "14", ["-b:a", "192k"]
+
+
+def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, width: int, height: int, fps: float, quality: str) -> None:
+    out_w = even_dimension(width)
+    out_h = even_dimension(height)
+    preset, crf, audio_args = export_settings(quality, source_video_bitrate(source_video))
+    vf = f"scale={out_w}:{out_h}:flags=lanczos,fps={fps:.6f}"
+
     try:
-        run([
+        cmd = [
             "ffmpeg",
             "-y",
             "-i",
@@ -185,36 +239,40 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path) -> 
             "0:v:0",
             "-map",
             "1:a?",
+            "-vf",
+            vf,
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            preset,
             "-crf",
-            "18",
+            crf,
             "-pix_fmt",
             "yuv420p",
             "-movflags",
             "+faststart",
             "-c:a",
             "aac",
-            "-b:a",
-            "160k",
+            *audio_args,
             "-shortest",
             str(output_video),
-        ])
+        ]
+        run(cmd)
     except Exception:
-        # No audio or mux failure: still return playable video.
+        # No audio or mux failure: still return a playable video at source size/fps.
         run([
             "ffmpeg",
             "-y",
             "-i",
             str(inpainted_video),
+            "-vf",
+            vf,
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            preset,
             "-crf",
-            "18",
+            crf,
             "-pix_fmt",
             "yuv420p",
             "-movflags",
@@ -223,7 +281,7 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path) -> 
         ])
 
 
-def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: int, height: int) -> Path:
+def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
         raise RuntimeError(
@@ -235,7 +293,7 @@ def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: i
         shutil.rmtree(result_root)
     result_root.mkdir(parents=True, exist_ok=True)
 
-    proc_w, proc_h = processing_size(width, height)
+    proc_w, proc_h = processing_size(width, height, quality)
     cmd = [
         "python",
         str(inference),
@@ -267,6 +325,9 @@ def main() -> None:
     input_video = Path(required_env("ERASER_INPUT_VIDEO"))
     input_mask = Path(required_env("ERASER_INPUT_MASK"))
     output_video = Path(required_env("ERASER_OUTPUT_VIDEO"))
+    output_quality = os.environ.get("ERASER_OUTPUT_QUALITY", "source").strip().lower()
+    if output_quality not in {"source", "higher"}:
+        output_quality = "source"
     output_video.parent.mkdir(parents=True, exist_ok=True)
 
     if not input_video.exists() or input_video.stat().st_size <= 0:
@@ -280,10 +341,10 @@ def main() -> None:
     result_root = work_dir / "propainter_results"
 
     prepare_source_mp4(input_video, source_mp4)
-    _fps, width, height = read_video_meta(source_mp4)
+    fps, width, height = read_video_meta(source_mp4)
     prepare_static_mask(input_mask, mask_png, width, height)
-    inpainted = run_propainter(source_mp4, mask_png, result_root, width, height)
-    mux_audio(inpainted, source_mp4, output_video)
+    inpainted = run_propainter(source_mp4, mask_png, result_root, width, height, output_quality)
+    mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
 
     if not output_video.exists() or output_video.stat().st_size <= 0:
         raise RuntimeError("ProPainter pipeline did not create output video")
