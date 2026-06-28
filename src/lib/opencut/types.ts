@@ -9,6 +9,17 @@ export interface OpenCutClip {
   end: number;
   speed: number;
   volume: number;
+  filterPreset?: string;
+  brightness?: number;
+  contrast?: number;
+  saturation?: number;
+  blur?: number;
+  opacity?: number;
+  rotate?: number;
+  flipX?: boolean;
+  fit?: 'contain' | 'cover';
+  fadeIn?: number;
+  fadeOut?: number;
 }
 
 export interface OpenCutTextLayer {
@@ -22,6 +33,8 @@ export interface OpenCutTextLayer {
   weight: number;
   color: string;
   background: boolean;
+  shadow?: boolean;
+  uppercase?: boolean;
 }
 
 export interface OpenCutProject {
