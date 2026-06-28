@@ -1,0 +1,5 @@
+# TVAPP
+
+**Deleted package-lock.json to fix Vercel deployment timeout issue**
+
+This was causing npm install to fail with network timeouts.
