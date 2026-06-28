@@ -1,6 +1,7 @@
 // Orchestrates the REAL in-browser object-removal pipeline and drives the
 // one-folder local job state machine with real progress at each phase.
 import { extractFrames } from './frames';
+import { expandScribbleToObjectMask, countMaskPixels } from './segment';
 import { trackMask, smoothMasks } from './track';
 import { inpaint, type Mask } from './inpaint';
 import { encodeVideo } from './exporter';
@@ -38,10 +39,10 @@ export interface PipelineOutput {
   confidence: number[];
 }
 
-
 function rasterizeMask(maskCanvas: HTMLCanvasElement, procW: number, procH: number): Mask {
   const c = document.createElement('canvas');
-  c.width = procW; c.height = procH;
+  c.width = procW;
+  c.height = procH;
   const ctx = c.getContext('2d', { willReadFrequently: true })!;
   ctx.drawImage(maskCanvas, 0, 0, procW, procH);
   const d = ctx.getImageData(0, 0, procW, procH).data;
@@ -61,7 +62,7 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
 
   // mask_ready -> segmenting (build clean binary mask from scribble)
   guard();
-  await step(jobId, 'segmenting', 24, 'Segmenting object from your scribble...', 'segmenting: scribble -> binary mask', onPhase);
+  await step(jobId, 'segmenting', 24, 'Segmenting object from your mark...', 'segmenting: scribble -> local object mask', onPhase);
 
   // extract frames at a higher working resolution (better fills) while staying tractable.
   const ext = await extractFrames(
@@ -74,21 +75,36 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   const { frames, timestamps, procW, procH, frameCount } = ext;
 
   // map selected time to nearest extracted frame
-  let keyIndex = 0, bestDt = Infinity;
+  let keyIndex = 0;
+  let bestDt = Infinity;
   for (let i = 0; i < timestamps.length; i++) {
     const dt = Math.abs(timestamps[i] - selectedTime);
-    if (dt < bestDt) { bestDt = dt; keyIndex = i; }
+    if (dt < bestDt) {
+      bestDt = dt;
+      keyIndex = i;
+    }
   }
-  const keyMask = rasterizeMask(maskCanvas, procW, procH);
-  await eraserApi.progress({ jobId, progress: 32, statusMessage: 'Object segmented on keyframe.', log: `keyframe=${keyIndex} mask px=${keyMask.reduce((a, b) => a + b, 0)}` });
+
+  const scribbleMask = rasterizeMask(maskCanvas, procW, procH);
+  const scribblePx = countMaskPixels(scribbleMask);
+  const keyMask = expandScribbleToObjectMask(frames[keyIndex], scribbleMask);
+  const keyMaskPx = countMaskPixels(keyMask);
+
+  await eraserApi.progress({
+    jobId,
+    progress: 32,
+    statusMessage: 'Object mask built on keyframe.',
+    log: `keyframe=${keyIndex} scribble px=${scribblePx} object mask px=${keyMaskPx}`,
+  });
 
   // segmenting -> tracking_mask
   guard();
-  await step(jobId, 'tracking_mask', 36, 'Tracking object across all frames...', 'tracking_mask: optical-flow propagation', onPhase);
+  await step(jobId, 'tracking_mask', 36, 'Tracking marked object across the full clip...', 'tracking_mask: guarded local block tracking', onPhase);
   const { masks, confidence } = trackMask(frames, keyIndex, keyMask, (frac) =>
     onPhase?.('tracking_mask', 36 + frac * 12, `Tracking object (${Math.round(frac * 100)}%)...`)
   );
   guard();
+
   // Flag low-confidence ranges so the UI can ask for a correction keyframe instead
   // of blindly erasing the wrong area.
   const lowConfidenceFrames: number[] = [];
@@ -103,12 +119,11 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
     : 'tracking confidence OK on all masked frames';
   await eraserApi.progress({ jobId, progress: 50, statusMessage: 'Object tracked through clip.', log: `tracked ${masks.length} frames; ${lcLog}` });
   if (lowConfidenceFrames.length) {
-    onPhase?.('tracking_mask', 50, `Tracking confidence dropped around frame ${lowConfidenceFrames[0]}. Consider adding another keyframe after preview.`);
+    onPhase?.('tracking_mask', 50, `Tracking confidence dropped around frame ${lowConfidenceFrames[0]}. Add another keyframe if the preview misses the object.`);
   }
 
-
   // tracking_mask -> smoothing_masks
-  await step(jobId, 'smoothing_masks', 52, 'Smoothing masks over time...', 'smoothing_masks: temporal smoothing + feather', onPhase);
+  await step(jobId, 'smoothing_masks', 52, 'Smoothing masks over time...', 'smoothing_masks: temporal hole fill', onPhase);
   const smoothed = smoothMasks(masks, procW, procH);
   guard();
 
@@ -134,7 +149,9 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   // temporal flicker reduction: blend each inpainted-masked pixel with neighbours
   for (let i = 1; i < frameCount - 1; i++) {
     const m = smoothed[i];
-    const a = inpaintedFrames[i - 1].data, b = inpaintedFrames[i].data, c = inpaintedFrames[i + 1].data;
+    const a = inpaintedFrames[i - 1].data;
+    const b = inpaintedFrames[i].data;
+    const c = inpaintedFrames[i + 1].data;
     for (let p = 0; p < procW * procH; p++) {
       if (!m[p]) continue;
       const o = p * 4;
@@ -154,14 +171,19 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   const outW = video.videoWidth || procW;
   const outH = video.videoHeight || procH;
   const procBuf = document.createElement('canvas');
-  procBuf.width = procW; procBuf.height = procH;
+  procBuf.width = procW;
+  procBuf.height = procH;
   const procCtx = procBuf.getContext('2d')!;
 
   const drawFrameAt = (time: number, ctx: CanvasRenderingContext2D) => {
-    let idx = 0, best = Infinity;
+    let idx = 0;
+    let best = Infinity;
     for (let i = 0; i < timestamps.length; i++) {
       const dt = Math.abs(timestamps[i] - time);
-      if (dt < best) { best = dt; idx = i; }
+      if (dt < best) {
+        best = dt;
+        idx = i;
+      }
     }
     procCtx.putImageData(inpaintedFrames[idx], 0, 0);
     // scale proc frame up to source resolution (aspect ratio identical -> no distortion)
@@ -173,7 +195,11 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   await step(jobId, 'generating_preview', 94, 'Generating preview & final export...', 'generating_preview: MediaRecorder mux', onPhase);
 
   const enc = await encodeVideo({
-    outW, outH, duration, sourceUrl, fps,
+    outW,
+    outH,
+    duration,
+    sourceUrl,
+    fps,
     drawFrameAt,
     onProgress: (frac) => onPhase?.('generating_preview', 94 + frac * 3, `Exporting (${Math.round(frac * 100)}%)...`),
   });
@@ -206,11 +232,16 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
     localUrl: enc.url,
     mimeType: enc.mimeType,
     hasAudio: enc.hasAudio,
-    outW, outH,
+    outW,
+    outH,
     effectiveFps: enc.effectiveFps,
-    frameCount, procW, procH,
+    frameCount,
+    procW,
+    procH,
     lowConfidenceFrames,
-    inpaintedFrames, originalFrames: frames, timestamps, confidence,
+    inpaintedFrames,
+    originalFrames: frames,
+    timestamps,
+    confidence,
   };
 }
-
