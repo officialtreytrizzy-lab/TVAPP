@@ -10,6 +10,30 @@ The Vite frontend calls this worker when `VITE_ERASER_GPU_WORKER_URL` is configu
 - `GET /v1/video-eraser/jobs/{job_id}`
 - `POST /v1/video-eraser/jobs/{job_id}/cancel`
 
+## Deploy on Modal
+
+Do not hard-code Modal tokens into this repo.
+
+From your computer:
+
+```bash
+pip install modal
+modal setup
+modal deploy gpu-worker/modal_app.py
+```
+
+Modal prints a deployed web URL. Put that URL in Vercel:
+
+```bash
+VITE_ERASER_GPU_WORKER_URL=https://your-workspace--tvapp-video-eraser-gpu-fastapi-app.modal.run
+```
+
+Optional auth can be added later with:
+
+```bash
+VITE_ERASER_GPU_API_KEY=your-worker-bearer-token
+```
+
 ## Expected production pipeline
 
 1. Save the uploaded video and PNG alpha mask.
