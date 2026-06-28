@@ -26,6 +26,7 @@ interface Props {
   canProcess?: boolean;
   finalUrl: string | null;
   originalUrl: string | null;
+  processingMode?: string;
   onProcess: () => void;
   onCancel: () => void;
   onDownload: () => void;
@@ -33,16 +34,20 @@ interface Props {
 
 export default function ProcessingPanel({
   phase, progress, statusMessage, error, hasMask, processing, canProcess = true, finalUrl, originalUrl,
-  onProcess, onCancel, onDownload,
+  processingMode = 'browser fallback', onProcess, onCancel, onDownload,
 }: Props) {
 
   const [showAfter, setShowAfter] = useState(true);
   const done = phase === 'completed' && finalUrl;
+  const usingGpu = /gpu/i.test(processingMode);
 
   return (
     <div className="space-y-4 rounded-xl bg-slate-900/70 p-4 ring-1 ring-slate-800">
-      <div className="flex items-center justify-between">
-        <span className="text-sm font-semibold text-white">Processing</span>
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <span className="text-sm font-semibold text-white">Processing</span>
+          <p className="mt-0.5 text-xs text-slate-500">Mode: {processingMode}</p>
+        </div>
         <span className="rounded-full bg-slate-800 px-2.5 py-1 text-xs font-medium text-violet-300">
           {PHASE_LABEL[phase] ?? phase}
         </span>
@@ -70,7 +75,7 @@ export default function ProcessingPanel({
       {!done && !processing && (
         <button onClick={onProcess} disabled={!hasMask || !canProcess}
           className="flex w-full items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-4 py-3 font-semibold text-white shadow-lg shadow-violet-900/30 transition hover:from-violet-500 hover:to-blue-500 disabled:cursor-not-allowed disabled:opacity-40">
-          <Sparkles className="h-5 w-5" /> Process Video
+          <Sparkles className="h-5 w-5" /> {usingGpu ? 'Process with GPU AI' : 'Process Video'}
         </button>
       )}
       {!hasMask && !done && !processing && canProcess && (
@@ -80,7 +85,6 @@ export default function ProcessingPanel({
         <p className="text-center text-xs text-amber-400">This job is already processing. Keep this tab open.</p>
       )}
 
-
       {processing && (
         <button onClick={onCancel}
           className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-800 px-4 py-3 font-medium text-red-300 hover:bg-slate-700">
@@ -89,7 +93,8 @@ export default function ProcessingPanel({
       )}
       {processing && (
         <div className="flex items-center justify-center gap-2 text-xs text-slate-400">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Working in your browser — keep this tab open.
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          {usingGpu ? 'GPU worker is processing — keep this tab open.' : 'Working in your browser — keep this tab open.'}
         </div>
       )}
 
