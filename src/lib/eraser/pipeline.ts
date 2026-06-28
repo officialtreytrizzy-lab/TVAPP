@@ -1,5 +1,6 @@
 // Orchestrates the REAL in-browser object-removal pipeline and drives the
 // one-folder local job state machine with real progress at each phase.
+// Reapplied on top of the current main branch so object-mask segmentation stays wired before tracking.
 import { extractFrames } from './frames';
 import { expandScribbleToObjectMask, countMaskPixels } from './segment';
 import { trackMask, smoothMasks } from './track';
