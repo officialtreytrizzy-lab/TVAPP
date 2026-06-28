@@ -22,7 +22,7 @@ OpenCut Mobile API
 VITE_ERASER_GPU_WORKER_URL=https://your-modal-worker.modal.run
 TREY_VIDEO_API_PUBLIC_BASE_URL=https://your-domain.com
 TREY_VIDEO_API_ALLOWED_ORIGIN=*
-TREY_VIDEO_API_KEYS=key_id:sha256_hash:organization_id:plan:scopes
+TREY_VIDEO_API_KEYS=key_id;sha256_hash;organization_id;plan;scopes
 ```
 
 Generate an API key hash:
@@ -34,8 +34,10 @@ node -e "console.log(require('crypto').createHash('sha256').update(process.argv[
 Example `TREY_VIDEO_API_KEYS` value:
 
 ```text
-starter_key_1:YOUR_SHA256_HASH:org_demo:starter:video_removal:write|video_removal:read|video_editor:write|video_editor:read
+starter_key_1;YOUR_SHA256_HASH;org_demo;starter;video_removal:write video_removal:read video_editor:write video_editor:read
 ```
+
+For multiple keys, separate records with `|KEY|` or put each record on a new line.
 
 ## Auth
 
