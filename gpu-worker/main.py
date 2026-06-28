@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 WORK_DIR = Path(os.environ.get("ERASER_WORK_DIR", "/tmp/video-eraser-jobs"))
 PUBLIC_BASE_URL = os.environ.get("ERASER_PUBLIC_BASE_URL", "").rstrip("/")
-PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "").strip()
+PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2_propainter.py").strip()
 
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -75,7 +75,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
     output_path = job_dir / "output.mp4"
 
     try:
-        set_job(job_id, phase="segmenting", progress=8, statusMessage="Starting GPU segmentation pipeline")
+        set_job(job_id, phase="segmenting", progress=8, statusMessage="Starting GPU smoke-test pipeline")
         if not PIPELINE_CMD:
             raise RuntimeError("ERASER_PIPELINE_CMD is not configured. Point it at the SAM2/ProPainter pipeline command.")
 
@@ -93,7 +93,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             "ERASER_HEIGHT": height,
         })
 
-        set_job(job_id, phase="tracking_mask", progress=20, statusMessage="Running video mask tracking")
+        set_job(job_id, phase="generating_preview", progress=35, statusMessage="Encoding smoke-test MP4 on Modal")
         completed = subprocess.run(
             PIPELINE_CMD,
             shell=True,
@@ -113,7 +113,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             job_id,
             phase="completed",
             progress=100,
-            statusMessage="GPU AI removal complete",
+            statusMessage="GPU smoke test complete",
             outputUrl=public_output_url(job_id),
             error=None,
         )
