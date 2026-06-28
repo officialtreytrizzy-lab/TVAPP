@@ -1,4 +1,3 @@
-
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -21,7 +20,9 @@ const App = () => (
           <Routes>
             <Route path="/" element={<Index />} />
             <Route path="/studio" element={<MobileStudio />} />
+            <Route path="/mobile-editor" element={<MobileStudio />} />
             <Route path="/opencut" element={<MobileStudio />} />
+            <Route path="/opencut/mobile" element={<MobileStudio />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>
