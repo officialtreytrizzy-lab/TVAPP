@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import Editor from './eraser/Editor';
 import { eraserApi, type LocalJob } from '@/lib/eraser/api';
-import { Wand2, MousePointerClick, Scan, Film, Sparkles, Github, Mail, History, X, Play, HardDrive } from 'lucide-react';
+import { Wand2, MousePointerClick, Scan, Film, Sparkles, Github, Mail, History, X, Play, HardDrive, Clapperboard } from 'lucide-react';
 
 const HERO = 'https://d64gsuwffb70l.cloudfront.net/6a407d389662950bf1dfa607_1782611760246_970a59e4.jpg';
 const STEPS = [
@@ -89,6 +89,9 @@ export default function AppLayout() {
             <span className="text-lg font-bold tracking-tight">Video E<span className="text-violet-400">Treyser</span></span>
           </div>
           <div className="flex items-center gap-2">
+            <a href="/studio" className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-2 text-sm font-semibold text-white shadow-lg shadow-violet-900/30 hover:bg-violet-500">
+              <Clapperboard className="h-4 w-4" /> <span className="hidden sm:inline">OpenCut</span>
+            </a>
             <button onClick={() => { loadJobs(); setShowHistory(true); }} className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
               <History className="h-4 w-4" /> <span className="hidden sm:inline">Local jobs</span>
             </button>
@@ -108,6 +111,7 @@ export default function AppLayout() {
           <p className="mx-auto mt-5 max-w-2xl text-lg text-slate-300">Scribble over an unwanted person, logo, or object on a single frame. The app tracks it through the whole clip, inpaints the gap, and exports a clean video from one local project folder.</p>
           <div className="mt-8 flex flex-wrap items-center justify-center gap-3">
             <button onClick={scrollToEditor} className="rounded-xl bg-gradient-to-r from-violet-600 to-blue-600 px-7 py-3.5 text-base font-semibold text-white shadow-lg shadow-violet-900/40 hover:from-violet-500 hover:to-blue-500">Upload a video</button>
+            <a href="/studio" className="rounded-xl bg-slate-800 px-7 py-3.5 text-base font-semibold text-white ring-1 ring-slate-700 hover:bg-slate-700">Open mobile editor</a>
             <span className="text-sm text-slate-400">No Edge Function. No separate backend server. Local job history is stored in this browser.</span>
           </div>
         </div>
@@ -156,7 +160,7 @@ export default function AppLayout() {
           </div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Pipeline</h4><ul className="space-y-2 text-sm text-slate-400"><li>Frame extraction</li><li>Optical-flow tracking</li><li>Diffusion inpainting</li><li>Audio-preserving export</li></ul></div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Specs</h4><ul className="space-y-2 text-sm text-slate-400"><li>MP4 · MOV · WebM</li><li>Up to 30 seconds</li><li>Original FPS & audio</li><li>Aspect ratio preserved</li></ul></div>
-          <div><h4 className="mb-3 text-sm font-semibold text-white">Connect</h4><div className="flex gap-3 text-slate-400"><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Github className="h-4 w-4" /></a><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Mail className="h-4 w-4" /></a></div></div>
+          <div><h4 className="mb-3 text-sm font-semibold text-white">Studio</h4><div className="flex gap-3 text-slate-400"><a href="/studio" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Clapperboard className="h-4 w-4" /></a><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Github className="h-4 w-4" /></a><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Mail className="h-4 w-4" /></a></div></div>
         </div>
         <div className="border-t border-slate-800 px-4 py-5 pb-safe text-center text-xs text-slate-500">© {year} Video ETreyser. Only edit videos you own or have permission to edit.</div>
       </footer>
