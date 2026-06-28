@@ -87,12 +87,13 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
   const scribblePx = countMaskPixels(scribbleMask);
   const keyMask = expandScribbleToObjectMask(frames[keyIndex], scribbleMask);
   const keyMaskPx = countMaskPixels(keyMask);
+  const maxSafeMaskPx = Math.max(keyMaskPx * 3, Math.round(procW * procH * 0.012));
 
   await eraserApi.progress({
     jobId,
     progress: 32,
     statusMessage: 'Tight mask built on keyframe.',
-    log: `keyframe=${keyIndex} scribble px=${scribblePx} tight mask px=${keyMaskPx}`,
+    log: `keyframe=${keyIndex} scribble px=${scribblePx} tight mask px=${keyMaskPx} max safe px=${maxSafeMaskPx}`,
   });
 
   guard();
@@ -123,18 +124,28 @@ export async function runPipeline(input: PipelineInput): Promise<PipelineOutput>
 
   await step(jobId, 'inpainting', 54, 'Filling the selected pixels without extra blur...', 'inpainting: tight fill no temporal smear', onPhase);
   const inpaintedFrames: ImageData[] = new Array(frameCount);
+  let skippedOversizedMasks = 0;
   for (let i = 0; i < frameCount; i++) {
     guard();
     const src = frames[i];
     const copy = new ImageData(new Uint8ClampedArray(src.data), src.width, src.height);
     const m = smoothed[i];
-    const hasMask = m.some((v) => v === 1);
-    if (hasMask) inpaint(copy, m, { iterations: 16, feather: 1, grow: 0 });
+    const maskPx = countMaskPixels(m);
+    if (maskPx > 0 && maskPx <= maxSafeMaskPx) {
+      inpaint(copy, m, { iterations: 16, feather: 1, grow: 0 });
+    } else if (maskPx > maxSafeMaskPx) {
+      skippedOversizedMasks++;
+    }
     inpaintedFrames[i] = copy;
     const frac = (i + 1) / frameCount;
     const p = 54 + frac * 26;
     if (i % 5 === 0 || i === frameCount - 1) {
-      await eraserApi.progress({ jobId, progress: p, statusMessage: `Inpainting frames (${i + 1}/${frameCount})...`, log: i === frameCount - 1 ? `inpainted ${frameCount} frames` : undefined });
+      await eraserApi.progress({
+        jobId,
+        progress: p,
+        statusMessage: `Inpainting frames (${i + 1}/${frameCount})...`,
+        log: i === frameCount - 1 ? `inpainted ${frameCount} frames; skipped oversized masks=${skippedOversizedMasks}` : undefined,
+      });
     }
     onPhase?.('inpainting', p, `Inpainting frames (${i + 1}/${frameCount})...`);
   }
