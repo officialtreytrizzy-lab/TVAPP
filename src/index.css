@@ -96,6 +96,8 @@
     /* Avoid iOS Safari auto-inflating text on rotation */
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
+    height: 100%;
+    background: #03030a;
   }
 
   body {
@@ -103,6 +105,13 @@
     /* Stop iOS rubber-band / chained scrolling while brushing the mask */
     overscroll-behavior-y: none;
     -webkit-font-smoothing: antialiased;
+    min-height: 100%;
+    background: #03030a;
+  }
+
+  #root {
+    min-height: 100%;
+    background: #03030a;
   }
 
   /* Kill the grey tap flash on iOS for all interactive controls */
@@ -146,6 +155,13 @@
   .max-h-screen-video {
     max-height: 60vh;
     max-height: 55dvh;
+  }
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
   }
 }
 
