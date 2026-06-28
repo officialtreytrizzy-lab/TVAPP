@@ -7,7 +7,7 @@ import ProcessingPanel from './ProcessingPanel';
 import { probeVideo } from '@/lib/eraser/frames';
 import { eraserApi } from '@/lib/eraser/api';
 import { runPipeline, type PipelineOutput } from '@/lib/eraser/pipeline';
-import { gpuRemovalLabel, isGpuRemovalConfigured, runGpuRemoval } from '@/lib/eraser/gpu';
+import { gpuRemovalLabel, isGpuRemovalConfigured, runGpuRemoval, type EraserOutputQuality } from '@/lib/eraser/gpu';
 import { RotateCcw, ShieldCheck } from 'lucide-react';
 
 const MAX_DURATION = 30;
@@ -47,6 +47,7 @@ export default function Editor() {
   const [erasing, setErasing] = useState(false);
   const [maskVisible, setMaskVisible] = useState(true);
   const [hasMask, setHasMask] = useState(false);
+  const [outputQuality, setOutputQuality] = useState<EraserOutputQuality>('source');
 
   const [phase, setPhase] = useState('awaiting_mask');
   const [progress, setProgress] = useState(18);
@@ -167,6 +168,7 @@ export default function Editor() {
           selectedTime: current,
           selectedFrameIndex,
           maskCanvas,
+          outputQuality,
           cancelRef: cancelRef.current,
           onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
         })
@@ -180,7 +182,7 @@ export default function Editor() {
       setFinalUrl(out.finalUrl);
       setPhase('completed');
       setProgress(100);
-      setStatusMessage(useGpu ? 'Done with GPU AI removal.' : 'Done with browser fallback.');
+      setStatusMessage(useGpu ? `Done with GPU AI removal (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).` : 'Done with browser fallback.');
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === '__CANCELLED__') {
@@ -214,7 +216,7 @@ export default function Editor() {
     const ext = /mp4/i.test(out.mimeType) ? 'mp4' : 'webm';
     const a = document.createElement('a');
     a.href = href;
-    a.download = meta.filename.replace(/\.[^.]+$/, '') + `-erased.${ext}`;
+    a.download = meta.filename.replace(/\.[^.]+$/, '') + `-erased-${outputQuality}.${ext}`;
     document.body.appendChild(a); a.click(); a.remove();
   };
 
@@ -294,6 +296,7 @@ export default function Editor() {
           phase={phase} progress={progress} statusMessage={statusMessage} error={error}
           hasMask={hasMask} processing={processing} canProcess={PROCESS_READY.has(phase)}
           finalUrl={finalUrl} originalUrl={meta.url} processingMode={processingMode}
+          outputQuality={outputQuality} onOutputQualityChange={setOutputQuality}
           onProcess={() => process(false)} onCancel={cancel} onDownload={download}
         />
 
