@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Loader2, Download, X, Sparkles, CheckCircle2, AlertTriangle } from 'lucide-react';
+import type { EraserOutputQuality } from '@/lib/eraser/gpu';
 
 const PHASE_LABEL: Record<string, string> = {
   awaiting_mask: 'Awaiting mask',
@@ -27,6 +28,8 @@ interface Props {
   finalUrl: string | null;
   originalUrl: string | null;
   processingMode?: string;
+  outputQuality: EraserOutputQuality;
+  onOutputQualityChange: (quality: EraserOutputQuality) => void;
   onProcess: () => void;
   onCancel: () => void;
   onDownload: () => void;
@@ -34,7 +37,7 @@ interface Props {
 
 export default function ProcessingPanel({
   phase, progress, statusMessage, error, hasMask, processing, canProcess = true, finalUrl, originalUrl,
-  processingMode = 'browser fallback', onProcess, onCancel, onDownload,
+  processingMode = 'browser fallback', outputQuality, onOutputQualityChange, onProcess, onCancel, onDownload,
 }: Props) {
 
   const [showAfter, setShowAfter] = useState(true);
@@ -52,6 +55,36 @@ export default function ProcessingPanel({
           {PHASE_LABEL[phase] ?? phase}
         </span>
       </div>
+
+      {usingGpu && !done && !processing && (
+        <div className="rounded-lg bg-slate-950/40 p-3 ring-1 ring-slate-800">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-slate-300">Render quality</span>
+            <span className="rounded bg-slate-800 px-2 py-0.5 text-[11px] text-slate-400">
+              {outputQuality === 'higher' ? 'Higher quality' : 'Source quality'}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() => onOutputQualityChange('source')}
+              className={`rounded-md px-3 py-2 font-medium transition ${outputQuality === 'source' ? 'bg-violet-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}
+            >
+              Same quality
+            </button>
+            <button
+              type="button"
+              onClick={() => onOutputQualityChange('higher')}
+              className={`rounded-md px-3 py-2 font-medium transition ${outputQuality === 'higher' ? 'bg-violet-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}
+            >
+              Higher quality
+            </button>
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-slate-500">
+            Same quality preserves the original size, frame rate, and audio. Higher quality keeps the same size and uses a cleaner export with less compression.
+          </p>
+        </div>
+      )}
 
       {(processing || progress > 0) && phase !== 'awaiting_mask' && (
         <div>
