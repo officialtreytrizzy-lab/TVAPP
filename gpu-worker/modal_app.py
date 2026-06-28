@@ -22,8 +22,8 @@ app = modal.App("tvapp-video-eraser-gpu")
     gpu="A10G",
     timeout=60 * 30,
     scaledown_window=60 * 5,
-    allow_concurrent_inputs=4,
 )
+@modal.concurrent(max_inputs=4)
 @modal.asgi_app()
 def fastapi_app():
     import sys
