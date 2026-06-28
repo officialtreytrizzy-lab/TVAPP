@@ -18,6 +18,8 @@ export interface DisplayGeometry {
   scale: number;
 }
 
+const EPSILON = 0.0001;
+
 /**
  * Compute how a frameW x frameH video renders inside a displayW x displayH box
  * using object-fit: contain (preserves aspect ratio, adds letterbox/pillarbox).
@@ -28,42 +30,72 @@ export function computeGeometry(
   frameW: number,
   frameH: number
 ): DisplayGeometry {
-  const frameAR = frameW / frameH;
-  const boxAR = displayW / displayH;
-  let contentW: number, contentH: number;
+  const safeDisplayW = Math.max(1, displayW || 1);
+  const safeDisplayH = Math.max(1, displayH || 1);
+  const safeFrameW = Math.max(1, frameW || 1);
+  const safeFrameH = Math.max(1, frameH || 1);
+
+  const frameAR = safeFrameW / safeFrameH;
+  const boxAR = safeDisplayW / safeDisplayH;
+  let contentW: number;
+  let contentH: number;
+
   if (frameAR > boxAR) {
-    // frame is wider -> pillarbox top/bottom (letterbox actually); width fills
-    contentW = displayW;
-    contentH = displayW / frameAR;
+    // Video is wider than the visible box: width fills, top/bottom letterbox.
+    contentW = safeDisplayW;
+    contentH = safeDisplayW / frameAR;
   } else {
-    contentH = displayH;
-    contentW = displayH * frameAR;
+    // Video is taller than the visible box: height fills, left/right pillarbox.
+    contentH = safeDisplayH;
+    contentW = safeDisplayH * frameAR;
   }
-  const contentX = (displayW - contentW) / 2;
-  const contentY = (displayH - contentH) / 2;
-  const scale = frameW / contentW; // display px -> frame px
-  return { displayW, displayH, frameW, frameH, contentX, contentY, contentW, contentH, scale };
+
+  const contentX = (safeDisplayW - contentW) / 2;
+  const contentY = (safeDisplayH - contentH) / 2;
+  const scale = safeFrameW / Math.max(EPSILON, contentW);
+
+  return {
+    displayW: safeDisplayW,
+    displayH: safeDisplayH,
+    frameW: safeFrameW,
+    frameH: safeFrameH,
+    contentX,
+    contentY,
+    contentW,
+    contentH,
+    scale,
+  };
 }
 
 /** Map a point in display/CSS coordinates (relative to the canvas element) to frame coordinates. */
 export function displayToFrame(g: DisplayGeometry, dx: number, dy: number): { x: number; y: number } | null {
   const cx = dx - g.contentX;
   const cy = dy - g.contentY;
-  if (cx < 0 || cy < 0 || cx > g.contentW || cy > g.contentH) {
-    // outside the actual video content (in the letterbox bars) -> clamp to edge
-    const clampedX = Math.max(0, Math.min(g.contentW, cx));
-    const clampedY = Math.max(0, Math.min(g.contentH, cy));
-    return { x: clampedX * g.scale, y: clampedY * g.scale };
-  }
-  return { x: cx * g.scale, y: cy * g.scale };
+
+  // Do not clamp touches from letterbox/pillarbox bars into the video. Clamping
+  // made edge taps create masks in the wrong frame location.
+  if (cx < 0 || cy < 0 || cx > g.contentW || cy > g.contentH) return null;
+
+  return {
+    x: Math.max(0, Math.min(g.frameW - 1, cx * g.scale)),
+    y: Math.max(0, Math.min(g.frameH - 1, cy * g.scale)),
+  };
 }
 
-/** Map a frame-space radius/brush size to display content px (for drawing the overlay). */
+/** Map a frame-space point to display/CSS coordinates for overlay debugging or previews. */
+export function frameToDisplay(g: DisplayGeometry, fx: number, fy: number): { x: number; y: number } {
+  return {
+    x: g.contentX + fx / g.scale,
+    y: g.contentY + fy / g.scale,
+  };
+}
+
+/** Map a frame-space radius/brush size to display content px. */
 export function frameToDisplayRadius(g: DisplayGeometry, frameRadius: number): number {
   return frameRadius / g.scale;
 }
 
 /** Map a display brush radius to frame radius. */
 export function displayToFrameRadius(g: DisplayGeometry, displayRadius: number): number {
-  return displayRadius * g.scale;
+  return Math.max(0.5, displayRadius * g.scale);
 }
