@@ -1,14 +1,13 @@
-"""First-pass real removal pipeline for the Modal video eraser worker.
+"""Static-mask ProPainter pipeline for the Modal video eraser worker.
 
-This is not the final SAM2/ProPainter implementation yet. It performs an actual
-mask-guided removal pass using OpenCV inpainting on every frame, then re-encodes
-an MP4 with the original audio preserved when present.
+This version targets the current failing case: a small fixed sparkle/logo near
+the bottom-right of the video. It prepares the uploaded mask as a static video
+mask, calls the real ProPainter inference script when available, and muxes the
+result back with the original audio.
 
-Why this exists:
-- The previous smoke test only proved the Vercel -> Modal -> output route.
-- This version actually uses the user's mask and removes the marked region.
-- The next upgrade can replace `inpaint_frame` with SAM2 mask propagation plus
-  ProPainter/E2FGVI temporal inpainting without changing the worker API.
+For moving objects, the next layer is SAM2 mask propagation before this
+ProPainter step. For fixed logos/watermarks, this static mask path is the right
+first production route.
 """
 
 from __future__ import annotations
@@ -21,6 +20,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+PROPAINTER_ROOT = Path(os.environ.get("PROPAINTER_ROOT", "/opt/ProPainter"))
+
 
 def required_env(name: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -29,15 +30,16 @@ def required_env(name: str) -> str:
     return value
 
 
-def run(cmd: list[str]) -> None:
+def run(cmd: list[str], cwd: Path | None = None) -> None:
     completed = subprocess.run(
         cmd,
+        cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
     if completed.returncode != 0:
-        raise RuntimeError(completed.stdout[-4000:] or f"Command failed: {' '.join(cmd)}")
+        raise RuntimeError(completed.stdout[-6000:] or f"Command failed: {' '.join(cmd)}")
 
 
 def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
@@ -47,7 +49,65 @@ def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int] | None:
     return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
 
 
-def load_mask(mask_path: Path, width: int, height: int) -> np.ndarray:
+def read_video_meta(input_video: Path) -> tuple[float, int, int]:
+    cap = cv2.VideoCapture(str(input_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {input_video}")
+    fps = cap.get(cv2.CAP_PROP_FPS) or float(os.environ.get("ERASER_FPS", "24") or 24)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    if width <= 0 or height <= 0:
+        raise RuntimeError("Could not read video dimensions")
+    return fps, width, height
+
+
+def prepare_source_mp4(input_video: Path, source_mp4: Path) -> None:
+    if source_mp4.exists():
+        source_mp4.unlink()
+    try:
+        run([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            str(source_mp4),
+        ])
+    except Exception:
+        run([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-shortest",
+            str(source_mp4),
+        ])
+
+
+
+def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: int) -> None:
     raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
     if raw is None:
         raise RuntimeError(f"Could not read mask image: {mask_path}")
@@ -55,7 +115,6 @@ def load_mask(mask_path: Path, width: int, height: int) -> np.ndarray:
     if raw.ndim == 3 and raw.shape[2] == 4:
         alpha = raw[:, :, 3]
     elif raw.ndim == 3:
-        # Fallback for RGB masks: any non-black pixel means remove.
         alpha = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
     else:
         alpha = raw
@@ -73,11 +132,10 @@ def load_mask(mask_path: Path, width: int, height: int) -> np.ndarray:
     box_h = y2 - y1 + 1
     min_side = min(width, height)
 
-    # Keep the operation tight, but give OpenCV enough edge context to remove
-    # small logos/watermarks cleanly. This deliberately avoids the giant mask
-    # growth that caused the loud patch in the browser pipeline.
-    pad = max(3, min(18, int(max(box_w, box_h) * 0.18)))
-    kernel_size = max(3, min(17, int(min_side * 0.006)))
+    # Fixed logo/static-mark path: keep it local but make sure the full mark is
+    # covered. ProPainter handles the fill; this just defines the remove area.
+    pad = max(4, min(24, int(max(box_w, box_h) * 0.22)))
+    kernel_size = max(3, min(19, int(min_side * 0.008)))
     if kernel_size % 2 == 0:
         kernel_size += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
@@ -94,75 +152,115 @@ def load_mask(mask_path: Path, width: int, height: int) -> np.ndarray:
 
     clipped = np.zeros_like(mask)
     clipped[y1 : y2 + 1, x1 : x2 + 1] = mask[y1 : y2 + 1, x1 : x2 + 1]
-    return clipped
+    cv2.imwrite(str(output_mask), clipped)
 
 
-def inpaint_frame(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    # Telea usually looks cleaner for small logos; NS is a fallback if the first
-    # pass leaves too much edge ringing.
-    result = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
-
-    # Blend a tiny feathered edge back against the original so the repair is not
-    # a hard sticker. Only the edge is feathered, not the whole filled region.
-    edge = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
-    edge = cv2.subtract(edge, cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1))
-    if edge.max() > 0:
-        alpha = cv2.GaussianBlur(edge.astype(np.float32) / 255.0, (5, 5), 0)
-        alpha = alpha[:, :, None]
-        result = (result.astype(np.float32) * alpha + frame.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-    return result
+def processing_size(width: int, height: int) -> tuple[int, int]:
+    # ProPainter memory requirements are high. Keep vertical clips reasonable for
+    # A10G while preserving aspect ratio. Values must be divisible by 8.
+    max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", "768"))
+    scale = min(1.0, max_side / max(width, height))
+    proc_w = max(8, int(width * scale) // 8 * 8)
+    proc_h = max(8, int(height * scale) // 8 * 8)
+    return proc_w, proc_h
 
 
-def extract_audio(input_video: Path, audio_path: Path) -> bool:
+def find_propainter_output(result_root: Path) -> Path:
+    candidates = list(result_root.rglob("inpaint_out.mp4"))
+    if not candidates:
+        raise RuntimeError(f"ProPainter completed but no inpaint_out.mp4 was found under {result_root}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path) -> None:
     try:
         run([
             "ffmpeg",
             "-y",
             "-i",
-            str(input_video),
-            "-vn",
-            "-acodec",
-            "copy",
-            str(audio_path),
+            str(inpainted_video),
+            "-i",
+            str(source_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-shortest",
+            str(output_video),
         ])
-        return audio_path.exists() and audio_path.stat().st_size > 0
     except Exception:
-        return False
+        # No audio or mux failure: still return playable video.
+        run([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(inpainted_video),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_video),
+        ])
 
 
-def encode_video(frames_dir: Path, audio_path: Path, has_audio: bool, fps: float, output_video: Path) -> None:
+def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: int, height: int) -> Path:
+    inference = PROPAINTER_ROOT / "inference_propainter.py"
+    if not inference.exists():
+        raise RuntimeError(
+            f"ProPainter is not installed at {PROPAINTER_ROOT}. "
+            "The Modal image must clone https://github.com/sczhou/ProPainter.git."
+        )
+
+    if result_root.exists():
+        shutil.rmtree(result_root)
+    result_root.mkdir(parents=True, exist_ok=True)
+
+    proc_w, proc_h = processing_size(width, height)
     cmd = [
-        "ffmpeg",
-        "-y",
-        "-framerate",
-        f"{fps:.6f}",
-        "-i",
-        str(frames_dir / "%06d.png"),
+        "python",
+        str(inference),
+        "--video",
+        str(source_mp4),
+        "--mask",
+        str(mask_png),
+        "--output",
+        str(result_root),
+        "--height",
+        str(proc_h),
+        "--width",
+        str(proc_w),
+        "--fp16",
+        "--subvideo_length",
+        "50",
+        "--neighbor_length",
+        "6",
+        "--ref_stride",
+        "10",
+        "--mask_dilation",
+        "4",
     ]
-    if has_audio:
-        cmd += ["-i", str(audio_path)]
-    cmd += [
-        "-map",
-        "0:v:0",
-    ]
-    if has_audio:
-        cmd += ["-map", "1:a:0"]
-    cmd += [
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "18",
-        "-pix_fmt",
-        "yuv420p",
-        "-movflags",
-        "+faststart",
-    ]
-    if has_audio:
-        cmd += ["-c:a", "aac", "-b:a", "160k", "-shortest"]
-    cmd += [str(output_video)]
-    run(cmd)
+    run(cmd, cwd=PROPAINTER_ROOT)
+    return find_propainter_output(result_root)
 
 
 def main() -> None:
@@ -177,42 +275,18 @@ def main() -> None:
         raise RuntimeError(f"Input mask is missing or empty: {input_mask}")
 
     work_dir = output_video.parent
-    frames_dir = work_dir / "inpainted_frames"
-    audio_path = work_dir / "audio_track.m4a"
-    if frames_dir.exists():
-        shutil.rmtree(frames_dir)
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    source_mp4 = work_dir / "source_for_propainter.mp4"
+    mask_png = work_dir / "static_remove_mask.png"
+    result_root = work_dir / "propainter_results"
 
-    cap = cv2.VideoCapture(str(input_video))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {input_video}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or float(os.environ.get("ERASER_FPS", "24") or 24)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if width <= 0 or height <= 0:
-        raise RuntimeError("Could not read video dimensions")
-
-    mask = load_mask(input_mask, width, height)
-
-    index = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        repaired = inpaint_frame(frame, mask)
-        cv2.imwrite(str(frames_dir / f"{index:06d}.png"), repaired)
-        index += 1
-    cap.release()
-
-    if index == 0:
-        raise RuntimeError("No frames decoded from input video")
-
-    has_audio = extract_audio(input_video, audio_path)
-    encode_video(frames_dir, audio_path, has_audio, fps, output_video)
+    prepare_source_mp4(input_video, source_mp4)
+    _fps, width, height = read_video_meta(source_mp4)
+    prepare_static_mask(input_mask, mask_png, width, height)
+    inpainted = run_propainter(source_mp4, mask_png, result_root, width, height)
+    mux_audio(inpainted, source_mp4, output_video)
 
     if not output_video.exists() or output_video.stat().st_size <= 0:
-        raise RuntimeError("Inpainting pipeline did not create output video")
+        raise RuntimeError("ProPainter pipeline did not create output video")
 
 
 if __name__ == "__main__":
