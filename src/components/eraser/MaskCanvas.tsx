@@ -55,13 +55,13 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     const wrap = wrapRef.current;
     const overlay = overlayRef.current;
     if (!wrap || !overlay) return;
+
     const rect = wrap.getBoundingClientRect();
-    // size overlay buffer to device pixels for crisp drawing, but geometry in CSS px
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     overlay.width = Math.round(rect.width * dpr);
     overlay.height = Math.round(rect.height * dpr);
-    overlay.style.width = rect.width + 'px';
-    overlay.style.height = rect.height + 'px';
+    overlay.style.width = `${rect.width}px`;
+    overlay.style.height = `${rect.height}px`;
     geomRef.current = computeGeometry(rect.width, rect.height, frameW, frameH);
     renderOverlay();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -74,12 +74,13 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     window.addEventListener('orientationchange', onResize);
     const ro = new ResizeObserver(() => recomputeGeometry());
     if (wrapRef.current) ro.observe(wrapRef.current);
+    if (videoEl) ro.observe(videoEl);
     return () => {
       window.removeEventListener('resize', onResize);
       window.removeEventListener('orientationchange', onResize);
       ro.disconnect();
     };
-  }, [recomputeGeometry]);
+  }, [recomputeGeometry, videoEl]);
 
   // re-render overlay when visibility toggles
   useEffect(() => { renderOverlay(); /* eslint-disable-next-line */ }, [maskVisible]);
@@ -89,20 +90,28 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     const mask = maskRef.current;
     const g = geomRef.current;
     if (!overlay || !mask || !g) return;
+
     const ctx = overlay.getContext('2d')!;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, g.displayW, g.displayH);
     if (!maskVisible) return;
-    // tint mask red and draw within content box
+
+    // tint mask red and draw only into the actual rendered video content box
     const tint = document.createElement('canvas');
-    tint.width = mask.width; tint.height = mask.height;
+    tint.width = mask.width;
+    tint.height = mask.height;
     const tctx = tint.getContext('2d')!;
     tctx.drawImage(mask, 0, 0);
     const id = tctx.getImageData(0, 0, mask.width, mask.height);
     const d = id.data;
     for (let i = 0; i < d.length; i += 4) {
-      if (d[i + 3] > 10) { d[i] = 239; d[i + 1] = 68; d[i + 2] = 68; d[i + 3] = 150; }
+      if (d[i + 3] > 10) {
+        d[i] = 239;
+        d[i + 1] = 68;
+        d[i + 2] = 68;
+        d[i + 3] = 150;
+      }
     }
     tctx.putImageData(id, 0, 0);
     ctx.imageSmoothingEnabled = true;
@@ -110,7 +119,8 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
   }
 
   function pushHistory() {
-    const mask = maskRef.current!;
+    const mask = maskRef.current;
+    if (!mask) return;
     const ctx = mask.getContext('2d', { willReadFrequently: true })!;
     historyRef.current.push(ctx.getImageData(0, 0, mask.width, mask.height));
     if (historyRef.current.length > MAX_HISTORY) historyRef.current.shift();
@@ -135,12 +145,14 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     ctx.lineWidth = frameRadius * 2;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
+
     if (fromX !== null && fromY !== null) {
       ctx.beginPath();
       ctx.moveTo(fromX, fromY);
       ctx.lineTo(fx, fy);
       ctx.stroke();
     }
+
     ctx.beginPath();
     ctx.arc(fx, fy, frameRadius, 0, Math.PI * 2);
     ctx.fill();
@@ -150,12 +162,15 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     if (disabled) return;
     e.preventDefault();
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
-    const g = geomRef.current; if (!g) return;
-    pushHistory();
-    drawingRef.current = true;
+
+    const g = geomRef.current;
+    if (!g) return;
     const { dx, dy } = getLocalPoint(e.nativeEvent);
     const p = displayToFrame(g, dx, dy);
     if (!p) return;
+
+    pushHistory();
+    drawingRef.current = true;
     paintAt(p.x, p.y, null, null);
     lastPt.current = p;
     renderOverlay();
@@ -164,10 +179,13 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
   const onPointerMove = (e: React.PointerEvent) => {
     if (!drawingRef.current || disabled) return;
     e.preventDefault();
-    const g = geomRef.current; if (!g) return;
+
+    const g = geomRef.current;
+    if (!g) return;
     const { dx, dy } = getLocalPoint(e.nativeEvent);
     const p = displayToFrame(g, dx, dy);
     if (!p) return;
+
     const last = lastPt.current;
     paintAt(p.x, p.y, last?.x ?? null, last?.y ?? null);
     lastPt.current = p;
@@ -184,20 +202,23 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
   useImperativeHandle(ref, () => ({
     getMaskCanvas: () => maskRef.current,
     hasMask: () => {
-      const mask = maskRef.current; if (!mask) return false;
+      const mask = maskRef.current;
+      if (!mask) return false;
       const ctx = mask.getContext('2d', { willReadFrequently: true })!;
       const d = ctx.getImageData(0, 0, mask.width, mask.height).data;
       for (let i = 3; i < d.length; i += 4) if (d[i] > 10) return true;
       return false;
     },
     clear: () => {
-      const mask = maskRef.current; if (!mask) return;
+      const mask = maskRef.current;
+      if (!mask) return;
       pushHistory();
       mask.getContext('2d')!.clearRect(0, 0, mask.width, mask.height);
       renderOverlay();
     },
     undo: () => {
-      const mask = maskRef.current; if (!mask || !historyRef.current.length) return;
+      const mask = maskRef.current;
+      if (!mask || !historyRef.current.length) return;
       const ctx = mask.getContext('2d', { willReadFrequently: true })!;
       redoRef.current.push(ctx.getImageData(0, 0, mask.width, mask.height));
       const prev = historyRef.current.pop()!;
@@ -206,7 +227,8 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
       force((n) => n + 1);
     },
     redo: () => {
-      const mask = maskRef.current; if (!mask || !redoRef.current.length) return;
+      const mask = maskRef.current;
+      if (!mask || !redoRef.current.length) return;
       const ctx = mask.getContext('2d', { willReadFrequently: true })!;
       historyRef.current.push(ctx.getImageData(0, 0, mask.width, mask.height));
       const nxt = redoRef.current.pop()!;
@@ -215,7 +237,8 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
       force((n) => n + 1);
     },
     loadFromCanvas: (src) => {
-      const mask = maskRef.current; if (!mask) return;
+      const mask = maskRef.current;
+      if (!mask) return;
       pushHistory();
       const ctx = mask.getContext('2d')!;
       ctx.clearRect(0, 0, mask.width, mask.height);
