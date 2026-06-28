@@ -68,14 +68,14 @@ def save_upload(upload: UploadFile, path: Path) -> None:
         shutil.copyfileobj(upload.file, out)
 
 
-def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps: str, duration: str, width: str, height: str) -> None:
+def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps: str, duration: str, width: str, height: str, quality: str) -> None:
     job_dir = WORK_DIR / job_id
     video_path = job_dir / "input_video"
     mask_path = job_dir / "mask.png"
     output_path = job_dir / "output.mp4"
 
     try:
-        set_job(job_id, phase="segmenting", progress=8, statusMessage="Starting GPU smoke-test pipeline")
+        set_job(job_id, phase="segmenting", progress=8, statusMessage="Preparing source-quality ProPainter job")
         if not PIPELINE_CMD:
             raise RuntimeError("ERASER_PIPELINE_CMD is not configured. Point it at the SAM2/ProPainter pipeline command.")
 
@@ -91,9 +91,16 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             "ERASER_DURATION": duration,
             "ERASER_WIDTH": width,
             "ERASER_HEIGHT": height,
+            "ERASER_OUTPUT_QUALITY": quality,
+            "ERASER_PRESERVE_RESOLUTION": "true",
+            "ERASER_PRESERVE_FPS": "true",
+            "ERASER_PRESERVE_AUDIO": "true",
         })
 
-        set_job(job_id, phase="generating_preview", progress=35, statusMessage="Encoding smoke-test MP4 on Modal")
+        status = "Running ProPainter and restoring source-quality MP4"
+        if quality == "higher":
+            status = "Running ProPainter and exporting higher-quality MP4"
+        set_job(job_id, phase="inpainting", progress=35, statusMessage=status)
         completed = subprocess.run(
             PIPELINE_CMD,
             shell=True,
@@ -102,10 +109,10 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=60 * 30,
+            timeout=60 * 45,
         )
         if completed.returncode != 0:
-            raise RuntimeError(completed.stdout[-4000:] or f"Pipeline exited with {completed.returncode}")
+            raise RuntimeError(completed.stdout[-6000:] or f"Pipeline exited with {completed.returncode}")
         if not output_path.exists() or output_path.stat().st_size <= 0:
             raise RuntimeError("Pipeline completed without writing output.mp4")
 
@@ -113,7 +120,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             job_id,
             phase="completed",
             progress=100,
-            statusMessage="GPU smoke test complete",
+            statusMessage="GPU AI removal complete",
             outputUrl=public_output_url(job_id),
             error=None,
         )
@@ -134,21 +141,25 @@ async def create_job(
     width: str = Form(default="0"),
     height: str = Form(default="0"),
     pipeline: str = Form(default="sam2-propainter"),
-    quality: str = Form(default="commercial"),
+    quality: str = Form(default="source"),
+    preserve_resolution: str = Form(default="true"),
+    preserve_fps: str = Form(default="true"),
+    preserve_audio: str = Form(default="true"),
 ):
     remote_job_id = job_id.strip() or str(uuid.uuid4())
     job_dir = WORK_DIR / remote_job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    normalized_quality = quality if quality in {"source", "higher"} else "source"
 
     save_upload(video, job_dir / "input_video")
     save_upload(mask, job_dir / "mask.png")
     (job_dir / "request.txt").write_text(
-        f"pipeline={pipeline}\nquality={quality}\nselected_time={selected_time}\nselected_frame_index={selected_frame_index}\nfps={fps}\nduration={duration}\nwidth={width}\nheight={height}\n",
+        f"pipeline={pipeline}\nquality={normalized_quality}\npreserve_resolution={preserve_resolution}\npreserve_fps={preserve_fps}\npreserve_audio={preserve_audio}\nselected_time={selected_time}\nselected_frame_index={selected_frame_index}\nfps={fps}\nduration={duration}\nwidth={width}\nheight={height}\n",
         encoding="utf-8",
     )
 
     state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued on GPU worker")
-    background_tasks.add_task(process_job, remote_job_id, selected_time, selected_frame_index, fps, duration, width, height)
+    background_tasks.add_task(process_job, remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, normalized_quality)
     return {
         **state.model_dump(),
         "statusUrl": f"/v1/video-eraser/jobs/{remote_job_id}",
