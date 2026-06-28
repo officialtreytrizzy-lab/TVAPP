@@ -1,5 +1,7 @@
 import type { PipelineOutput } from './pipeline';
 
+export type EraserOutputQuality = 'source' | 'higher';
+
 interface GpuRemovalInput {
   jobId: string;
   file: File;
@@ -11,6 +13,7 @@ interface GpuRemovalInput {
   selectedTime: number;
   selectedFrameIndex: number;
   maskCanvas: HTMLCanvasElement;
+  outputQuality?: EraserOutputQuality;
   cancelRef: { cancelled: boolean };
   onPhase?: (phase: string, progress: number, msg: string) => void;
 }
@@ -141,6 +144,7 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
     selectedTime,
     selectedFrameIndex,
     maskCanvas,
+    outputQuality = 'source',
     cancelRef,
     onPhase,
   } = input;
@@ -160,7 +164,10 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
   form.append('height', String(height));
   form.append('pipeline', 'sam2-propainter');
   form.append('mask_semantics', 'alpha_gt_0_remove');
-  form.append('quality', 'commercial');
+  form.append('quality', outputQuality);
+  form.append('preserve_resolution', 'true');
+  form.append('preserve_fps', 'true');
+  form.append('preserve_audio', 'true');
 
   const createRes = await fetch(`${WORKER_URL}/v1/video-eraser/jobs`, {
     method: 'POST',
@@ -172,7 +179,7 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
   let outputUrl = getOutputUrl(payload);
 
   if (outputUrl) {
-    onPhase?.('completed', 100, 'GPU AI removal complete.');
+    onPhase?.('completed', 100, outputQuality === 'higher' ? 'GPU AI removal complete in higher quality.' : 'GPU AI removal complete at source quality.');
     return {
       finalUrl: outputUrl,
       localUrl: outputUrl,
@@ -214,7 +221,7 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
     outputUrl = getOutputUrl(payload);
     if (phase === 'completed' || outputUrl) {
       if (!outputUrl) throw new Error('GPU worker completed but did not return an output URL.');
-      onPhase?.('completed', 100, 'GPU AI removal complete.');
+      onPhase?.('completed', 100, outputQuality === 'higher' ? 'GPU AI removal complete in higher quality.' : 'GPU AI removal complete at source quality.');
       return {
         finalUrl: outputUrl,
         localUrl: outputUrl,
