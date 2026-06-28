@@ -314,7 +314,7 @@ export default function MobileOpenCutStudio() {
               onChange={(e) => setProject((p) => ({ ...p, name: e.target.value }))}
               className="w-full truncate bg-transparent text-[15px] font-black tracking-tight text-white outline-none placeholder:text-white/30"
             />
-            <div className="mt-0.5 flex items-center gap-1.5 text-[11px] font-semibold text-white/45">
+            <div className="mt-0.5 flex items-center gap-1.5 text-[11px] font-semibold text-white/50">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.9)]" />
               iPhone Studio
             </div>
@@ -345,7 +345,7 @@ export default function MobileOpenCutStudio() {
               </div>
 
               <h1 className="mt-7 text-[2.7rem] font-black leading-[0.92] tracking-[-0.08em] text-white">Create your first cut.</h1>
-              <p className="mt-4 max-w-sm text-[15px] leading-6 text-white/62">
+              <p className="mt-4 max-w-sm text-[15px] leading-6 text-white/60">
                 Import a video, follow the guided tools, and export a polished vertical edit from Safari without fighting the screen.
               </p>
 
@@ -364,7 +364,7 @@ export default function MobileOpenCutStudio() {
           <section className="mt-4 rounded-[30px] border border-white/10 bg-black/25 p-4 backdrop-blur-xl">
             <div className="mb-4 flex items-center justify-between">
               <h2 className="text-sm font-black tracking-tight">First-time flow</h2>
-              <span className="text-[11px] font-semibold text-white/45">3 steps</span>
+              <span className="text-[11px] font-semibold text-white/50">3 steps</span>
             </div>
             <div className="space-y-3">
               {FIRST_RUN_STEPS.map(({ icon: Icon, title, body }, index) => (
@@ -392,7 +392,7 @@ export default function MobileOpenCutStudio() {
               <div className="inline-flex items-center gap-2 rounded-full bg-white/[0.08] px-3 py-1.5 text-[11px] font-bold text-white/75 ring-1 ring-white/10">
                 <Layers className="h-3.5 w-3.5 text-violet-200" /> Preview
               </div>
-              <div className="rounded-full bg-black/40 px-3 py-1.5 font-mono text-[11px] text-white/55 ring-1 ring-white/10">{formatTime(current)}</div>
+              <div className="rounded-full bg-black/40 px-3 py-1.5 font-mono text-[11px] text-white/60 ring-1 ring-white/10">{formatTime(current)}</div>
             </div>
             <div className={`relative mx-auto max-h-[43dvh] overflow-hidden rounded-[28px] bg-black ${aspectClass(project.aspect, selectedClip)}`}>
               <video ref={videoRef} playsInline muted controls={false} className="absolute inset-0 h-full w-full object-contain" />
@@ -415,14 +415,14 @@ export default function MobileOpenCutStudio() {
               </button>
             </div>
             <div className="mt-2 grid grid-cols-3 gap-2 px-1 text-center text-[11px]">
-              <div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/35">Size</span><span className="font-mono text-white/70">{selectedClip.width}×{selectedClip.height}</span></div>
-              <div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/35">Length</span><span className="font-mono text-white/70">{formatTime(clipDuration)}</span></div>
-              <div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/35">Aspect</span><span className="font-mono text-white/70">{project.aspect}</span></div>
+              <div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Size</span><span className="font-mono text-white/70">{selectedClip.width}×{selectedClip.height}</span></div>
+              <div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Length</span><span className="font-mono text-white/70">{formatTime(clipDuration)}</span></div>
+              <div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Aspect</span><span className="font-mono text-white/70">{project.aspect}</span></div>
             </div>
           </section>
 
           <section className="mt-3 rounded-[28px] border border-white/10 bg-white/[0.06] p-3 shadow-[0_18px_55px_rgba(0,0,0,0.28)] backdrop-blur-xl">
-            <div className="mb-2 flex items-center justify-between text-xs text-white/55">
+            <div className="mb-2 flex items-center justify-between text-xs text-white/60">
               <span>{formatTime(selectedClip.start)}</span>
               <span className="font-black text-white">Timeline</span>
               <span>{formatTime(selectedClip.end)}</span>
@@ -445,7 +445,7 @@ export default function MobileOpenCutStudio() {
             </div>
             <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto pb-1">
               {project.clips.map((clip) => (
-                <button key={clip.id} onClick={() => setProject((p) => ({ ...p, selectedClipId: clip.id }))} className={`min-w-28 rounded-2xl px-3 py-2 text-left text-xs ring-1 active:scale-95 ${clip.id === selectedClip.id ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.055] text-white/62 ring-white/10'}`}>
+                <button key={clip.id} onClick={() => setProject((p) => ({ ...p, selectedClipId: clip.id }))} className={`min-w-28 rounded-2xl px-3 py-2 text-left text-xs ring-1 active:scale-95 ${clip.id === selectedClip.id ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.055] text-white/60 ring-white/10'}`}>
                   <span className="block truncate font-black">{clip.name}</span>
                   <span className="font-mono text-[10px] opacity-70">{formatTime(clip.end - clip.start)}</span>
                 </button>
@@ -457,11 +457,11 @@ export default function MobileOpenCutStudio() {
             <div className="mb-4 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <div className="grid h-9 w-9 place-items-center rounded-2xl bg-white/[0.08] ring-1 ring-white/10">
-                  <ActiveToolIcon className="h-4.5 w-4.5" />
+                  <ActiveToolIcon className="h-4 w-4" />
                 </div>
                 <div>
                   <h3 className="text-sm font-black">{activeTool.label}</h3>
-                  <p className="text-[11px] text-white/42">Make the next clean edit</p>
+                  <p className="text-[11px] text-white/40">Make the next clean edit</p>
                 </div>
               </div>
               <button onClick={() => fileRef.current?.click()} className="rounded-full bg-white/[0.08] px-3 py-2 text-[11px] font-bold text-white/70 ring-1 ring-white/10 active:scale-95">
@@ -495,7 +495,7 @@ export default function MobileOpenCutStudio() {
             {tool === 'text' && (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <p className="text-xs leading-5 text-white/48">Add captions, titles, or punchline text.</p>
+                  <p className="text-xs leading-5 text-white/50">Add captions, titles, or punchline text.</p>
                   <button onClick={addText} className="rounded-full bg-white px-3 py-2 text-xs font-black text-slate-950"><Plus className="inline h-3.5 w-3.5" /> Add</button>
                 </div>
                 {selectedText ? (
@@ -515,7 +515,7 @@ export default function MobileOpenCutStudio() {
               <div className="space-y-3">
                 <div className="flex items-center gap-2 text-sm font-black"><Volume2 className="h-4 w-4" /> Clip volume</div>
                 <label className="block rounded-2xl bg-black/25 p-3 text-xs font-bold text-white/60 ring-1 ring-white/10">Volume · {Math.round(selectedClip.volume * 100)}%<input type="range" min={0} max={1} step={0.01} value={selectedClip.volume} onChange={(e) => updateClip({ volume: Number(e.target.value) })} className="mt-1 w-full accent-violet-500" /></label>
-                <p className="text-xs leading-5 text-white/42">Music, voiceover, and beat sync will connect to the next media-bin pass.</p>
+                <p className="text-xs leading-5 text-white/40">Music, voiceover, and beat sync will connect to the next media-bin pass.</p>
               </div>
             )}
 
@@ -532,7 +532,7 @@ export default function MobileOpenCutStudio() {
                 <div className="grid grid-cols-3 gap-2 text-xs">
                   {['Clean', 'Glow', 'Film', 'Punch', 'Soft', 'Noir'].map((name) => <button key={name} className="min-h-14 rounded-2xl bg-white/[0.08] px-3 py-4 font-bold ring-1 ring-white/10 active:scale-95">{name}</button>)}
                 </div>
-                <p className="text-xs leading-5 text-white/42">Effect buttons are staged for the next render filter pass.</p>
+                <p className="text-xs leading-5 text-white/40">Effect buttons are staged for the next render filter pass.</p>
               </div>
             )}
 
@@ -541,7 +541,7 @@ export default function MobileOpenCutStudio() {
                 <div className="grid grid-cols-4 gap-2 text-xs">
                   {ASPECTS.map((aspect) => <button key={aspect} onClick={() => setProject((p) => ({ ...p, aspect }))} className={`min-h-11 rounded-2xl px-2 py-2 font-black ring-1 active:scale-95 ${project.aspect === aspect ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.08] text-white ring-white/10'}`}>{aspect}</button>)}
                 </div>
-                <button onClick={exportVideo} disabled={exporting} className="flex min-h-13 w-full items-center justify-center gap-2 rounded-[22px] bg-white px-4 py-3 font-black text-slate-950 shadow-[0_15px_40px_rgba(255,255,255,0.14)] disabled:opacity-60">{exporting ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />} {exporting ? `Rendering ${Math.round(exportProgress)}%` : 'Render mobile video'}</button>
+                <button onClick={exportVideo} disabled={exporting} className="flex min-h-[3.25rem] w-full items-center justify-center gap-2 rounded-[22px] bg-white px-4 py-3 font-black text-slate-950 shadow-[0_15px_40px_rgba(255,255,255,0.14)] disabled:opacity-60">{exporting ? <Loader2 className="h-5 w-5 animate-spin" /> : <Download className="h-5 w-5" />} {exporting ? `Rendering ${Math.round(exportProgress)}%` : 'Render mobile video'}</button>
                 {exportUrl && <button onClick={downloadExport} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-emerald-500 px-4 py-3 font-black text-emerald-950"><Check className="h-5 w-5" /> Download render</button>}
                 {exportError && <p className="rounded-2xl bg-red-500/10 p-3 text-xs text-red-100 ring-1 ring-red-300/20">{exportError}</p>}
               </div>
@@ -552,7 +552,7 @@ export default function MobileOpenCutStudio() {
             <div className="mx-auto max-w-[430px] px-3 pt-2">
               <div className="no-scrollbar flex gap-2 overflow-x-auto pb-2">
                 {TOOLS.map(({ id, label, icon: Icon }) => (
-                  <button key={id} onClick={() => setTool(id)} className={`flex min-h-[4rem] min-w-[4.85rem] flex-col items-center justify-center gap-1 rounded-[22px] px-3 py-2 text-[11px] font-black ring-1 active:scale-95 ${tool === id ? 'bg-white text-slate-950 ring-white shadow-[0_12px_35px_rgba(255,255,255,0.16)]' : 'bg-white/[0.07] text-white/62 ring-white/10'}`}>
+                  <button key={id} onClick={() => setTool(id)} className={`flex min-h-[4rem] min-w-[4.85rem] flex-col items-center justify-center gap-1 rounded-[22px] px-3 py-2 text-[11px] font-black ring-1 active:scale-95 ${tool === id ? 'bg-white text-slate-950 ring-white shadow-[0_12px_35px_rgba(255,255,255,0.16)]' : 'bg-white/[0.07] text-white/60 ring-white/10'}`}>
                     <Icon className="h-5 w-5" />
                     {label}
                   </button>
