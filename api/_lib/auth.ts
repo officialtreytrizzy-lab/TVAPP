@@ -26,23 +26,41 @@ function parseBearer(req: any): string {
   return match?.[1]?.trim() || '';
 }
 
-function parseConfiguredKeys(): ApiClient[] {
+function parseKeyEntry(entry: string): Array<ApiClient & { keyHash: string }> {
+  // Preferred format uses semicolons because OAuth-style scopes contain colons:
+  // key_id;sha256_hash;organization_id;plan;video_removal:write video_removal:read
+  if (entry.includes(';')) {
+    const [keyId, keyHash, organizationId = 'default_org', plan = 'starter', scopeText = 'video_removal:write video_removal:read video_editor:write video_editor:read'] = entry.split(';');
+    if (!keyId || !keyHash) return [];
+    return [{
+      keyId,
+      keyHash,
+      organizationId,
+      plan,
+      scopes: scopeText.split(/[\s,]+/).filter(Boolean),
+    }];
+  }
+
+  // Legacy fallback: key_id:sha256_hash only.
+  const [keyId, keyHash] = entry.split(':');
+  if (!keyId || !keyHash) return [];
+  return [{
+    keyId,
+    keyHash,
+    organizationId: 'default_org',
+    plan: 'starter',
+    scopes: ['video_removal:write', 'video_removal:read', 'video_editor:write', 'video_editor:read'],
+  }];
+}
+
+function parseConfiguredKeys(): Array<ApiClient & { keyHash: string }> {
   const raw = process.env.TREY_VIDEO_API_KEYS || '';
   return raw
-    .split(',')
+    .split('\n')
+    .flatMap((line) => line.split('|KEY|'))
     .map((part) => part.trim())
     .filter(Boolean)
-    .map((entry) => {
-      const [keyId, keyHash, organizationId = 'default_org', plan = 'starter', scopeText = 'video_removal:write video_removal:read video_editor:write video_editor:read'] = entry.split(':');
-      return {
-        keyId,
-        keyHash,
-        organizationId,
-        plan,
-        scopes: scopeText.split(/[\s|]+/).filter(Boolean),
-      };
-    })
-    .filter((client) => client.keyId && client.keyHash) as Array<ApiClient & { keyHash: string }>;
+    .flatMap(parseKeyEntry);
 }
 
 export function authenticate(req: any, requiredScope?: string): ApiClient | null {
@@ -82,7 +100,8 @@ export function requireApiKey(req: any, scope: string): ApiClient {
 export function describeAuthSetup() {
   return {
     header: 'Authorization: Bearer tve_live_xxx',
-    env: 'TREY_VIDEO_API_KEYS=key_id:sha256_hash:organization_id:plan:scopes',
+    env: 'TREY_VIDEO_API_KEYS=key_id;sha256_hash;organization_id;plan;scopes',
+    multipleKeys: 'Separate multiple key records with |KEY| or new lines.',
     hashCommand: 'node -e "console.log(require(\'crypto\').createHash(\'sha256\').update(process.argv[1]).digest(\'hex\'))" tve_live_your_secret_key',
   };
 }
