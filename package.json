@@ -9,7 +9,9 @@
     "build:dev": "vite build --mode development",
     "lint": "eslint .",
     "preview": "vite preview",
-    "check:eraser-contract": "node scripts/check-eraser-contract.mjs"
+    "check:eraser-contract": "node scripts/check-eraser-contract.mjs",
+    "check:api-contract": "node scripts/check-api-contract.mjs",
+    "check:contracts": "npm run check:eraser-contract && npm run check:api-contract"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",
