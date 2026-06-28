@@ -76,7 +76,8 @@ function getRemoteJobId(payload: WorkerJobResponse): string {
 }
 
 function getOutputUrl(payload: WorkerJobResponse): string {
-  return payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url || '';
+  const raw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url || '';
+  return raw ? absoluteUrl(raw) : '';
 }
 
 function getStatusUrl(payload: WorkerJobResponse): string {
@@ -133,7 +134,6 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
   const {
     jobId,
     file,
-    sourceUrl,
     fps,
     duration,
     width,
