@@ -7,6 +7,7 @@ import ProcessingPanel from './ProcessingPanel';
 import { probeVideo } from '@/lib/eraser/frames';
 import { eraserApi } from '@/lib/eraser/api';
 import { runPipeline, type PipelineOutput } from '@/lib/eraser/pipeline';
+import { gpuRemovalLabel, isGpuRemovalConfigured, runGpuRemoval } from '@/lib/eraser/gpu';
 import { RotateCcw, ShieldCheck } from 'lucide-react';
 
 const MAX_DURATION = 30;
@@ -26,7 +27,6 @@ function isIdempotencyError(msg: string): boolean {
 
 interface Meta { duration: number; width: number; height: number; fps: number; url: string; filename: string; }
 
-
 export default function Editor() {
   const [meta, setMeta] = useState<Meta | null>(null);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -37,9 +37,9 @@ export default function Editor() {
   const maskRef = useRef<MaskCanvasHandle | null>(null);
   const cancelRef = useRef({ cancelled: false });
   const outputRef = useRef<PipelineOutput | null>(null);
+  const sourceFileRef = useRef<File | null>(null);
   // Synchronous lock — fires before setProcessing(true) renders, blocking double-tap/mobile dupes.
   const processingLockRef = useRef(false);
-
 
   const [current, setCurrent] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -56,7 +56,8 @@ export default function Editor() {
   const [finalUrl, setFinalUrl] = useState<string | null>(null);
 
   const onFile = useCallback(async (file: File) => {
-    setUploadError(null); setUploadBusy(true);
+    setUploadError(null);
+    setUploadBusy(true);
     try {
       const supported = ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-m4v'];
       const okExt = /\.(mp4|mov|webm|m4v)$/i.test(file.name);
@@ -75,10 +76,14 @@ export default function Editor() {
         fileType: file.type || 'video/mp4', duration: probed.duration, fps: probed.fps,
         width: probed.width, height: probed.height, frameCount, originalFilename: file.name,
       });
+      sourceFileRef.current = file;
       setJobId(job.jobId);
       setMeta({ duration: probed.duration, width: probed.width, height: probed.height, fps: probed.fps, url: probed.url, filename: file.name });
-      setPhase(job.phase); setProgress(job.progress); setStatusMessage(job.statusMessage);
+      setPhase(job.phase);
+      setProgress(job.progress);
+      setStatusMessage(job.statusMessage);
     } catch (e) {
+      sourceFileRef.current = null;
       setUploadError((e as Error).message);
     } finally {
       setUploadBusy(false);
@@ -87,7 +92,8 @@ export default function Editor() {
 
   // video time sync
   useEffect(() => {
-    const v = videoRef.current; if (!v) return;
+    const v = videoRef.current;
+    if (!v) return;
     const onTime = () => setCurrent(v.currentTime);
     const onPlay = () => setPlaying(true);
     const onPause = () => setPlaying(false);
@@ -114,7 +120,9 @@ export default function Editor() {
     const maskCanvas = maskRef.current.getMaskCanvas();
     if (!maskCanvas || !maskRef.current.hasMask()) return;
     processingLockRef.current = true;
-    setError(null); setFinalUrl(null); setProcessing(true);
+    setError(null);
+    setFinalUrl(null);
+    setProcessing(true);
     cancelRef.current = { cancelled: false };
     videoRef.current.pause();
     try {
@@ -124,32 +132,55 @@ export default function Editor() {
       try {
         const cur = await eraserApi.getJob(jobId);
         if (cur && ACTIVE_PROCESSING.has(cur.phase)) {
-          setPhase(cur.phase); setProgress(cur.progress ?? 20);
+          setPhase(cur.phase);
+          setProgress(cur.progress ?? 20);
           setStatusMessage('This job is already processing. Keep this tab open.');
           return; // finally clears the lock; the in-flight run owns completion
         }
       } catch { /* non-fatal: fall through to normal flow */ }
 
-      const payload = { jobId, selectedFrameIndex: Math.round(current * meta.fps), maskWidth: meta.width, maskHeight: meta.height };
+      const selectedFrameIndex = Math.round(current * meta.fps);
+      const payload = { jobId, selectedFrameIndex, maskWidth: meta.width, maskHeight: meta.height };
       let maskRes: MaskResponse;
       if (isRefine) maskRes = await eraserApi.refineMask(payload);
       else maskRes = await eraserApi.setMask(payload);
       // Local state may idempotently report the job is already processing — adopt and bail.
       if (maskRes?.idempotent || (maskRes?.phase && ACTIVE_PROCESSING.has(maskRes.phase))) {
-        setPhase(maskRes.phase); setProgress(maskRes.progress ?? 20);
+        setPhase(maskRes.phase);
+        setProgress(maskRes.progress ?? 20);
         setStatusMessage('This job is already processing. Keep this tab open.');
         return;
       }
-      setPhase('mask_ready'); setProgress(20);
+      setPhase('mask_ready');
+      setProgress(20);
 
-      const out = await runPipeline({
-        jobId, video: videoRef.current, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
-        selectedTime: current, maskCanvas, cancelRef: cancelRef.current,
-        onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
-      });
+      const useGpu = isGpuRemovalConfigured() && !!sourceFileRef.current;
+      const out = useGpu
+        ? await runGpuRemoval({
+          jobId,
+          file: sourceFileRef.current!,
+          sourceUrl: meta.url,
+          fps: meta.fps,
+          duration: meta.duration,
+          width: meta.width,
+          height: meta.height,
+          selectedTime: current,
+          selectedFrameIndex,
+          maskCanvas,
+          cancelRef: cancelRef.current,
+          onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
+        })
+        : await runPipeline({
+          jobId, video: videoRef.current, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
+          selectedTime: current, maskCanvas, cancelRef: cancelRef.current,
+          onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
+        });
+
       outputRef.current = out;
       setFinalUrl(out.finalUrl);
-      setPhase('completed'); setProgress(100); setStatusMessage('Done!');
+      setPhase('completed');
+      setProgress(100);
+      setStatusMessage(useGpu ? 'Done with GPU AI removal.' : 'Done with browser fallback.');
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === '__CANCELLED__') {
@@ -172,7 +203,6 @@ export default function Editor() {
     }
   };
 
-
   const cancel = () => { cancelRef.current.cancelled = true; };
 
   const download = () => {
@@ -188,12 +218,12 @@ export default function Editor() {
     document.body.appendChild(a); a.click(); a.remove();
   };
 
-
   const reset = () => {
     if (meta) URL.revokeObjectURL(meta.url);
-    if (finalUrl) URL.revokeObjectURL(finalUrl);
+    if (finalUrl?.startsWith('blob:')) URL.revokeObjectURL(finalUrl);
     setMeta(null); setJobId(null); setFinalUrl(null); setError(null);
     setPhase('awaiting_mask'); setProgress(18); setProcessing(false); setHasMask(false);
+    sourceFileRef.current = null;
     outputRef.current = null;
   };
 
@@ -213,6 +243,7 @@ export default function Editor() {
 
   const ar = meta.width / meta.height;
   const editing = !processing && phase !== 'completed';
+  const processingMode = gpuRemovalLabel();
 
   return (
     <div className="grid gap-5 lg:grid-cols-[1fr_360px]">
@@ -242,6 +273,7 @@ export default function Editor() {
           <span className="rounded bg-slate-800 px-2 py-1 font-mono">{meta.width}×{meta.height}</span>
           <span className="rounded bg-slate-800 px-2 py-1 font-mono">{Math.round(meta.fps)} fps</span>
           <span className="rounded bg-slate-800 px-2 py-1 font-mono">{meta.duration.toFixed(1)}s</span>
+          <span className="rounded bg-slate-800 px-2 py-1 font-mono">{processingMode}</span>
           <button onClick={reset} className="ml-auto inline-flex items-center gap-1.5 rounded bg-slate-800 px-3 py-1.5 text-slate-300 hover:bg-slate-700">
             <RotateCcw className="h-3.5 w-3.5" /> New video
           </button>
@@ -261,7 +293,7 @@ export default function Editor() {
         <ProcessingPanel
           phase={phase} progress={progress} statusMessage={statusMessage} error={error}
           hasMask={hasMask} processing={processing} canProcess={PROCESS_READY.has(phase)}
-          finalUrl={finalUrl} originalUrl={meta.url}
+          finalUrl={finalUrl} originalUrl={meta.url} processingMode={processingMode}
           onProcess={() => process(false)} onCancel={cancel} onDownload={download}
         />
 
