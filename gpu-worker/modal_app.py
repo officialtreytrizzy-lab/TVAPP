@@ -27,6 +27,7 @@ app = modal.App("tvapp-video-eraser-gpu")
     gpu="A10G",
     timeout=60 * 45,
     scaledown_window=60 * 5,
+    max_containers=1,
 )
 @modal.concurrent(max_inputs=1)
 @modal.asgi_app()
