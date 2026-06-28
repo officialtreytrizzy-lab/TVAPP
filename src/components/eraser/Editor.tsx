@@ -219,9 +219,10 @@ export default function Editor() {
       {/* Left: video + canvas + timeline */}
       <div className="space-y-4">
         <div className="overflow-hidden rounded-2xl bg-black ring-1 ring-slate-800">
-          <div className="relative mx-auto w-full" style={{ aspectRatio: String(ar), maxHeight: '60vh' }}>
+          <div className="relative mx-auto w-full max-h-screen-video touch-none select-none" style={{ aspectRatio: String(ar) }}>
             <video
-              ref={videoRef} src={meta.url} playsInline muted
+              ref={videoRef} src={meta.url} playsInline muted controls={false}
+              disablePictureInPicture
               className="absolute inset-0 h-full w-full object-contain"
             />
             <MaskCanvas

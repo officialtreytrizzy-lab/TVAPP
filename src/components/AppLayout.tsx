@@ -19,7 +19,7 @@ interface ReopenState {
 function HistoryDrawer({ jobs, onClose, onReopen }: { jobs: LocalJob[]; onClose: () => void; onReopen: (j: LocalJob) => void }) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={onClose}>
-      <div className="h-full w-full max-w-md overflow-y-auto bg-slate-900 p-5 ring-1 ring-slate-800" onClick={(e) => e.stopPropagation()}>
+      <div className="h-full w-full max-w-md overflow-y-auto overscroll-contain bg-slate-900 p-5 pt-safe pb-safe ring-1 ring-slate-800" onClick={(e) => e.stopPropagation()}>
         <div className="mb-4 flex items-center justify-between">
           <h3 className="flex items-center gap-2 text-lg font-bold text-white"><History className="h-5 w-5 text-violet-400" /> Local jobs</h3>
           <button onClick={onClose} className="text-slate-400 hover:text-white"><X className="h-5 w-5" /></button>
@@ -81,12 +81,12 @@ export default function AppLayout() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-slate-950/80 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
+    <div className="min-h-dvh bg-slate-950 text-slate-100">
+      <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-slate-950/80 pt-safe backdrop-blur">
+        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 px-safe">
           <div className="flex items-center gap-2">
             <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-blue-600"><Wand2 className="h-5 w-5 text-white" /></div>
-            <span className="text-lg font-bold tracking-tight">Eraser<span className="text-violet-400">AI</span></span>
+            <span className="text-lg font-bold tracking-tight">Video E<span className="text-violet-400">Treyser</span></span>
           </div>
           <div className="flex items-center gap-2">
             <button onClick={() => { loadJobs(); setShowHistory(true); }} className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
@@ -151,14 +151,14 @@ export default function AppLayout() {
       <footer className="border-t border-slate-800 bg-slate-950">
         <div className="mx-auto grid max-w-6xl gap-8 px-4 py-12 sm:grid-cols-2 lg:grid-cols-4">
           <div>
-            <div className="flex items-center gap-2"><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-violet-600 to-blue-600"><Wand2 className="h-4 w-4 text-white" /></div><span className="font-bold">EraserAI</span></div>
+            <div className="flex items-center gap-2"><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-violet-600 to-blue-600"><Wand2 className="h-4 w-4 text-white" /></div><span className="font-bold">Video ETreyser</span></div>
             <p className="mt-3 text-sm text-slate-400">Video object removal that runs from one local app folder.</p>
           </div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Pipeline</h4><ul className="space-y-2 text-sm text-slate-400"><li>Frame extraction</li><li>Optical-flow tracking</li><li>Diffusion inpainting</li><li>Audio-preserving export</li></ul></div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Specs</h4><ul className="space-y-2 text-sm text-slate-400"><li>MP4 · MOV · WebM</li><li>Up to 30 seconds</li><li>Original FPS & audio</li><li>Aspect ratio preserved</li></ul></div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Connect</h4><div className="flex gap-3 text-slate-400"><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Github className="h-4 w-4" /></a><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Mail className="h-4 w-4" /></a></div></div>
         </div>
-        <div className="border-t border-slate-800 px-4 py-5 text-center text-xs text-slate-500">© {year} EraserAI. Only edit videos you own or have permission to edit.</div>
+        <div className="border-t border-slate-800 px-4 py-5 pb-safe text-center text-xs text-slate-500">© {year} Video ETreyser. Only edit videos you own or have permission to edit.</div>
       </footer>
 
       {showHistory && <HistoryDrawer jobs={jobs} onClose={() => setShowHistory(false)} onReopen={reopenJob} />}

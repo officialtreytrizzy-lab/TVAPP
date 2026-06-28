@@ -92,13 +92,87 @@
     @apply border-border;
   }
 
+  html {
+    /* Avoid iOS Safari auto-inflating text on rotation */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+  }
+
   body {
     @apply bg-background text-foreground font-sans dark:bg-background dark:text-foreground;
+    /* Stop iOS rubber-band / chained scrolling while brushing the mask */
+    overscroll-behavior-y: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Kill the grey tap flash on iOS for all interactive controls */
+  button,
+  a,
+  input,
+  [role='button'] {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* Drawing surfaces must never trigger scroll/zoom gestures on touch */
+  canvas {
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
   }
 
   pre, code {
     @apply font-mono;
   }
+}
+
+@layer utilities {
+  /* iPhone notch + home-indicator safe areas */
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .px-safe {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  /* Dynamic viewport height — accounts for the collapsing Safari toolbar */
+  .min-h-dvh {
+    min-height: 100vh;
+    min-height: 100dvh;
+  }
+  .max-h-screen-video {
+    max-height: 60vh;
+    max-height: 55dvh;
+  }
+}
+
+/* Bigger, finger-friendly range sliders on iOS (default WebKit thumb is tiny) */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 1.75rem; /* taller hit area for thumbs */
+  background: transparent;
+  touch-action: pan-x;
+  cursor: pointer;
+}
+input[type='range']::-webkit-slider-runnable-track {
+  height: 0.375rem;
+  border-radius: 9999px;
+  background: hsl(215 28% 25%);
+}
+input[type='range']::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  margin-top: -0.5625rem;
+  height: 1.5rem;
+  width: 1.5rem;
+  border-radius: 9999px;
+  background: #8b5cf6;
+  border: 2px solid #f8fafc;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.4);
 }
 
 .markdown-editor {
