@@ -1,4 +1,22 @@
 {
   "buildCommand": "npm run build",
-  "outputDirectory": "dist"
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/studio",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/mobile-editor",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/opencut",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/opencut/mobile",
+      "destination": "/index.html"
+    }
+  ]
 }
