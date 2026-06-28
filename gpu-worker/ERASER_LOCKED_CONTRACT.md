@@ -14,6 +14,7 @@ Vercel React app
 → gpu-worker/main.py
 → gpu-worker/pipelines/sam2_propainter.py
 → ProPainter static-mask removal
+→ source-resolution / source-FPS / audio-preserving export
 → /v1/video-eraser/jobs/{job_id}/output
 → frontend playback/download
 ```
@@ -22,15 +23,25 @@ Vercel React app
 
 - `src/lib/eraser/gpu.ts` must upload both the original video and PNG mask.
 - `src/lib/eraser/gpu.ts` must convert relative Modal output URLs into absolute URLs.
+- `src/lib/eraser/gpu.ts` must send `quality`, `preserve_resolution`, `preserve_fps`, and `preserve_audio` to the worker.
 - `src/components/eraser/Editor.tsx` must use `runGpuRemoval()` when `VITE_ERASER_GPU_WORKER_URL` exists.
 - `src/components/eraser/ProcessingPanel.tsx` must show whether the app is in `GPU AI worker` or `browser fallback` mode.
+- `src/components/eraser/ProcessingPanel.tsx` must expose `Same quality` and `Higher quality` render options.
 - `gpu-worker/modal_app.py` must install ProPainter into `/opt/ProPainter`.
 - `gpu-worker/modal_app.py` must use a real GPU.
 - `gpu-worker/modal_app.py` must keep `max_containers=1` until job state is moved out of memory into durable storage.
 - `gpu-worker/modal_app.py` must keep `@modal.concurrent(max_inputs=1)` because ProPainter is memory-heavy.
 - `gpu-worker/main.py` must default to `python /app/pipelines/sam2_propainter.py`.
+- `gpu-worker/main.py` must pass output quality and preservation flags into the pipeline environment.
 - `gpu-worker/pipelines/sam2_propainter.py` must call ProPainter's `inference_propainter.py`.
+- `gpu-worker/pipelines/sam2_propainter.py` must restore the final MP4 to source width, source height, and source FPS.
 - `gpu-worker/pipelines/sam2_propainter.py` must preserve original audio when possible.
+
+## Render quality rule
+
+`Same quality` means the output is restored to the original video dimensions, frame rate, and audio track, then encoded with a source-quality setting that avoids unnecessary extra compression.
+
+`Higher quality` keeps the same dimensions and frame rate but uses a cleaner, lower-compression export. It may create a larger file. It cannot invent detail that was not in the source, but it should avoid making the rendered video worse after removal.
 
 ## Why `max_containers=1` is locked
 
