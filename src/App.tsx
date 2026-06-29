@@ -6,6 +6,7 @@ import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { ThemeProvider } from "@/components/theme-provider";
 import Index from "./pages/Index";
 import MobileStudio from "./pages/MobileStudio";
+import ApiDocs from "./pages/ApiDocs";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -23,6 +24,8 @@ const App = () => (
             <Route path="/mobile-editor" element={<MobileStudio />} />
             <Route path="/opencut" element={<MobileStudio />} />
             <Route path="/opencut/mobile" element={<MobileStudio />} />
+            <Route path="/api-docs" element={<ApiDocs />} />
+            <Route path="/developers" element={<ApiDocs />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>
