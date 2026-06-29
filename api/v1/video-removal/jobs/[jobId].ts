@@ -14,6 +14,10 @@ function modalOutputFromPayload(modal: any): string | undefined {
   return modal.outputUrl || modal.output_url || modal.finalOutputUrl || modal.final_output_url || modal.previewUrl || modal.preview_url;
 }
 
+function publicOutputUrl(baseUrl: string, jobId: string): string {
+  return `${baseUrl}/api/v1/video-removal/jobs/${jobId}/output`;
+}
+
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;
   if (req.method !== 'GET') return methodNotAllowed(res, ['GET']);
@@ -44,7 +48,7 @@ export default async function handler(req: any, res: any) {
         quality: modal.quality || 'source',
         created_at: modal.created_at || modal.createdAt,
         status_url: `${baseUrl}/api/v1/video-removal/jobs/${jobId}`,
-        output_url: hasOutput ? `${baseUrl}/api/v1/video-removal/jobs/${jobId}/output` : undefined,
+        output_url: hasOutput ? publicOutputUrl(baseUrl, jobId) : undefined,
         metadata: modal.metadata || { source: 'gpu_worker_fallback' },
       });
     }
@@ -54,9 +58,10 @@ export default async function handler(req: any, res: any) {
       const modal = await readModalStatus(record.modal_status_url);
       const status = normalizeJobStatus(modal.phase || modal.status || record.status);
       const outputRaw = modalOutputFromPayload(modal);
+      const hasOutput = Boolean(outputRaw) || status === 'completed';
       updated = updateRememberedJob(jobId, {
         status,
-        output_url: outputRaw || status === 'completed' ? `${baseUrl}/api/v1/video-removal/jobs/${jobId}/output` : record.output_url,
+        output_url: hasOutput ? publicOutputUrl(baseUrl, jobId) : record.output_url,
       }) || record;
     }
 
