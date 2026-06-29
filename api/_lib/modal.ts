@@ -61,6 +61,14 @@ function absoluteModalUrl(pathOrUrl: string): string {
   return `${base}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
 }
 
+export function modalJobStatusUrl(jobId: string): string {
+  return absoluteModalUrl(`/v1/video-eraser/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export function modalJobOutputUrl(jobId: string): string {
+  return absoluteModalUrl(`/v1/video-eraser/jobs/${encodeURIComponent(jobId)}/output`);
+}
+
 async function fetchAsBlob(url: string, label: string): Promise<Blob> {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Could not fetch ${label}: HTTP ${response.status}`);
