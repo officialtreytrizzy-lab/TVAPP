@@ -10,6 +10,24 @@ const endpoints = [
   },
   {
     method: 'POST',
+    path: '/api/v1/api-key-requests',
+    scope: 'public',
+    description: 'Submits a developer inquiry for admin approval.',
+  },
+  {
+    method: 'GET',
+    path: '/api/v1/admin/api-key-requests',
+    scope: 'admin',
+    description: 'Lists pending, approved, and denied API key requests in the admin portal.',
+  },
+  {
+    method: 'POST',
+    path: '/api/v1/admin/api-key-review',
+    scope: 'admin',
+    description: 'Approves or denies a request. Approval issues a working bearer token.',
+  },
+  {
+    method: 'POST',
     path: '/api/v1/video-removal/jobs',
     scope: 'video_removal:write',
     description: 'Creates a video object-removal job from a source video and mask.',
@@ -56,9 +74,13 @@ const ApiDocs: React.FC = () => {
             </div>
             <span className="text-lg font-bold tracking-tight">Video E<span className="text-violet-400">Treyser</span></span>
           </a>
-          <a href="/" className="inline-flex items-center gap-2 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
-            <ArrowLeft className="h-4 w-4" /> Back to app
-          </a>
+          <div className="flex items-center gap-2">
+            <a href="/api-key-request" className="hidden rounded-lg bg-violet-600 px-3 py-2 text-sm font-semibold text-white hover:bg-violet-500 sm:inline-flex">Request key</a>
+            <a href="/admin/api-requests" className="hidden rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700 sm:inline-flex">Admin</a>
+            <a href="/" className="inline-flex items-center gap-2 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
+              <ArrowLeft className="h-4 w-4" /> Back to app
+            </a>
+          </div>
         </div>
       </header>
 
@@ -73,11 +95,12 @@ const ApiDocs: React.FC = () => {
               Build video erasing and mobile editor workflows into your own app.
             </h1>
             <p className="mt-5 max-w-2xl text-lg text-slate-300">
-              Use the same Video ETreyser pipeline from code: create object-removal jobs, check status, stream finished MP4s, and route mobile editor render jobs through protected API endpoints.
+              Use the same Video ETreyser pipeline from code: request API access, get admin approval, create object-removal jobs, check status, and stream finished MP4s through protected endpoints.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
-              <a href="#endpoints" className="rounded-xl bg-gradient-to-r from-violet-600 to-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 hover:from-violet-500 hover:to-blue-500">View endpoints</a>
-              <a href="#auth" className="rounded-xl bg-slate-800 px-6 py-3 text-sm font-semibold text-white ring-1 ring-slate-700 hover:bg-slate-700">Authentication</a>
+              <a href="/api-key-request" className="rounded-xl bg-gradient-to-r from-violet-600 to-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 hover:from-violet-500 hover:to-blue-500">Request API key</a>
+              <a href="/admin/api-requests" className="rounded-xl bg-slate-800 px-6 py-3 text-sm font-semibold text-white ring-1 ring-slate-700 hover:bg-slate-700">Admin approval portal</a>
+              <a href="#endpoints" className="rounded-xl bg-slate-900 px-6 py-3 text-sm font-semibold text-white ring-1 ring-slate-700 hover:bg-slate-800">View endpoints</a>
             </div>
           </div>
         </section>
@@ -91,12 +114,12 @@ const ApiDocs: React.FC = () => {
           <div className="rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800">
             <KeyRound className="mb-3 h-6 w-6 text-violet-300" />
             <h2 className="font-semibold text-white">Scoped API keys</h2>
-            <p className="mt-2 text-sm text-slate-400">Protected endpoints require bearer keys with read or write scopes for the requested workflow.</p>
+            <p className="mt-2 text-sm text-slate-400">Developers submit a request, then approved keys unlock the exact scopes granted by admin.</p>
           </div>
           <div className="rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800">
             <ShieldCheck className="mb-3 h-6 w-6 text-violet-300" />
-            <h2 className="font-semibold text-white">Commercial guardrails</h2>
-            <p className="mt-2 text-sm text-slate-400">Use videos you own or have permission to edit, and keep model/license clearance in place before production use.</p>
+            <h2 className="font-semibold text-white">Admin approval</h2>
+            <p className="mt-2 text-sm text-slate-400">The admin portal can approve or deny inquiries. Approved requests issue active bearer tokens.</p>
           </div>
         </section>
 
@@ -107,7 +130,7 @@ const ApiDocs: React.FC = () => {
               <h2 className="text-2xl font-bold text-white">Authentication</h2>
             </div>
             <p className="text-slate-300">
-              Send protected requests with an API key in the Authorization header.
+              Send protected requests with an approved API key in the Authorization header.
             </p>
             <pre className="mt-4 overflow-x-auto rounded-2xl bg-slate-950 p-4 text-sm text-slate-200 ring-1 ring-slate-800"><code>Authorization: Bearer YOUR_TREY_VIDEO_API_KEY</code></pre>
           </div>
