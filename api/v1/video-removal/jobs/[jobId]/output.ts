@@ -1,12 +1,6 @@
 import { requireApiKey } from '../../../../_lib/auth';
 import { error, handleOptions, methodNotAllowed } from '../../../../_lib/http';
-import { getRememberedJob, modalBaseUrl } from '../../../../_lib/modal';
-
-function absoluteModalUrl(pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  const base = modalBaseUrl();
-  return `${base}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
-}
+import { getRememberedJob, modalJobOutputUrl } from '../../../../_lib/modal';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;
@@ -16,11 +10,9 @@ export default async function handler(req: any, res: any) {
     requireApiKey(req, 'video_removal:read');
     const jobId = String(req.query.jobId || '');
     const record = getRememberedJob(jobId);
-    if (!record) return error(res, 404, 'Job not found. Durable job storage is required before multi-instance production use.', 'job_not_found');
+    const externalJobId = record?.external_job_id || jobId;
+    const upstream = await fetch(modalJobOutputUrl(externalJobId));
 
-    const externalJobId = record.external_job_id || jobId;
-    const modalOutput = absoluteModalUrl(`/v1/video-eraser/jobs/${externalJobId}/output`);
-    const upstream = await fetch(modalOutput);
     if (!upstream.ok || !upstream.body) {
       return error(res, upstream.status || 502, `Output not ready from worker: HTTP ${upstream.status}`, 'output_not_ready');
     }
