@@ -2,8 +2,8 @@ export type JsonBody = Record<string, unknown> | unknown[];
 
 export function setCors(res: any) {
   res.setHeader('Access-Control-Allow-Origin', process.env.TREY_VIDEO_API_ALLOWED_ORIGIN || '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,Idempotency-Key,X-Trey-Webhook-Signature');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type,Idempotency-Key,X-Admin-Key,X-Trey-Webhook-Signature');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
