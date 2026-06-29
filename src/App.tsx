@@ -7,6 +7,8 @@ import { ThemeProvider } from "@/components/theme-provider";
 import Index from "./pages/Index";
 import MobileStudio from "./pages/MobileStudio";
 import ApiDocs from "./pages/ApiDocs";
+import ApiKeyRequest from "./pages/ApiKeyRequest";
+import AdminApiRequests from "./pages/AdminApiRequests";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -26,6 +28,9 @@ const App = () => (
             <Route path="/opencut/mobile" element={<MobileStudio />} />
             <Route path="/api-docs" element={<ApiDocs />} />
             <Route path="/developers" element={<ApiDocs />} />
+            <Route path="/api-key-request" element={<ApiKeyRequest />} />
+            <Route path="/request-api-key" element={<ApiKeyRequest />} />
+            <Route path="/admin/api-requests" element={<AdminApiRequests />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
         </BrowserRouter>
