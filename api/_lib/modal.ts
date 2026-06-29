@@ -14,11 +14,22 @@ export interface RemovalJobRequest {
   metadata?: Record<string, unknown>;
 }
 
+export interface MixTransitionJobRequest {
+  clip_a_url?: string;
+  clip_b_url?: string;
+  clip_a_base64?: string;
+  clip_b_base64?: string;
+  duration?: number;
+  quality?: 'source' | 'higher';
+  webhook_url?: string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface ApiJobRecord {
   job_id: string;
   external_job_id?: string;
   status: string;
-  service: 'video_removal';
+  service: 'video_removal' | 'video_transition';
   mode: string;
   quality: string;
   created_at: string;
@@ -67,6 +78,14 @@ export function modalJobStatusUrl(jobId: string): string {
 
 export function modalJobOutputUrl(jobId: string): string {
   return absoluteModalUrl(`/v1/video-eraser/jobs/${encodeURIComponent(jobId)}/output`);
+}
+
+export function modalMixTransitionStatusUrl(jobId: string): string {
+  return absoluteModalUrl(`/v1/video-transitions/mix/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export function modalMixTransitionOutputUrl(jobId: string): string {
+  return absoluteModalUrl(`/v1/video-transitions/mix/jobs/${encodeURIComponent(jobId)}/output`);
 }
 
 async function fetchAsBlob(url: string, label: string): Promise<Blob> {
@@ -129,6 +148,56 @@ export async function submitRemovalToModal(jobId: string, input: RemovalJobReque
   const externalJobId = payload.jobId || payload.job_id || payload.id || jobId;
   const outputRaw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url;
   const statusRaw = payload.statusUrl || payload.status_url || `/v1/video-eraser/jobs/${externalJobId}`;
+
+  return {
+    externalJobId,
+    phase: payload.phase || payload.status || 'queued',
+    progress: payload.progress,
+    outputUrl: outputRaw ? absoluteModalUrl(outputRaw) : undefined,
+    statusUrl: statusRaw ? absoluteModalUrl(statusRaw) : undefined,
+  };
+}
+
+export async function submitMixTransitionToModal(jobId: string, input: MixTransitionJobRequest): Promise<{
+  externalJobId: string;
+  phase: string;
+  progress?: number;
+  outputUrl?: string;
+  statusUrl?: string;
+}> {
+  const base = modalBaseUrl();
+  if (!base) throw new Error('VITE_ERASER_GPU_WORKER_URL or ERASER_GPU_WORKER_URL is not configured.');
+
+  const form = new FormData();
+  let clipABlob: Blob;
+  let clipBBlob: Blob;
+
+  if (input.clip_a_base64) clipABlob = base64ToBlob(input.clip_a_base64, 'video/mp4');
+  else if (input.clip_a_url) clipABlob = await fetchAsBlob(input.clip_a_url, 'clip_a_url');
+  else throw new Error('clip_a_url or clip_a_base64 is required.');
+
+  if (input.clip_b_base64) clipBBlob = base64ToBlob(input.clip_b_base64, 'video/mp4');
+  else if (input.clip_b_url) clipBBlob = await fetchAsBlob(input.clip_b_url, 'clip_b_url');
+  else throw new Error('clip_b_url or clip_b_base64 is required.');
+
+  form.append('clip_a', clipABlob, `${jobId}-a.mp4`);
+  form.append('clip_b', clipBBlob, `${jobId}-b.mp4`);
+  form.append('job_id', jobId);
+  form.append('duration', String(input.duration || 1));
+  form.append('quality', input.quality || 'source');
+
+  const response = await fetch(`${base}/v1/video-transitions/mix/jobs`, { method: 'POST', body: form });
+  const text = await response.text();
+  let payload: any = {};
+  try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }
+  if (!response.ok) {
+    const detail = payload?.detail || payload?.error || text || `Modal transition worker failed with HTTP ${response.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+
+  const externalJobId = payload.jobId || payload.job_id || payload.id || jobId;
+  const outputRaw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url;
+  const statusRaw = payload.statusUrl || payload.status_url || `/v1/video-transitions/mix/jobs/${externalJobId}`;
 
   return {
     externalJobId,
