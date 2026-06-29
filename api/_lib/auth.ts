@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { listApprovedApiKeys } from './api-key-approvals';
 
 export interface ApiClient {
   keyId: string;
@@ -63,11 +64,21 @@ function parseConfiguredKeys(): Array<ApiClient & { keyHash: string }> {
     .flatMap(parseKeyEntry);
 }
 
+function parseApprovedKeys(): Array<ApiClient & { keyHash: string }> {
+  return listApprovedApiKeys().map((key) => ({
+    keyId: key.keyId,
+    keyHash: key.keyHash,
+    organizationId: key.organizationId,
+    plan: key.plan,
+    scopes: key.scopes,
+  }));
+}
+
 export function authenticate(req: any, requiredScope?: string): ApiClient | null {
   const token = parseBearer(req);
   if (!token) return null;
   const digest = sha256(token);
-  const clients = parseConfiguredKeys();
+  const clients = [...parseConfiguredKeys(), ...parseApprovedKeys()];
 
   for (const client of clients) {
     if (!safeEqualHex(digest, client.keyHash)) continue;
@@ -101,7 +112,7 @@ export function describeAuthSetup() {
   return {
     header: 'Authorization: Bearer tve_live_xxx',
     env: 'TREY_VIDEO_API_KEYS=key_id;sha256_hash;organization_id;plan;scopes',
-    multipleKeys: 'Separate multiple key records with |KEY| or new lines.',
+    multipleKeys: 'Separate multiple key records with |KEY| or new lines. Admin-approved runtime keys are also accepted.',
     hashCommand: 'node -e "console.log(require(\'crypto\').createHash(\'sha256\').update(process.argv[1]).digest(\'hex\'))" tve_live_your_secret_key',
   };
 }
