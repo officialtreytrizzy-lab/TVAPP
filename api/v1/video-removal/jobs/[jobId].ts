@@ -1,6 +1,18 @@
 import { requireApiKey } from '../../../_lib/auth';
 import { error, handleOptions, json, methodNotAllowed, publicBaseUrl } from '../../../_lib/http';
-import { getRememberedJob, readModalStatus, updateRememberedJob } from '../../../_lib/modal';
+import { getRememberedJob, modalJobStatusUrl, readModalStatus, updateRememberedJob } from '../../../_lib/modal';
+
+function normalizeJobStatus(value: unknown): string {
+  const status = String(value || '').toLowerCase();
+  if (['completed', 'complete', 'done', 'success', 'succeeded'].includes(status)) return 'completed';
+  if (['failed', 'error', 'errored', 'cancelled', 'canceled'].includes(status)) return 'failed';
+  if (['queued', 'pending', 'created'].includes(status)) return 'queued';
+  return 'processing';
+}
+
+function modalOutputFromPayload(modal: any): string | undefined {
+  return modal.outputUrl || modal.output_url || modal.finalOutputUrl || modal.final_output_url || modal.previewUrl || modal.preview_url;
+}
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;
@@ -10,16 +22,41 @@ export default async function handler(req: any, res: any) {
     requireApiKey(req, 'video_removal:read');
     const jobId = String(req.query.jobId || '');
     const record = getRememberedJob(jobId);
-    if (!record) return error(res, 404, 'Job not found. Durable job storage is required before multi-instance production use.', 'job_not_found');
+    const baseUrl = publicBaseUrl(req);
+
+    if (!record) {
+      let modal: any;
+      try {
+        modal = await readModalStatus(modalJobStatusUrl(jobId));
+      } catch {
+        return error(res, 404, 'Job not found in API memory or GPU worker.', 'job_not_found');
+      }
+
+      const status = normalizeJobStatus(modal.phase || modal.status);
+      const outputRaw = modalOutputFromPayload(modal);
+      const hasOutput = Boolean(outputRaw) || status === 'completed';
+
+      return json(res, 200, {
+        job_id: modal.job_id || modal.jobId || modal.id || jobId,
+        status,
+        service: 'video_removal',
+        mode: modal.mode || modal.pipeline || 'video_removal',
+        quality: modal.quality || 'source',
+        created_at: modal.created_at || modal.createdAt,
+        status_url: `${baseUrl}/api/v1/video-removal/jobs/${jobId}`,
+        output_url: hasOutput ? `${baseUrl}/api/v1/video-removal/jobs/${jobId}/output` : undefined,
+        metadata: modal.metadata || { source: 'gpu_worker_fallback' },
+      });
+    }
 
     let updated = record;
     if (record.modal_status_url && record.status !== 'completed') {
       const modal = await readModalStatus(record.modal_status_url);
-      const phase = modal.phase || modal.status || record.status;
-      const outputRaw = modal.outputUrl || modal.output_url || modal.finalOutputUrl || modal.final_output_url;
+      const status = normalizeJobStatus(modal.phase || modal.status || record.status);
+      const outputRaw = modalOutputFromPayload(modal);
       updated = updateRememberedJob(jobId, {
-        status: phase === 'completed' ? 'completed' : phase === 'failed' ? 'failed' : 'processing',
-        output_url: outputRaw ? `${publicBaseUrl(req)}/api/v1/video-removal/jobs/${jobId}/output` : record.output_url,
+        status,
+        output_url: outputRaw || status === 'completed' ? `${baseUrl}/api/v1/video-removal/jobs/${jobId}/output` : record.output_url,
       }) || record;
     }
 
