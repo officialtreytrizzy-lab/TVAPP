@@ -28,6 +28,24 @@ const endpoints = [
   },
   {
     method: 'POST',
+    path: '/api/v1/video-transitions/mix',
+    scope: 'video_editor:write',
+    description: 'Creates a CapCut-style Mix dissolve transition render job from two clips.',
+  },
+  {
+    method: 'GET',
+    path: '/api/v1/video-transitions/status?job_id={jobId}',
+    scope: 'video_editor:read',
+    description: 'Checks Mix transition render status and output availability.',
+  },
+  {
+    method: 'GET',
+    path: '/api/v1/video-transitions/output?job_id={jobId}',
+    scope: 'video_editor:read',
+    description: 'Streams or downloads the finished Mix transition MP4.',
+  },
+  {
+    method: 'POST',
     path: '/api/v1/video-removal/jobs',
     scope: 'video_removal:write',
     description: 'Creates a video object-removal job from a source video and mask.',
@@ -52,15 +70,15 @@ const endpoints = [
   },
 ];
 
-const curlExample = `curl -X POST https://your-domain.com/api/v1/video-removal/jobs \\
+const curlExample = `curl -X POST https://your-domain.com/api/v1/video-transitions/mix \\
   -H "Authorization: Bearer YOUR_TREY_VIDEO_API_KEY" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "source_video_url": "https://example.com/source.mp4",
-    "mask_url": "https://example.com/mask.png",
-    "mode": "moving_object",
+    "clip_a_url": "https://example.com/scene-a.mp4",
+    "clip_b_url": "https://example.com/scene-b.mp4",
+    "duration": 1.0,
     "quality": "source",
-    "preserve_audio": true
+    "metadata": { "transition": "mix" }
   }'`;
 
 const ApiDocs: React.FC = () => {
@@ -95,7 +113,7 @@ const ApiDocs: React.FC = () => {
               Build video erasing and mobile editor workflows into your own app.
             </h1>
             <p className="mt-5 max-w-2xl text-lg text-slate-300">
-              Use the same Video ETreyser pipeline from code: request API access, get admin approval, create object-removal jobs, check status, and stream finished MP4s through protected endpoints.
+              Use the same Video ETreyser pipeline from code: request API access, get admin approval, create CapCut-style Mix transitions, create object-removal jobs, check status, and stream finished MP4s through protected endpoints.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
               <a href="/api-key-request" className="rounded-xl bg-gradient-to-r from-violet-600 to-blue-600 px-6 py-3 text-sm font-semibold text-white shadow-lg shadow-violet-900/40 hover:from-violet-500 hover:to-blue-500">Request API key</a>
@@ -108,8 +126,8 @@ const ApiDocs: React.FC = () => {
         <section className="mx-auto grid max-w-6xl gap-4 px-4 py-10 sm:grid-cols-3">
           <div className="rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800">
             <Video className="mb-3 h-6 w-6 text-violet-300" />
-            <h2 className="font-semibold text-white">Video removal</h2>
-            <p className="mt-2 text-sm text-slate-400">Submit a clip and mask, then receive a clean MP4 output after the GPU worker finishes.</p>
+            <h2 className="font-semibold text-white">Mix transitions</h2>
+            <p className="mt-2 text-sm text-slate-400">Create CapCut-style dissolve transitions with FFmpeg xfade and audio crossfade.</p>
           </div>
           <div className="rounded-2xl bg-slate-900/60 p-5 ring-1 ring-slate-800">
             <KeyRound className="mb-3 h-6 w-6 text-violet-300" />
