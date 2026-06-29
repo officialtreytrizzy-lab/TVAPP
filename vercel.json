@@ -11,6 +11,18 @@
       "destination": "/index.html"
     },
     {
+      "source": "/api-key-request",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/request-api-key",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/admin/api-requests",
+      "destination": "/index.html"
+    },
+    {
       "source": "/studio",
       "destination": "/index.html"
     },
