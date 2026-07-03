@@ -1,6 +1,6 @@
 import { requireApiKey } from '../../../../_lib/auth.js';
 import { error, handleOptions, methodNotAllowed } from '../../../../_lib/http.js';
-import { getRememberedJob, modalJobOutputUrl } from '../../../../_lib/modal.js';
+import { getRememberedJob, modalCompositeOutputFromPayload, modalJobOutputUrl, readModalStatus } from '../../../../_lib/modal.js';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;
@@ -11,7 +11,20 @@ export default async function handler(req: any, res: any) {
     const jobId = String(req.query.jobId || '');
     const record = getRememberedJob(jobId);
     const externalJobId = record?.external_job_id || jobId;
-    const upstream = await fetch(modalJobOutputUrl(externalJobId));
+
+    let outputUrl = modalJobOutputUrl(externalJobId);
+    const statusUrl = record?.modal_status_url;
+    if (statusUrl) {
+      try {
+        const modal = await readModalStatus(statusUrl);
+        const preferred = modalCompositeOutputFromPayload(modal);
+        if (preferred) outputUrl = /^https?:\/\//i.test(preferred) ? preferred : modalJobOutputUrl(externalJobId).replace(`/v1/video-eraser/jobs/${encodeURIComponent(externalJobId)}/output`, preferred.startsWith('/') ? preferred : `/${preferred}`);
+      } catch {
+        // Fall back to the conventional worker output endpoint.
+      }
+    }
+
+    const upstream = await fetch(outputUrl);
 
     if (!upstream.ok || !upstream.body) {
       return error(res, upstream.status || 502, `Output not ready from worker: HTTP ${upstream.status}`, 'output_not_ready');
