@@ -1,0 +1,31 @@
+import { requireApiKey } from '../_lib/auth.js';
+import { error, handleOptions, json, methodNotAllowed } from '../_lib/http.js';
+import { modalBaseUrl } from '../_lib/modal.js';
+
+/**
+ * Key-gated discovery of the GPU worker's direct upload endpoints.
+ *
+ * Vercel serverless functions cap request AND response bodies at ~4.5MB, so
+ * real videos cannot flow through the relay endpoints. Licensed clients call
+ * this endpoint with their API key, then POST multipart form-data straight to
+ * the worker (which allows CORS) and poll/download from it directly.
+ */
+export default async function handler(req: any, res: any) {
+  if (handleOptions(req, res)) return;
+  if (req.method !== 'GET') return methodNotAllowed(res, ['GET']);
+
+  try {
+    requireApiKey(req, 'video_removal:write');
+    const base = modalBaseUrl();
+    if (!base) return error(res, 503, 'GPU worker is not configured.', 'worker_not_configured');
+    json(res, 200, {
+      worker_base: base,
+      video_removal_upload_url: `${base}/v1/video-eraser/jobs`,
+      video_transitions_mix_upload_url: `${base}/v1/video-transitions/mix/jobs`,
+      note: 'POST multipart form-data (video, mask | clip_a, clip_b) directly to these URLs for large files; poll {worker_base}/v1/.../jobs/{jobId} and fetch .../output when phase=completed.',
+    });
+  } catch (e) {
+    const err = e as any;
+    error(res, err.status || 500, err.message || 'Could not resolve upload target.', err.code || 'upload_target_failed');
+  }
+}
