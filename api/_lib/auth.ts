@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { listApprovedApiKeys } from './api-key-approvals';
+import { listApprovedApiKeys } from './api-key-approvals.js';
 
 export interface ApiClient {
   keyId: string;

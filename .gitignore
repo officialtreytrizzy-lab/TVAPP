@@ -7,3 +7,4 @@ dist
 *.local
 *.log
 trey-video-api-key.local.txt
+.vercel
