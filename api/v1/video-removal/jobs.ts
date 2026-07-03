@@ -1,6 +1,6 @@
-import { requireApiKey } from '../../_lib/auth';
-import { error, handleOptions, json, methodNotAllowed, publicBaseUrl, readJson } from '../../_lib/http';
-import { newPublicJobId, rememberJob, submitRemovalToModal, type RemovalJobRequest } from '../../_lib/modal';
+import { requireApiKey } from '../../_lib/auth.js';
+import { error, handleOptions, json, methodNotAllowed, publicBaseUrl, readJson } from '../../_lib/http.js';
+import { newPublicJobId, rememberJob, submitRemovalToModal, type RemovalJobRequest } from '../../_lib/modal.js';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;

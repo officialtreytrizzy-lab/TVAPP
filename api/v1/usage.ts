@@ -1,5 +1,5 @@
-import { requireApiKey } from '../_lib/auth';
-import { error, handleOptions, json, methodNotAllowed } from '../_lib/http';
+import { requireApiKey } from '../_lib/auth.js';
+import { error, handleOptions, json, methodNotAllowed } from '../_lib/http.js';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;

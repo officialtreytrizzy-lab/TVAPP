@@ -1,6 +1,6 @@
-import { describeAuthSetup } from '../_lib/auth';
-import { handleOptions, json } from '../_lib/http';
-import { modalBaseUrl } from '../_lib/modal';
+import { describeAuthSetup } from '../_lib/auth.js';
+import { handleOptions, json } from '../_lib/http.js';
+import { modalBaseUrl } from '../_lib/modal.js';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;

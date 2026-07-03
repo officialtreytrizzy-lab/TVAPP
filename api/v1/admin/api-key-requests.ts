@@ -1,6 +1,6 @@
-import { requireAdmin } from '../../_lib/admin';
-import { listApiKeyInquiries } from '../../_lib/api-key-approvals';
-import { error, handleOptions, json, methodNotAllowed } from '../../_lib/http';
+import { requireAdmin } from '../../_lib/admin.js';
+import { listApiKeyInquiries } from '../../_lib/api-key-approvals.js';
+import { error, handleOptions, json, methodNotAllowed } from '../../_lib/http.js';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;

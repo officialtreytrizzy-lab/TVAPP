@@ -1,6 +1,6 @@
-import { requireApiKey } from '../../../_lib/auth';
-import { error, handleOptions, json, methodNotAllowed, publicBaseUrl } from '../../../_lib/http';
-import { getRememberedJob, modalJobStatusUrl, readModalStatus, updateRememberedJob } from '../../../_lib/modal';
+import { requireApiKey } from '../../../_lib/auth.js';
+import { error, handleOptions, json, methodNotAllowed, publicBaseUrl } from '../../../_lib/http.js';
+import { getRememberedJob, modalJobStatusUrl, readModalStatus, updateRememberedJob } from '../../../_lib/modal.js';
 
 function normalizeJobStatus(value: unknown): string {
   const status = String(value || '').toLowerCase();
