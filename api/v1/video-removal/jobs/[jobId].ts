@@ -1,6 +1,6 @@
 import { requireApiKey } from '../../../_lib/auth.js';
 import { error, handleOptions, json, methodNotAllowed, publicBaseUrl } from '../../../_lib/http.js';
-import { getRememberedJob, modalJobStatusUrl, readModalStatus, updateRememberedJob } from '../../../_lib/modal.js';
+import { getRememberedJob, modalCompositeOutputFromPayload, modalJobStatusUrl, readModalStatus, updateRememberedJob } from '../../../_lib/modal.js';
 
 function normalizeJobStatus(value: unknown): string {
   const status = String(value || '').toLowerCase();
@@ -8,10 +8,6 @@ function normalizeJobStatus(value: unknown): string {
   if (['failed', 'error', 'errored', 'cancelled', 'canceled'].includes(status)) return 'failed';
   if (['queued', 'pending', 'created'].includes(status)) return 'queued';
   return 'processing';
-}
-
-function modalOutputFromPayload(modal: any): string | undefined {
-  return modal.outputUrl || modal.output_url || modal.finalOutputUrl || modal.final_output_url || modal.previewUrl || modal.preview_url;
 }
 
 function publicOutputUrl(baseUrl: string, jobId: string): string {
@@ -37,7 +33,7 @@ export default async function handler(req: any, res: any) {
       }
 
       const status = normalizeJobStatus(modal.phase || modal.status);
-      const outputRaw = modalOutputFromPayload(modal);
+      const outputRaw = modalCompositeOutputFromPayload(modal);
       const hasOutput = Boolean(outputRaw) || status === 'completed';
 
       return json(res, 200, {
@@ -49,7 +45,10 @@ export default async function handler(req: any, res: any) {
         created_at: modal.created_at || modal.createdAt,
         status_url: `${baseUrl}/api/v1/video-removal/jobs/${jobId}`,
         output_url: hasOutput ? publicOutputUrl(baseUrl, jobId) : undefined,
-        metadata: modal.metadata || { source: 'gpu_worker_fallback' },
+        metadata: {
+          ...(modal.metadata || { source: 'gpu_worker_fallback' }),
+          output_kind: outputRaw ? 'composite_preferred' : undefined,
+        },
       });
     }
 
@@ -57,11 +56,15 @@ export default async function handler(req: any, res: any) {
     if (record.modal_status_url && record.status !== 'completed') {
       const modal = await readModalStatus(record.modal_status_url);
       const status = normalizeJobStatus(modal.phase || modal.status || record.status);
-      const outputRaw = modalOutputFromPayload(modal);
+      const outputRaw = modalCompositeOutputFromPayload(modal);
       const hasOutput = Boolean(outputRaw) || status === 'completed';
       updated = updateRememberedJob(jobId, {
         status,
         output_url: hasOutput ? publicOutputUrl(baseUrl, jobId) : record.output_url,
+        metadata: {
+          ...(record.metadata || {}),
+          worker_output_kind: outputRaw ? 'composite_preferred' : undefined,
+        },
       }) || record;
     }
 
