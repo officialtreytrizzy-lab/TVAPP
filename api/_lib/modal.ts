@@ -10,6 +10,13 @@ export interface RemovalJobRequest {
   preserve_resolution?: boolean;
   preserve_fps?: boolean;
   preserve_audio?: boolean;
+  output_mode?: 'composite' | 'patch' | string;
+  return_mode?: 'composite' | 'patch' | string;
+  result_mode?: 'full_video' | 'patch' | string;
+  output_kind?: 'full_video' | 'patch' | string;
+  composite_output?: boolean;
+  patch_only?: boolean;
+  return_patch?: boolean;
   webhook_url?: string;
   metadata?: Record<string, unknown>;
 }
@@ -88,6 +95,27 @@ export function modalMixTransitionOutputUrl(jobId: string): string {
   return absoluteModalUrl(`/v1/video-transitions/mix/jobs/${encodeURIComponent(jobId)}/output`);
 }
 
+export function modalCompositeOutputFromPayload(modal: any): string | undefined {
+  // Prefer final/full/composited outputs. Some workers expose preview/output as
+  // the patch artifact and finalOutputUrl as the actual full-frame video.
+  return modal.finalCompositeUrl
+    || modal.final_composite_url
+    || modal.compositeOutputUrl
+    || modal.composite_output_url
+    || modal.fullVideoUrl
+    || modal.full_video_url
+    || modal.finalOutputUrl
+    || modal.final_output_url
+    || modal.outputUrl
+    || modal.output_url
+    || modal.resultUrl
+    || modal.result_url
+    || modal.videoUrl
+    || modal.video_url
+    || modal.previewUrl
+    || modal.preview_url;
+}
+
 async function fetchAsBlob(url: string, label: string): Promise<Blob> {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`Could not fetch ${label}: HTTP ${response.status}`);
@@ -97,6 +125,29 @@ async function fetchAsBlob(url: string, label: string): Promise<Blob> {
 function base64ToBlob(base64: string, mimeType: string): Blob {
   const clean = base64.includes(',') ? base64.split(',').pop() || '' : base64;
   return new Blob([Buffer.from(clean, 'base64')], { type: mimeType });
+}
+
+function appendRemovalOutputIntent(form: FormData, input: RemovalJobRequest): void {
+  const outputMode = input.output_mode || 'composite';
+  const returnMode = input.return_mode || 'composite';
+  const resultMode = input.result_mode || 'full_video';
+  const outputKind = input.output_kind || 'full_video';
+  const compositeOutput = input.composite_output !== false;
+  const patchOnly = input.patch_only === true;
+  const returnPatch = input.return_patch === true;
+
+  // These keys intentionally overlap because worker versions differ. Unknown
+  // fields are harmless; known fields force the worker to return the finished
+  // erased video instead of the raw patch/crop artifact.
+  form.append('output_mode', outputMode);
+  form.append('return_mode', returnMode);
+  form.append('result_mode', resultMode);
+  form.append('output_kind', outputKind);
+  form.append('composite_output', String(compositeOutput));
+  form.append('patch_only', String(patchOnly));
+  form.append('return_patch', String(returnPatch));
+  form.append('full_frame_output', 'true');
+  form.append('full_video_output', 'true');
 }
 
 export async function submitRemovalToModal(jobId: string, input: RemovalJobRequest): Promise<{
@@ -135,6 +186,7 @@ export async function submitRemovalToModal(jobId: string, input: RemovalJobReque
   form.append('preserve_resolution', String(input.preserve_resolution !== false));
   form.append('preserve_fps', String(input.preserve_fps !== false));
   form.append('preserve_audio', String(input.preserve_audio !== false));
+  appendRemovalOutputIntent(form, input);
 
   const response = await fetch(`${base}/v1/video-eraser/jobs`, { method: 'POST', body: form });
   const text = await response.text();
@@ -146,7 +198,7 @@ export async function submitRemovalToModal(jobId: string, input: RemovalJobReque
   }
 
   const externalJobId = payload.jobId || payload.job_id || payload.id || jobId;
-  const outputRaw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url;
+  const outputRaw = modalCompositeOutputFromPayload(payload);
   const statusRaw = payload.statusUrl || payload.status_url || `/v1/video-eraser/jobs/${externalJobId}`;
 
   return {
