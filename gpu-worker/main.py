@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import select
+import signal
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from threading import Lock, Thread
@@ -184,6 +187,20 @@ def save_upload(upload: UploadFile, path: Path) -> None:
         shutil.copyfileobj(upload.file, out)
 
 
+def append_text_log(path: Path, line: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line.rstrip("\n") + "\n")
+        handle.flush()
+
+
+def tail_text(path: Path, limit: int = 6000) -> str:
+    if not path.exists():
+        return ""
+    data = path.read_text(encoding="utf-8", errors="replace")
+    return data[-limit:]
+
+
 def run_json(command: list[str]) -> dict[str, Any]:
     completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
     if completed.returncode != 0:
@@ -318,9 +335,29 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
     video_path = job_dir / "input_video"
     mask_path = job_dir / "mask.png"
     output_path = job_dir / "output.mp4"
+    pipeline_log_path = job_dir / "wan_pipeline.log"
+    error_log_path = job_dir / "error.log"
+    started_at = time.monotonic()
+    heartbeat_marks = [
+        (60, 40, "Wan is still generating…"),
+        (120, 45, "Wan is still generating…"),
+        (240, 50, "Wan is still generating…"),
+        (480, 60, "Wan is still generating…"),
+    ]
+    next_heartbeat_index = 0
+    process: subprocess.Popen[str] | None = None
 
     log_path = job_dir / "error.log"
     try:
+        append_text_log(pipeline_log_path, f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+        append_text_log(pipeline_log_path, f"job_id={job_id}")
+        append_text_log(pipeline_log_path, f"input_path={video_path}")
+        append_text_log(pipeline_log_path, f"output_path={output_path}")
+        append_text_log(pipeline_log_path, f"prompt={prompt}")
+        append_text_log(pipeline_log_path, f"worker_pid={os.getpid()}")
+        append_text_log(pipeline_log_path, f"worker_thread_id={get_ident()}")
+        append_text_log(pipeline_log_path, f"pipeline_command={AI_REMIX_PIPELINE_CMD}")
+
         if not AI_REMIX_PIPELINE_CMD:
             raise RuntimeError("AI_REMIX_PIPELINE_CMD is not configured. Point it at the Wan remix pipeline command.")
         if not prompt.strip():
@@ -340,12 +377,15 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
             "AI_REMIX_PRESERVE_FACE": preserve_face,
             "AI_REMIX_PRESERVE_MOTION": preserve_motion,
             "AI_REMIX_OUTPUT_QUALITY": quality,
+            "AI_REMIX_LOG_PATH": str(pipeline_log_path),
+            "PYTHONUNBUFFERED": "1",
             "WAN_ROOT": os.environ.get("WAN_ROOT", "/opt/Wan2.1"),
             "WAN_CKPT_DIR": os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B"),
         })
 
         set_job(job_id, phase="remixing", progress=35, statusMessage="Generating prompt-based AI remix with Wan2.1")
-        completed = subprocess.run(
+        append_text_log(pipeline_log_path, "starting AI Remix pipeline subprocess")
+        process = subprocess.Popen(
             AI_REMIX_PIPELINE_CMD,
             shell=True,
             cwd=str(job_dir),
@@ -353,7 +393,8 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            timeout=60 * 45,
+            bufsize=1,
+            start_new_session=True,
         )
         (job_dir / "wan_pipeline.log").write_text(completed.stdout or "", encoding="utf-8")
         if completed.returncode != 0:
@@ -361,6 +402,7 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
         assert_playable_mp4(output_path)
 
         final_url = public_remix_output_url(job_id)
+        append_text_log(pipeline_log_path, "AI Remix pipeline completed successfully")
         set_job(
             job_id,
             phase="completed",
@@ -628,6 +670,9 @@ async def create_ai_remix_job(
         f"prompt={prompt}\nintent={intent}\nstrength={normalized_strength}\npreserve_audio={preserve_audio}\npreserve_face={preserve_face}\npreserve_motion={preserve_motion}\nquality={normalized_quality}\n",
         encoding="utf-8",
     )
+    append_text_log(job_dir / "wan_pipeline.log", f"job_id={remote_job_id}")
+    append_text_log(job_dir / "wan_pipeline.log", f"queued_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    append_text_log(job_dir / "wan_pipeline.log", "queued AI Remix job; background worker thread will append lifecycle details")
 
     state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued AI Remix", prompt=prompt, intent=intent, strength=normalized_strength)
     thread = Thread(
