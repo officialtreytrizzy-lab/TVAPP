@@ -14,13 +14,16 @@ from pydantic import BaseModel
 
 WORK_DIR = Path(os.environ.get("ERASER_WORK_DIR", "/tmp/video-eraser-jobs"))
 TRANSITION_WORK_DIR = Path(os.environ.get("TRANSITION_WORK_DIR", "/tmp/video-transition-jobs"))
+REMIX_WORK_DIR = Path(os.environ.get("AI_REMIX_WORK_DIR", "/tmp/ai-remix-jobs"))
 PUBLIC_BASE_URL = os.environ.get("ERASER_PUBLIC_BASE_URL", "").rstrip("/")
 PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2_propainter.py").strip()
+AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pipelines/wan_vace_remix.py").strip()
 
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
+REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Video Eraser GPU Worker", version="1.1.1")
+app = FastAPI(title="TVAPP GPU Worker", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,15 +39,17 @@ class JobState(BaseModel):
     statusMessage: str = "Queued"
     # Legacy/generic output URL kept for older clients.
     outputUrl: str | None = None
-    # Explicit names for the final full-frame composited erased video. Newer
-    # clients/proxies must prefer these over generic outputUrl because generic
-    # output/preview names can be confused with patch/blob artifacts.
+    # Explicit names for final full-frame video outputs. Newer clients/proxies
+    # must prefer these over generic outputUrl to avoid patch/blob ambiguity.
     finalCompositeUrl: str | None = None
     compositeOutputUrl: str | None = None
     fullVideoUrl: str | None = None
     finalOutputUrl: str | None = None
     outputKind: str | None = None
     error: str | None = None
+    prompt: str | None = None
+    intent: str | None = None
+    strength: str | None = None
 
 jobs: dict[str, JobState] = {}
 jobs_lock = Lock()
@@ -78,6 +83,12 @@ def public_transition_output_url(job_id: str) -> str:
     if PUBLIC_BASE_URL:
         return f"{PUBLIC_BASE_URL}/v1/video-transitions/mix/jobs/{job_id}/output"
     return f"/v1/video-transitions/mix/jobs/{job_id}/output"
+
+
+def public_remix_output_url(job_id: str) -> str:
+    if PUBLIC_BASE_URL:
+        return f"{PUBLIC_BASE_URL}/v1/ai-remix/jobs/{job_id}/output"
+    return f"/v1/ai-remix/jobs/{job_id}/output"
 
 
 def save_upload(upload: UploadFile, path: Path) -> None:
@@ -215,6 +226,72 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
         set_job(job_id, phase="failed", progress=100, statusMessage="GPU AI removal failed", error=str(exc))
 
 
+def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, preserve_audio: str, preserve_face: str, preserve_motion: str, quality: str) -> None:
+    job_dir = REMIX_WORK_DIR / job_id
+    video_path = job_dir / "input_video"
+    mask_path = job_dir / "mask.png"
+    output_path = job_dir / "output.mp4"
+
+    try:
+        if not AI_REMIX_PIPELINE_CMD:
+            raise RuntimeError("AI_REMIX_PIPELINE_CMD is not configured. Point it at the Wan remix pipeline command.")
+        if not prompt.strip():
+            raise RuntimeError("AI Remix prompt is required.")
+
+        set_job(job_id, phase="preparing", progress=8, statusMessage="Preparing Wan2.1 AI Remix", prompt=prompt, intent=intent, strength=strength)
+        env = os.environ.copy()
+        env.update({
+            "AI_REMIX_JOB_ID": job_id,
+            "AI_REMIX_INPUT_VIDEO": str(video_path),
+            "AI_REMIX_INPUT_MASK": str(mask_path) if mask_path.exists() else "",
+            "AI_REMIX_OUTPUT_VIDEO": str(output_path),
+            "AI_REMIX_PROMPT": prompt,
+            "AI_REMIX_INTENT": intent,
+            "AI_REMIX_STRENGTH": strength,
+            "AI_REMIX_PRESERVE_AUDIO": preserve_audio,
+            "AI_REMIX_PRESERVE_FACE": preserve_face,
+            "AI_REMIX_PRESERVE_MOTION": preserve_motion,
+            "AI_REMIX_OUTPUT_QUALITY": quality,
+            "WAN_ROOT": os.environ.get("WAN_ROOT", "/opt/Wan2.1"),
+            "WAN_CKPT_DIR": os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B"),
+        })
+
+        set_job(job_id, phase="remixing", progress=35, statusMessage="Generating prompt-based AI remix with Wan2.1")
+        completed = subprocess.run(
+            AI_REMIX_PIPELINE_CMD,
+            shell=True,
+            cwd=str(job_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60 * 45,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stdout[-6000:] or f"AI Remix pipeline exited with {completed.returncode}")
+        assert_playable_mp4(output_path)
+
+        final_url = public_remix_output_url(job_id)
+        set_job(
+            job_id,
+            phase="completed",
+            progress=100,
+            statusMessage="AI Remix complete",
+            outputUrl=final_url,
+            finalCompositeUrl=final_url,
+            compositeOutputUrl=final_url,
+            fullVideoUrl=final_url,
+            finalOutputUrl=final_url,
+            outputKind="ai_remix_video",
+            error=None,
+            prompt=prompt,
+            intent=intent,
+            strength=strength,
+        )
+    except Exception as exc:
+        set_job(job_id, phase="failed", progress=100, statusMessage="AI Remix failed", error=str(exc), prompt=prompt, intent=intent, strength=strength)
+
+
 def process_mix_transition(job_id: str, duration: str, quality: str) -> None:
     job_dir = TRANSITION_WORK_DIR / job_id
     clip_a = job_dir / "clip_a"
@@ -330,6 +407,57 @@ async def read_output(job_id: str):
         raise HTTPException(status_code=404, detail="Output not ready")
     assert_playable_mp4(output_path)
     return FileResponse(output_path, media_type="video/mp4", filename=f"{job_id}-erased.mp4")
+
+
+@app.post("/v1/ai-remix/jobs")
+async def create_ai_remix_job(
+    background_tasks: BackgroundTasks,
+    video: UploadFile = File(...),
+    mask: UploadFile | None = File(default=None),
+    job_id: str = Form(default=""),
+    prompt: str = Form(default=""),
+    intent: str = Form(default="full_video_to_video"),
+    strength: str = Form(default="medium"),
+    preserve_audio: str = Form(default="true"),
+    preserve_face: str = Form(default="true"),
+    preserve_motion: str = Form(default="true"),
+    quality: str = Form(default="source"),
+):
+    remote_job_id = job_id.strip() or f"remix_{uuid.uuid4().hex[:18]}"
+    job_dir = REMIX_WORK_DIR / remote_job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    normalized_strength = strength if strength in {"light", "medium", "heavy"} else "medium"
+    normalized_quality = quality if quality in {"draft", "source", "high"} else "source"
+
+    save_upload(video, job_dir / "input_video")
+    if mask is not None:
+        save_upload(mask, job_dir / "mask.png")
+    (job_dir / "request.txt").write_text(
+        f"prompt={prompt}\nintent={intent}\nstrength={normalized_strength}\npreserve_audio={preserve_audio}\npreserve_face={preserve_face}\npreserve_motion={preserve_motion}\nquality={normalized_quality}\n",
+        encoding="utf-8",
+    )
+
+    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued AI Remix", prompt=prompt, intent=intent, strength=normalized_strength)
+    background_tasks.add_task(process_ai_remix_job, remote_job_id, prompt, intent, normalized_strength, preserve_audio, preserve_face, preserve_motion, normalized_quality)
+    return {
+        **state.model_dump(),
+        "statusUrl": f"/v1/ai-remix/jobs/{remote_job_id}",
+    }
+
+
+@app.get("/v1/ai-remix/jobs/{job_id}")
+async def read_ai_remix_job(job_id: str):
+    return get_job(job_id).model_dump()
+
+
+@app.get("/v1/ai-remix/jobs/{job_id}/output")
+async def read_ai_remix_output(job_id: str):
+    get_job(job_id)
+    output_path = REMIX_WORK_DIR / job_id / "output.mp4"
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Output not ready")
+    assert_playable_mp4(output_path)
+    return FileResponse(output_path, media_type="video/mp4", filename=f"{job_id}-ai-remix.mp4")
 
 
 @app.post("/v1/video-transitions/mix/jobs")
