@@ -28,7 +28,7 @@ TREY_VIDEO_API_KEYS=key_id;sha256_hash;organization_id;plan;scopes
 Generate an API key hash:
 
 ```bash
-node -e "console.log(require('crypto').createHash('sha256').update(process.argv[1]).digest('hex'))" tve_live_your_secret_key
+node scripts/create-trey-video-api-key.mjs
 ```
 
 Example `TREY_VIDEO_API_KEYS` value:
@@ -39,12 +39,38 @@ starter_key_1;YOUR_SHA256_HASH;org_demo;starter;video_removal:write video_remova
 
 For multiple keys, separate records with `|KEY|` or put each record on a new line.
 
+## Trecut Eraser integration
+
+Trecut must not expose a raw generated API key through `VITE_*` browser variables. The Eraser tool calls the server-side proxy:
+
+```text
+/api/v1/trecut/eraser/jobs
+/api/v1/trecut/eraser/jobs/{job_id}
+/api/v1/trecut/eraser/jobs/{job_id}/output
+```
+
+Set the generated bearer token as a server/Vercel environment variable:
+
+```bash
+TRECUT_ETREYSER_API_KEY=GENERATED_BEARER_TOKEN_FROM_LOCAL_KEY_FILE
+```
+
+Optional overrides:
+
+```bash
+TRECUT_ETREYSER_API_BASE_URL=https://your-domain.com
+VITE_TRECUT_ERASER_PROXY_URL=/api/v1/trecut/eraser
+VITE_TRECUT_ERASER_USE_PROXY=true
+```
+
+The proxy attaches the bearer token server-side, calls the licensed Video ETreyser API, then rewrites protected status/output URLs back through the Trecut proxy so the browser never needs the secret.
+
 ## Auth
 
 Every protected request uses:
 
 ```http
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 Idempotency-Key: optional-customer-idempotency-key
 ```
 
@@ -58,21 +84,21 @@ GET /api/v1/health
 
 ```http
 GET /api/v1/licenses
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 ```
 
 ## Usage status
 
 ```http
 GET /api/v1/usage
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 ```
 
 ## Create video-removal job
 
 ```http
 POST /api/v1/video-removal/jobs
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 Content-Type: application/json
 ```
 
@@ -127,21 +153,21 @@ Response:
 
 ```http
 GET /api/v1/video-removal/jobs/{job_id}
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 ```
 
 ## Read job output
 
 ```http
 GET /api/v1/video-removal/jobs/{job_id}/output
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 ```
 
 ## Create OpenCut render job
 
 ```http
 POST /api/v1/video-editor/render-jobs
-Authorization: Bearer tve_live_xxx
+Authorization: Bearer GENERATED_BEARER_TOKEN
 Content-Type: application/json
 ```
 

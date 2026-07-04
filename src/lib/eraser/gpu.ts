@@ -39,21 +39,19 @@ interface WorkerJobResponse {
   error_message?: string;
 }
 
-const WORKER_URL = String(import.meta.env.VITE_ERASER_GPU_WORKER_URL ?? '').replace(/\/$/, '');
-const API_KEY = String(import.meta.env.VITE_ERASER_GPU_API_KEY ?? '');
+const DIRECT_WORKER_URL = String(import.meta.env.VITE_ERASER_GPU_WORKER_URL ?? '').replace(/\/$/, '');
+const ERASER_API_PROXY_URL = String(import.meta.env.VITE_TRECUT_ERASER_PROXY_URL ?? '/api/v1/trecut/eraser').replace(/\/$/, '');
+const USE_ERASER_API_PROXY = String(import.meta.env.VITE_TRECUT_ERASER_USE_PROXY ?? 'true').toLowerCase() !== 'false';
 const POLL_MS = 1400;
 const MAX_POLLS = 900; // about 21 minutes
 
 export function isGpuRemovalConfigured(): boolean {
-  return WORKER_URL.length > 0;
+  return (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL.length > 0) || DIRECT_WORKER_URL.length > 0;
 }
 
 export function gpuRemovalLabel(): string {
-  return isGpuRemovalConfigured() ? 'GPU AI worker' : 'browser fallback';
-}
-
-function authHeaders(): HeadersInit {
-  return API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {};
+  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser API proxy';
+  return DIRECT_WORKER_URL ? 'GPU AI worker' : 'browser fallback';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -69,26 +67,35 @@ function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   });
 }
 
-function absoluteUrl(pathOrUrl: string): string {
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  return `${WORKER_URL}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Could not prepare upload for eTreyser API.'));
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function absoluteUrl(baseUrl: string, pathOrUrl: string): string {
+  if (/^https?:\/\//i.test(pathOrUrl) || pathOrUrl.startsWith('blob:')) return pathOrUrl;
+  return `${baseUrl}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
 }
 
 function getRemoteJobId(payload: WorkerJobResponse): string {
   return payload.jobId || payload.job_id || payload.id || '';
 }
 
-function getOutputUrl(payload: WorkerJobResponse): string {
+function getOutputUrl(payload: WorkerJobResponse, baseUrl: string): string {
   const raw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url || '';
-  return raw ? absoluteUrl(raw) : '';
+  return raw ? absoluteUrl(baseUrl, raw) : '';
 }
 
-function getStatusUrl(payload: WorkerJobResponse): string {
+function getStatusUrl(payload: WorkerJobResponse, baseUrl: string, pathPrefix: string): string {
   const explicit = payload.statusUrl || payload.status_url;
-  if (explicit) return absoluteUrl(explicit);
+  if (explicit) return absoluteUrl(baseUrl, explicit);
   const remoteJobId = getRemoteJobId(payload);
   if (!remoteJobId) return '';
-  return `${WORKER_URL}/v1/video-eraser/jobs/${encodeURIComponent(remoteJobId)}`;
+  return `${baseUrl}${pathPrefix}/${encodeURIComponent(remoteJobId)}`;
 }
 
 function normalizePhase(payload: WorkerJobResponse): string {
@@ -106,7 +113,12 @@ async function parseWorkerResponse(res: Response): Promise<WorkerJobResponse> {
   const contentType = res.headers.get('content-type') || '';
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(text || `GPU worker failed with HTTP ${res.status}.`);
+    let message = text || `GPU worker failed with HTTP ${res.status}.`;
+    try {
+      const payload = JSON.parse(text);
+      message = payload?.error?.message || payload?.detail || payload?.error || message;
+    } catch { /* keep raw message */ }
+    throw new Error(message);
   }
   if (contentType.includes('application/json')) return (await res.json()) as WorkerJobResponse;
   if (contentType.startsWith('video/')) {
@@ -119,20 +131,126 @@ async function parseWorkerResponse(res: Response): Promise<WorkerJobResponse> {
 }
 
 async function fetchStatus(statusUrl: string): Promise<WorkerJobResponse> {
-  const res = await fetch(statusUrl, { method: 'GET', headers: authHeaders() });
+  const res = await fetch(statusUrl, { method: 'GET' });
   return parseWorkerResponse(res);
 }
 
-async function requestCancel(remoteJobId: string): Promise<void> {
-  if (!remoteJobId) return;
-  await fetch(`${WORKER_URL}/v1/video-eraser/jobs/${encodeURIComponent(remoteJobId)}/cancel`, {
+async function requestDirectWorkerCancel(remoteJobId: string): Promise<void> {
+  if (!remoteJobId || !DIRECT_WORKER_URL) return;
+  await fetch(`${DIRECT_WORKER_URL}/v1/video-eraser/jobs/${encodeURIComponent(remoteJobId)}/cancel`, {
     method: 'POST',
-    headers: authHeaders(),
   }).catch(() => undefined);
 }
 
-export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
-  if (!WORKER_URL) throw new Error('GPU video eraser worker is not configured.');
+function makePipelineOutput(outputUrl: string, input: GpuRemovalInput): PipelineOutput {
+  return {
+    finalUrl: outputUrl,
+    localUrl: outputUrl,
+    mimeType: 'video/mp4',
+    hasAudio: true,
+    outW: input.width,
+    outH: input.height,
+    effectiveFps: input.fps,
+    frameCount: Math.round(input.duration * input.fps),
+    procW: input.width,
+    procH: input.height,
+    lowConfidenceFrames: [],
+    inpaintedFrames: [],
+    originalFrames: [],
+    timestamps: [],
+    confidence: [],
+  };
+}
+
+async function waitForRemovalOutput(options: {
+  initialPayload: WorkerJobResponse;
+  baseUrl: string;
+  statusPathPrefix: string;
+  input: GpuRemovalInput;
+  onCancel?: (remoteJobId: string) => Promise<void>;
+}): Promise<PipelineOutput> {
+  const { baseUrl, statusPathPrefix, input, onCancel } = options;
+  const { outputQuality = 'source', cancelRef, onPhase } = input;
+  let payload = options.initialPayload;
+  let remoteJobId = getRemoteJobId(payload);
+  let outputUrl = getOutputUrl(payload, baseUrl);
+
+  if (outputUrl) {
+    onPhase?.('completed', 100, outputQuality === 'higher' ? 'AI removal complete in higher quality.' : 'AI removal complete at source quality.');
+    return makePipelineOutput(outputUrl, input);
+  }
+
+  const statusUrl = getStatusUrl(payload, baseUrl, statusPathPrefix);
+  if (!statusUrl) throw new Error('eTreyser did not return a status URL or output URL.');
+
+  for (let poll = 0; poll < MAX_POLLS; poll++) {
+    if (cancelRef.cancelled) {
+      if (onCancel) await onCancel(remoteJobId);
+      throw new Error('__CANCELLED__');
+    }
+
+    await sleep(POLL_MS);
+    payload = await fetchStatus(statusUrl);
+    remoteJobId = getRemoteJobId(payload) || remoteJobId;
+    const phase = normalizePhase(payload);
+    const progress = Math.max(24, Math.min(99, Number(payload.progress ?? (24 + poll * 2))));
+    const msg = payload.statusMessage || payload.status_message || 'eTreyser is removing the selected object...';
+    onPhase?.(phase === 'completed' ? 'generating_preview' : phase, progress, msg);
+
+    if (phase === 'failed') throw new Error(payload.error || payload.error_message || 'AI video removal failed.');
+
+    outputUrl = getOutputUrl(payload, baseUrl);
+    if (phase === 'completed' || outputUrl) {
+      if (!outputUrl) throw new Error('eTreyser completed but did not return an output URL.');
+      onPhase?.('completed', 100, outputQuality === 'higher' ? 'AI removal complete in higher quality.' : 'AI removal complete at source quality.');
+      return makePipelineOutput(outputUrl, input);
+    }
+  }
+
+  throw new Error('AI video removal timed out.');
+}
+
+async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
+  const { jobId, file, selectedFrameIndex, maskCanvas, outputQuality = 'source', onPhase } = input;
+
+  onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser API...');
+
+  const maskBlob = await canvasToPngBlob(maskCanvas);
+  const [sourceVideoBase64, maskBase64] = await Promise.all([
+    blobToDataUrl(file),
+    blobToDataUrl(maskBlob),
+  ]);
+
+  const createRes = await fetch(`${ERASER_API_PROXY_URL}/jobs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      source_video_base64: sourceVideoBase64,
+      mask_base64: maskBase64,
+      mode: 'static_logo',
+      quality: outputQuality,
+      preserve_resolution: true,
+      preserve_fps: true,
+      preserve_audio: true,
+      metadata: {
+        source: 'trecut_eraser_tool',
+        local_job_id: jobId,
+        selected_frame_index: selectedFrameIndex,
+      },
+    }),
+  });
+
+  const initialPayload = await parseWorkerResponse(createRes);
+  return waitForRemovalOutput({
+    initialPayload,
+    baseUrl: ERASER_API_PROXY_URL,
+    statusPathPrefix: '/jobs',
+    input,
+  });
+}
+
+async function runDirectWorkerRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
+  if (!DIRECT_WORKER_URL) throw new Error('GPU video eraser worker is not configured.');
 
   const {
     jobId,
@@ -145,7 +263,6 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
     selectedFrameIndex,
     maskCanvas,
     outputQuality = 'source',
-    cancelRef,
     onPhase,
   } = input;
 
@@ -169,78 +286,22 @@ export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOut
   form.append('preserve_fps', 'true');
   form.append('preserve_audio', 'true');
 
-  const createRes = await fetch(`${WORKER_URL}/v1/video-eraser/jobs`, {
+  const createRes = await fetch(`${DIRECT_WORKER_URL}/v1/video-eraser/jobs`, {
     method: 'POST',
-    headers: authHeaders(),
     body: form,
   });
-  let payload = await parseWorkerResponse(createRes);
-  let remoteJobId = getRemoteJobId(payload);
-  let outputUrl = getOutputUrl(payload);
 
-  if (outputUrl) {
-    onPhase?.('completed', 100, outputQuality === 'higher' ? 'GPU AI removal complete in higher quality.' : 'GPU AI removal complete at source quality.');
-    return {
-      finalUrl: outputUrl,
-      localUrl: outputUrl,
-      mimeType: 'video/mp4',
-      hasAudio: true,
-      outW: width,
-      outH: height,
-      effectiveFps: fps,
-      frameCount: Math.round(duration * fps),
-      procW: width,
-      procH: height,
-      lowConfidenceFrames: [],
-      inpaintedFrames: [],
-      originalFrames: [],
-      timestamps: [],
-      confidence: [],
-    };
-  }
+  const initialPayload = await parseWorkerResponse(createRes);
+  return waitForRemovalOutput({
+    initialPayload,
+    baseUrl: DIRECT_WORKER_URL,
+    statusPathPrefix: '/v1/video-eraser/jobs',
+    input,
+    onCancel: requestDirectWorkerCancel,
+  });
+}
 
-  const statusUrl = getStatusUrl(payload);
-  if (!statusUrl) throw new Error('GPU worker did not return a status URL or output URL.');
-
-  for (let poll = 0; poll < MAX_POLLS; poll++) {
-    if (cancelRef.cancelled) {
-      await requestCancel(remoteJobId);
-      throw new Error('__CANCELLED__');
-    }
-
-    await sleep(POLL_MS);
-    payload = await fetchStatus(statusUrl);
-    remoteJobId = getRemoteJobId(payload) || remoteJobId;
-    const phase = normalizePhase(payload);
-    const progress = Math.max(24, Math.min(99, Number(payload.progress ?? (24 + poll * 2))));
-    const msg = payload.statusMessage || payload.status_message || 'GPU AI worker is removing the selected object...';
-    onPhase?.(phase === 'completed' ? 'generating_preview' : phase, progress, msg);
-
-    if (phase === 'failed') throw new Error(payload.error || payload.error_message || 'GPU AI video removal failed.');
-
-    outputUrl = getOutputUrl(payload);
-    if (phase === 'completed' || outputUrl) {
-      if (!outputUrl) throw new Error('GPU worker completed but did not return an output URL.');
-      onPhase?.('completed', 100, outputQuality === 'higher' ? 'GPU AI removal complete in higher quality.' : 'GPU AI removal complete at source quality.');
-      return {
-        finalUrl: outputUrl,
-        localUrl: outputUrl,
-        mimeType: 'video/mp4',
-        hasAudio: true,
-        outW: width,
-        outH: height,
-        effectiveFps: fps,
-        frameCount: Math.round(duration * fps),
-        procW: width,
-        procH: height,
-        lowConfidenceFrames: [],
-        inpaintedFrames: [],
-        originalFrames: [],
-        timestamps: [],
-        confidence: [],
-      };
-    }
-  }
-
-  throw new Error('GPU AI video removal timed out.');
+export async function runGpuRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
+  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return runApiProxyRemoval(input);
+  return runDirectWorkerRemoval(input);
 }
