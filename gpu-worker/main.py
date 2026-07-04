@@ -20,7 +20,7 @@ PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Video Eraser GPU Worker", version="1.1.0")
+app = FastAPI(title="Video Eraser GPU Worker", version="1.1.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,7 +34,16 @@ class JobState(BaseModel):
     phase: str = "queued"
     progress: int = 0
     statusMessage: str = "Queued"
+    # Legacy/generic output URL kept for older clients.
     outputUrl: str | None = None
+    # Explicit names for the final full-frame composited erased video. Newer
+    # clients/proxies must prefer these over generic outputUrl because generic
+    # output/preview names can be confused with patch/blob artifacts.
+    finalCompositeUrl: str | None = None
+    compositeOutputUrl: str | None = None
+    fullVideoUrl: str | None = None
+    finalOutputUrl: str | None = None
+    outputKind: str | None = None
     error: str | None = None
 
 jobs: dict[str, JobState] = {}
@@ -129,6 +138,18 @@ def clean_float(value: str, fallback: float, min_value: float, max_value: float)
     return max(min(parsed, max_value), min_value)
 
 
+def assert_playable_mp4(path: Path) -> None:
+    if not path.exists() or path.stat().st_size <= 0:
+        raise RuntimeError(f"Output video is missing or empty: {path}")
+    payload = run_json([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_type,width,height", "-of", "json", str(path),
+    ])
+    streams = payload.get("streams") or []
+    if not streams:
+        raise RuntimeError("Output exists but does not contain a playable video stream.")
+
+
 def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps: str, duration: str, width: str, height: str, quality: str) -> None:
     job_dir = WORK_DIR / job_id
     video_path = job_dir / "input_video"
@@ -174,15 +195,20 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
         )
         if completed.returncode != 0:
             raise RuntimeError(completed.stdout[-6000:] or f"Pipeline exited with {completed.returncode}")
-        if not output_path.exists() or output_path.stat().st_size <= 0:
-            raise RuntimeError("Pipeline completed without writing output.mp4")
+        assert_playable_mp4(output_path)
 
+        final_url = public_output_url(job_id)
         set_job(
             job_id,
             phase="completed",
             progress=100,
             statusMessage="GPU AI removal complete",
-            outputUrl=public_output_url(job_id),
+            outputUrl=final_url,
+            finalCompositeUrl=final_url,
+            compositeOutputUrl=final_url,
+            fullVideoUrl=final_url,
+            finalOutputUrl=final_url,
+            outputKind="final_composite_video",
             error=None,
         )
     except Exception as exc:
@@ -302,6 +328,7 @@ async def read_output(job_id: str):
     output_path = WORK_DIR / job_id / "output.mp4"
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Output not ready")
+    assert_playable_mp4(output_path)
     return FileResponse(output_path, media_type="video/mp4", filename=f"{job_id}-erased.mp4")
 
 
