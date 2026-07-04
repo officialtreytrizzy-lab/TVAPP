@@ -1,15 +1,17 @@
+from __future__ import annotations
+
 import json
 import os
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
 
 WORK_DIR = Path(os.environ.get("ERASER_WORK_DIR", "/tmp/video-eraser-jobs"))
@@ -23,7 +25,14 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="TVAPP GPU Worker", version="1.2.0")
+APP_VERSION = "1.3.0"
+WORKER_NAME = "tvapp-video-eraser-gpu"
+WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
+WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
+MAX_AI_REMIX_UPLOAD_BYTES = int(os.environ.get("AI_REMIX_MAX_UPLOAD_MB", "50")) * 1024 * 1024
+MAX_AI_REMIX_SECONDS = float(os.environ.get("AI_REMIX_MAX_SECONDS", "6"))
+
+app = FastAPI(title="TVAPP GPU Worker", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +40,69 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def cors_headers() -> dict[str, str]:
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Max-Age": "86400",
+    }
+
+
+@app.options("/{path:path}")
+async def options_catch_all(path: str):
+    return Response(status_code=204, headers=cors_headers())
+
+
+def absolute_base_url(request: Request | None = None) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if request is not None:
+        forwarded_proto = request.headers.get("x-forwarded-proto")
+        forwarded_host = request.headers.get("x-forwarded-host")
+        if forwarded_host:
+            return f"{forwarded_proto or request.url.scheme}://{forwarded_host}".rstrip("/")
+        return str(request.base_url).rstrip("/")
+    return ""
+
+
+def absolute_url(path: str, request: Request | None = None) -> str:
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    base = absolute_base_url(request)
+    return f"{base}{path if path.startswith('/') else '/' + path}" if base else path
+
+
+def job_dir_for(job_id: str) -> Path:
+    if job_id.startswith("remix_"):
+        return REMIX_WORK_DIR / job_id
+    for root in (WORK_DIR, TRANSITION_WORK_DIR, REMIX_WORK_DIR):
+        candidate = root / job_id
+        if candidate.exists():
+            return candidate
+    return REMIX_WORK_DIR / job_id if job_id.startswith("remix") else WORK_DIR / job_id
+
+
+def status_path_for(job_id: str) -> Path:
+    return job_dir_for(job_id) / "status.json"
+
+
+def dump_job_payload(job: JobState, request: Request | None = None) -> dict[str, Any]:
+    data = job.model_dump()
+    data["job_id"] = job.jobId
+    for camel, snake in (
+        ("outputUrl", "output_url"),
+        ("finalCompositeUrl", "final_composite_url"),
+        ("compositeOutputUrl", "composite_output_url"),
+        ("fullVideoUrl", "full_video_url"),
+        ("finalOutputUrl", "final_output_url"),
+    ):
+        if data.get(camel):
+            data[camel] = absolute_url(str(data[camel]), request)
+            data[snake] = data[camel]
+    return data
 
 class JobState(BaseModel):
     jobId: str
@@ -62,15 +134,32 @@ def set_job(job_id: str, **updates: Any) -> JobState:
         data.update(updates)
         updated = JobState(**data)
         jobs[job_id] = updated
-        return updated
+    try:
+        path = status_path_for(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dump_job_payload(updated), indent=2, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+    return updated
 
 
 def get_job(job_id: str) -> JobState:
     with jobs_lock:
         job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return job
+    if job:
+        return job
+    path = status_path_for(job_id)
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["jobId"] = data.get("jobId") or data.get("job_id") or job_id
+            job = JobState(**{k: v for k, v in data.items() if k in JobState.model_fields})
+            with jobs_lock:
+                jobs[job_id] = job
+            return job
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Could not read job status: {exc}")
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 def public_output_url(job_id: str) -> str:
@@ -85,10 +174,8 @@ def public_transition_output_url(job_id: str) -> str:
     return f"/v1/video-transitions/mix/jobs/{job_id}/output"
 
 
-def public_remix_output_url(job_id: str) -> str:
-    if PUBLIC_BASE_URL:
-        return f"{PUBLIC_BASE_URL}/v1/ai-remix/jobs/{job_id}/output"
-    return f"/v1/ai-remix/jobs/{job_id}/output"
+def public_remix_output_url(job_id: str, request: Request | None = None) -> str:
+    return absolute_url(f"/v1/ai-remix/jobs/{job_id}/output", request)
 
 
 def save_upload(upload: UploadFile, path: Path) -> None:
@@ -232,6 +319,7 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
     mask_path = job_dir / "mask.png"
     output_path = job_dir / "output.mp4"
 
+    log_path = job_dir / "error.log"
     try:
         if not AI_REMIX_PIPELINE_CMD:
             raise RuntimeError("AI_REMIX_PIPELINE_CMD is not configured. Point it at the Wan remix pipeline command.")
@@ -267,6 +355,7 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
             text=True,
             timeout=60 * 45,
         )
+        (job_dir / "wan_pipeline.log").write_text(completed.stdout or "", encoding="utf-8")
         if completed.returncode != 0:
             raise RuntimeError(completed.stdout[-6000:] or f"AI Remix pipeline exited with {completed.returncode}")
         assert_playable_mp4(output_path)
@@ -289,7 +378,18 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
             strength=strength,
         )
     except Exception as exc:
-        set_job(job_id, phase="failed", progress=100, statusMessage="AI Remix failed", error=str(exc), prompt=prompt, intent=intent, strength=strength)
+        message = str(exc)
+        log_path.write_text(message, encoding="utf-8")
+        set_job(
+            job_id,
+            phase="failed",
+            progress=100,
+            statusMessage="AI Remix failed. Check the job log for Wan/FFmpeg details.",
+            error=message[-6000:],
+            prompt=prompt,
+            intent=intent,
+            strength=strength,
+        )
 
 
 def process_mix_transition(job_id: str, duration: str, quality: str) -> None:
@@ -349,6 +449,45 @@ def process_mix_transition(job_id: str, duration: str, quality: str) -> None:
         )
     except Exception as exc:
         set_job(job_id, phase="failed", progress=100, statusMessage="Mix transition render failed", error=str(exc))
+
+
+@app.get("/health")
+async def health(request: Request):
+    wan_root = Path(WAN_ROOT)
+    wan_ckpt_dir = Path(WAN_CKPT_DIR)
+    return {
+        "ok": True,
+        "worker": WORKER_NAME,
+        "version": APP_VERSION,
+        "has_wan_root": wan_root.exists(),
+        "has_wan_generate": (wan_root / "generate.py").exists(),
+        "has_wan_checkpoint": wan_ckpt_dir.exists(),
+        "wan_root": str(wan_root),
+        "wan_ckpt_dir": str(wan_ckpt_dir),
+        "public_base_url": absolute_base_url(request),
+        "ai_remix_pipeline_cmd": AI_REMIX_PIPELINE_CMD,
+        "work_dir": str(WORK_DIR),
+        "remix_work_dir": str(REMIX_WORK_DIR),
+    }
+
+
+@app.get("/v1/ai-remix/debug")
+async def ai_remix_debug(request: Request):
+    return {
+        "ok": True,
+        "max_recommended_upload_mb": MAX_AI_REMIX_UPLOAD_BYTES // (1024 * 1024),
+        "max_duration_seconds": MAX_AI_REMIX_SECONDS,
+        "routes": [
+            "GET /health",
+            "GET /v1/ai-remix/debug",
+            "POST /v1/ai-remix/jobs",
+            "GET /v1/ai-remix/jobs/{jobId}",
+            "GET /v1/ai-remix/jobs/{jobId}/output",
+            "GET /v1/ai-remix/jobs/{jobId}/log",
+        ],
+        "cors": "enabled",
+        "modal_worker_url_hint": absolute_base_url(request),
+    }
 
 
 @app.post("/v1/video-eraser/jobs")
@@ -411,7 +550,7 @@ async def read_output(job_id: str):
 
 @app.post("/v1/ai-remix/jobs")
 async def create_ai_remix_job(
-    background_tasks: BackgroundTasks,
+    request: Request,
     video: UploadFile = File(...),
     mask: UploadFile | None = File(default=None),
     job_id: str = Form(default=""),
@@ -428,8 +567,61 @@ async def create_ai_remix_job(
     job_dir.mkdir(parents=True, exist_ok=True)
     normalized_strength = strength if strength in {"light", "medium", "heavy"} else "medium"
     normalized_quality = quality if quality in {"draft", "source", "high"} else "source"
+    if not prompt.strip():
+        state = set_job(
+            remote_job_id,
+            phase="failed",
+            progress=100,
+            statusMessage="AI Remix prompt is required.",
+            error="AI Remix prompt is required.",
+            prompt=prompt,
+            intent=intent,
+            strength=normalized_strength,
+        )
+        return JSONResponse(status_code=400, content=dump_job_payload(state, request))
 
     save_upload(video, job_dir / "input_video")
+    upload_size = (job_dir / "input_video").stat().st_size
+    if upload_size > MAX_AI_REMIX_UPLOAD_BYTES:
+        message = "AI Remix V1 supports short clips only. Trim to 2–5 seconds and try again."
+        state = set_job(
+            remote_job_id,
+            phase="failed",
+            progress=100,
+            statusMessage=message,
+            error=f"Upload is {upload_size} bytes; limit is {MAX_AI_REMIX_UPLOAD_BYTES} bytes.",
+            prompt=prompt,
+            intent=intent,
+            strength=normalized_strength,
+        )
+        return JSONResponse(status_code=413, content={**dump_job_payload(state, request), "message": message})
+    try:
+        duration_seconds = ffprobe_duration(job_dir / "input_video")
+    except Exception as exc:
+        state = set_job(
+            remote_job_id,
+            phase="failed",
+            progress=100,
+            statusMessage="Could not read uploaded video duration.",
+            error=str(exc)[-6000:],
+            prompt=prompt,
+            intent=intent,
+            strength=normalized_strength,
+        )
+        return JSONResponse(status_code=400, content=dump_job_payload(state, request))
+    if duration_seconds > MAX_AI_REMIX_SECONDS:
+        message = "AI Remix V1 supports short clips only. Trim to 2–5 seconds and try again."
+        state = set_job(
+            remote_job_id,
+            phase="failed",
+            progress=100,
+            statusMessage=message,
+            error=f"Uploaded video is {duration_seconds:.2f}s; limit is {MAX_AI_REMIX_SECONDS:.2f}s.",
+            prompt=prompt,
+            intent=intent,
+            strength=normalized_strength,
+        )
+        return JSONResponse(status_code=413, content={**dump_job_payload(state, request), "message": message})
     if mask is not None:
         save_upload(mask, job_dir / "mask.png")
     (job_dir / "request.txt").write_text(
@@ -438,26 +630,53 @@ async def create_ai_remix_job(
     )
 
     state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued AI Remix", prompt=prompt, intent=intent, strength=normalized_strength)
-    background_tasks.add_task(process_ai_remix_job, remote_job_id, prompt, intent, normalized_strength, preserve_audio, preserve_face, preserve_motion, normalized_quality)
+    thread = Thread(
+        target=process_ai_remix_job,
+        args=(remote_job_id, prompt, intent, normalized_strength, preserve_audio, preserve_face, preserve_motion, normalized_quality),
+        daemon=True,
+    )
+    thread.start()
+    status_url = absolute_url(f"/v1/ai-remix/jobs/{remote_job_id}", request)
+    worker_base = absolute_base_url(request)
     return {
-        **state.model_dump(),
-        "statusUrl": f"/v1/ai-remix/jobs/{remote_job_id}",
+        **dump_job_payload(state, request),
+        "phase": "queued",
+        "statusUrl": status_url,
+        "status_url": status_url,
+        "workerBase": worker_base,
+        "worker_base": worker_base,
     }
 
 
 @app.get("/v1/ai-remix/jobs/{job_id}")
-async def read_ai_remix_job(job_id: str):
-    return get_job(job_id).model_dump()
+async def read_ai_remix_job(job_id: str, request: Request):
+    return dump_job_payload(get_job(job_id), request)
 
 
 @app.get("/v1/ai-remix/jobs/{job_id}/output")
 async def read_ai_remix_output(job_id: str):
-    get_job(job_id)
+    job = get_job(job_id)
+    if job.phase != "completed":
+        return JSONResponse(status_code=409, content={"error": "Output is not ready", "phase": job.phase, "statusMessage": job.statusMessage, "detail": job.error})
     output_path = REMIX_WORK_DIR / job_id / "output.mp4"
     if not output_path.exists():
-        raise HTTPException(status_code=404, detail="Output not ready")
-    assert_playable_mp4(output_path)
+        return JSONResponse(status_code=404, content={"error": "Output file is missing", "detail": f"{output_path} does not exist"})
+    try:
+        assert_playable_mp4(output_path)
+    except Exception as exc:
+        return JSONResponse(status_code=500, content={"error": "Output file is invalid", "detail": str(exc)})
     return FileResponse(output_path, media_type="video/mp4", filename=f"{job_id}-ai-remix.mp4")
+
+
+@app.get("/v1/ai-remix/jobs/{job_id}/log")
+async def read_ai_remix_log(job_id: str):
+    get_job(job_id)
+    job_dir = REMIX_WORK_DIR / job_id
+    for name in ("error.log", "wan_pipeline.log"):
+        path = job_dir / name
+        if path.exists():
+            return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"), media_type="text/plain")
+    return JSONResponse(status_code=404, content={"error": "No log file found", "job_id": job_id})
 
 
 @app.post("/v1/video-transitions/mix/jobs")
