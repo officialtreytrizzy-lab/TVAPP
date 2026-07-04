@@ -16,13 +16,17 @@ export default async function handler(req: any, res: any) {
 
   try {
     requireApiKey(req, 'video_removal:write');
-    const base = modalBaseUrl();
+    const base = modalBaseUrl() || 'https://californiatrey--tvapp-video-eraser-gpu-fastapi-app.modal.run';
     if (!base) return error(res, 503, 'GPU worker is not configured.', 'worker_not_configured');
     json(res, 200, {
       worker_base: base,
+      workerBase: base,
+      health_url: `${base}/health`,
+      healthUrl: `${base}/health`,
+      ai_remix_upload_url: `${base}/v1/ai-remix/jobs`,
+      aiRemixUploadUrl: `${base}/v1/ai-remix/jobs`,
       video_removal_upload_url: `${base}/v1/video-eraser/jobs`,
       video_transitions_mix_upload_url: `${base}/v1/video-transitions/mix/jobs`,
-      ai_remix_upload_url: `${base}/v1/ai-remix/jobs`,
       note: 'POST multipart form-data directly to these URLs for large files; poll {worker_base}/v1/.../jobs/{jobId} and fetch .../output when phase=completed.',
     });
   } catch (e) {
