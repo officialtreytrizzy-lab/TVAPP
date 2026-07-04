@@ -23,6 +23,21 @@ export interface RemovalJobRequest {
   metadata?: Record<string, unknown>;
 }
 
+export interface AiRemixJobRequest {
+  source_video_url?: string;
+  source_video_base64?: string;
+  mask_url?: string;
+  mask_base64?: string;
+  prompt: string;
+  intent?: string;
+  strength?: 'light' | 'medium' | 'heavy' | string;
+  preserve_audio?: boolean;
+  preserve_face?: boolean;
+  preserve_motion?: boolean;
+  quality?: 'draft' | 'source' | 'high' | string;
+  metadata?: Record<string, unknown>;
+}
+
 export interface MixTransitionJobRequest {
   clip_a_url?: string;
   clip_b_url?: string;
@@ -38,7 +53,7 @@ export interface ApiJobRecord {
   job_id: string;
   external_job_id?: string;
   status: string;
-  service: 'video_removal' | 'video_transition';
+  service: 'video_removal' | 'video_transition' | 'ai_remix';
   mode: string;
   quality: string;
   created_at: string;
@@ -97,6 +112,14 @@ export function modalMixTransitionOutputUrl(jobId: string): string {
   return absoluteModalUrl(`/v1/video-transitions/mix/jobs/${encodeURIComponent(jobId)}/output`);
 }
 
+export function modalAiRemixStatusUrl(jobId: string): string {
+  return absoluteModalUrl(`/v1/ai-remix/jobs/${encodeURIComponent(jobId)}`);
+}
+
+export function modalAiRemixOutputUrl(jobId: string): string {
+  return absoluteModalUrl(`/v1/ai-remix/jobs/${encodeURIComponent(jobId)}/output`);
+}
+
 export function modalCompositeOutputFromPayload(modal: any): string | undefined {
   // Strict on purpose for video removal. The worker's generic output/preview
   // fields have been returning raw patch/blob artifacts. Only accept names that
@@ -109,6 +132,19 @@ export function modalCompositeOutputFromPayload(modal: any): string | undefined 
     || modal.full_video_url
     || modal.finalOutputUrl
     || modal.final_output_url;
+}
+
+export function modalAiRemixOutputFromPayload(modal: any): string | undefined {
+  return modal.finalCompositeUrl
+    || modal.final_composite_url
+    || modal.compositeOutputUrl
+    || modal.composite_output_url
+    || modal.fullVideoUrl
+    || modal.full_video_url
+    || modal.finalOutputUrl
+    || modal.final_output_url
+    || modal.outputUrl
+    || modal.output_url;
 }
 
 function modalLooseOutputFromPayload(modal: any): string | undefined {
@@ -208,6 +244,57 @@ export async function submitRemovalToModal(jobId: string, input: RemovalJobReque
   const externalJobId = payload.jobId || payload.job_id || payload.id || jobId;
   const outputRaw = modalCompositeOutputFromPayload(payload);
   const statusRaw = payload.statusUrl || payload.status_url || `/v1/video-eraser/jobs/${externalJobId}`;
+
+  return {
+    externalJobId,
+    phase: payload.phase || payload.status || 'queued',
+    progress: payload.progress,
+    outputUrl: outputRaw ? absoluteModalUrl(outputRaw) : undefined,
+    statusUrl: statusRaw ? absoluteModalUrl(statusRaw) : undefined,
+  };
+}
+
+export async function submitAiRemixToModal(jobId: string, input: AiRemixJobRequest): Promise<{
+  externalJobId: string;
+  phase: string;
+  progress?: number;
+  outputUrl?: string;
+  statusUrl?: string;
+}> {
+  const base = modalBaseUrl();
+  if (!base) throw new Error('VITE_ERASER_GPU_WORKER_URL or ERASER_GPU_WORKER_URL is not configured.');
+  if (!input.prompt?.trim()) throw new Error('prompt is required.');
+
+  const form = new FormData();
+  let videoBlob: Blob;
+  if (input.source_video_base64) videoBlob = base64ToBlob(input.source_video_base64, 'video/mp4');
+  else if (input.source_video_url) videoBlob = await fetchAsBlob(input.source_video_url, 'source_video_url');
+  else throw new Error('source_video_url or source_video_base64 is required.');
+
+  form.append('video', videoBlob, `${jobId}.mp4`);
+  if (input.mask_base64) form.append('mask', base64ToBlob(input.mask_base64, 'image/png'), `${jobId}-mask.png`);
+  else if (input.mask_url) form.append('mask', await fetchAsBlob(input.mask_url, 'mask_url'), `${jobId}-mask.png`);
+  form.append('job_id', jobId);
+  form.append('prompt', input.prompt);
+  form.append('intent', input.intent || 'full_video_to_video');
+  form.append('strength', input.strength || 'medium');
+  form.append('preserve_audio', String(input.preserve_audio !== false));
+  form.append('preserve_face', String(input.preserve_face !== false));
+  form.append('preserve_motion', String(input.preserve_motion !== false));
+  form.append('quality', input.quality || 'source');
+
+  const response = await fetch(`${base}/v1/ai-remix/jobs`, { method: 'POST', body: form });
+  const text = await response.text();
+  let payload: any = {};
+  try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }
+  if (!response.ok) {
+    const detail = payload?.detail || payload?.error || text || `Modal AI Remix worker failed with HTTP ${response.status}`;
+    throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+  }
+
+  const externalJobId = payload.jobId || payload.job_id || payload.id || jobId;
+  const outputRaw = modalAiRemixOutputFromPayload(payload);
+  const statusRaw = payload.statusUrl || payload.status_url || `/v1/ai-remix/jobs/${externalJobId}`;
 
   return {
     externalJobId,
