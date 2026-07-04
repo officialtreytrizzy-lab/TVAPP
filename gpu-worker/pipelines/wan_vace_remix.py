@@ -79,8 +79,11 @@ def mux_original_audio(remixed_video: Path, source_video: Path, output_video: Pa
         shutil.copyfile(remixed_video, output_video)
 
 
-def find_newest_mp4(root: Path) -> Path:
-    candidates = [p for p in root.rglob("*.mp4") if p.is_file() and p.stat().st_size > 0]
+def find_newest_mp4(root: Path, newer_than: float | None = None) -> Path:
+    candidates = [
+        p for p in root.rglob("*.mp4")
+        if p.is_file() and p.stat().st_size > 0 and (newer_than is None or p.stat().st_mtime >= newer_than)
+    ]
     if not candidates:
         raise RuntimeError(f"Wan completed but no mp4 output was found under {root}")
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -89,6 +92,8 @@ def find_newest_mp4(root: Path) -> Path:
 def render_with_wan(normalized_video: Path, mask_path: Path | None, prompt: str, work_dir: Path) -> Path:
     if not WAN_ROOT.exists():
         raise RuntimeError(f"Wan2.1 is not installed at {WAN_ROOT}. Redeploy the Modal worker image.")
+    if not (WAN_ROOT / "generate.py").exists():
+        raise RuntimeError(f"Wan generate.py is missing at {WAN_ROOT / 'generate.py'}. Redeploy the Modal worker image.")
     if not WAN_CKPT_DIR.exists():
         raise RuntimeError(
             f"Wan model weights are missing at {WAN_CKPT_DIR}. Download Wan-AI/Wan2.1-VACE-1.3B into the /models Modal volume."
@@ -98,6 +103,7 @@ def render_with_wan(normalized_video: Path, mask_path: Path | None, prompt: str,
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    marker_time = output_dir.stat().st_mtime
 
     template = os.environ.get("AI_REMIX_WAN_CMD_TEMPLATE", "").strip()
     if template:
@@ -113,9 +119,8 @@ def render_with_wan(normalized_video: Path, mask_path: Path | None, prompt: str,
         )
         run(command, cwd=WAN_ROOT)
     else:
-        # Default VACE command based on Wan2.1 README. If upstream VACE flags differ
-        # in your deployed version, set AI_REMIX_WAN_CMD_TEMPLATE instead of editing
-        # the API or TrizzyCut frontend.
+        # Run from the Wan repo. Running from the job output directory makes
+        # python look for /tmp/.../wan_outputs/generate.py, which fails.
         cmd = [
             "python", "generate.py",
             "--task", "vace-1.3B",
@@ -130,20 +135,20 @@ def render_with_wan(normalized_video: Path, mask_path: Path | None, prompt: str,
         ]
         if mask_path and mask_path.exists():
             cmd += ["--src_mask", str(mask_path)]
-        # Some Wan builds write near cwd instead of an explicit output dir; run in
-        # output_dir and search both output_dir and WAN_ROOT afterward.
         try:
-            run(cmd, cwd=output_dir)
+            run(cmd, cwd=WAN_ROOT)
         except Exception as exc:
             raise RuntimeError(
                 "Wan VACE command failed. Set AI_REMIX_WAN_CMD_TEMPLATE if your installed Wan/VACE CLI uses different flags. "
                 f"Original error: {exc}"
             )
 
-    try:
-        return find_newest_mp4(output_dir)
-    except Exception:
-        return find_newest_mp4(WAN_ROOT)
+    for search_root in (output_dir, work_dir, WAN_ROOT):
+        try:
+            return find_newest_mp4(search_root, newer_than=marker_time)
+        except Exception:
+            continue
+    raise RuntimeError("Wan completed but did not write a new MP4 output.")
 
 
 def main() -> None:
