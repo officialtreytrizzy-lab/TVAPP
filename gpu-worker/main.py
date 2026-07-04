@@ -9,7 +9,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
-from threading import Lock, Thread, get_ident
+from threading import Lock, Thread
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -34,7 +34,6 @@ WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
 MAX_AI_REMIX_UPLOAD_BYTES = int(os.environ.get("AI_REMIX_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 MAX_AI_REMIX_SECONDS = float(os.environ.get("AI_REMIX_MAX_SECONDS", "6"))
-AI_REMIX_TIMEOUT_SECONDS = int(os.environ.get("AI_REMIX_TIMEOUT_SECONDS", str(20 * 60)))
 
 app = FastAPI(title="TVAPP GPU Worker", version=APP_VERSION)
 app.add_middleware(
@@ -348,6 +347,7 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
     next_heartbeat_index = 0
     process: subprocess.Popen[str] | None = None
 
+    log_path = job_dir / "error.log"
     try:
         append_text_log(pipeline_log_path, f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
         append_text_log(pipeline_log_path, f"job_id={job_id}")
@@ -396,42 +396,9 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
             bufsize=1,
             start_new_session=True,
         )
-        append_text_log(pipeline_log_path, f"pipeline_pid={process.pid}")
-
-        assert process.stdout is not None
-        while True:
-            elapsed = time.monotonic() - started_at
-            if elapsed > AI_REMIX_TIMEOUT_SECONDS:
-                append_text_log(pipeline_log_path, f"heartbeat elapsed={elapsed:.1f}s: Wan generation timed out; killing process group")
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                    process.wait(timeout=10)
-                except Exception:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except Exception:
-                        pass
-                raise TimeoutError("Wan generation timed out.")
-
-            while next_heartbeat_index < len(heartbeat_marks) and elapsed >= heartbeat_marks[next_heartbeat_index][0]:
-                _, progress, message = heartbeat_marks[next_heartbeat_index]
-                append_text_log(pipeline_log_path, f"heartbeat elapsed={elapsed:.1f}s progress={progress}: {message}")
-                set_job(job_id, phase="remixing", progress=progress, statusMessage=message, prompt=prompt, intent=intent, strength=strength)
-                next_heartbeat_index += 1
-
-            ready, _, _ = select.select([process.stdout], [], [], 1.0)
-            if ready:
-                line = process.stdout.readline()
-                if line:
-                    append_text_log(pipeline_log_path, line.rstrip("\n"))
-
-            if process.poll() is not None:
-                for remaining in process.stdout.readlines():
-                    append_text_log(pipeline_log_path, remaining.rstrip("\n"))
-                break
-
-        if process.returncode != 0:
-            raise RuntimeError(tail_text(pipeline_log_path) or f"AI Remix pipeline exited with {process.returncode}")
+        (job_dir / "wan_pipeline.log").write_text(completed.stdout or "", encoding="utf-8")
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stdout[-6000:] or f"AI Remix pipeline exited with {completed.returncode}")
         assert_playable_mp4(output_path)
 
         final_url = public_remix_output_url(job_id)
@@ -454,14 +421,13 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
         )
     except Exception as exc:
         message = str(exc)
-        append_text_log(pipeline_log_path, f"ERROR: {message}")
-        error_log_path.write_text(tail_text(pipeline_log_path) or message, encoding="utf-8")
+        log_path.write_text(message, encoding="utf-8")
         set_job(
             job_id,
             phase="failed",
             progress=100,
-            statusMessage="Wan generation timed out." if isinstance(exc, TimeoutError) else "AI Remix failed. Check the job log for Wan/FFmpeg details.",
-            error=(tail_text(pipeline_log_path) or message)[-6000:],
+            statusMessage="AI Remix failed. Check the job log for Wan/FFmpeg details.",
+            error=message[-6000:],
             prompt=prompt,
             intent=intent,
             strength=strength,
