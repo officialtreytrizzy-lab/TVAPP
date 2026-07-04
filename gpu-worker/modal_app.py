@@ -22,7 +22,8 @@ worker_image = (
         "rm -rf /opt/ProPainter && git clone --depth 1 https://github.com/sczhou/ProPainter.git /opt/ProPainter",
         "pip install -r /opt/ProPainter/requirements.txt",
         "rm -rf /opt/Wan2.1 && git clone --depth 1 https://github.com/Wan-Video/Wan2.1.git /opt/Wan2.1",
-        "pip install -r /opt/Wan2.1/requirements.txt",
+        "python - <<'PY'\nfrom pathlib import Path\nsrc = Path('/opt/Wan2.1/requirements.txt')\nout = Path('/tmp/wan-requirements-no-flash.txt')\nskip = {'flash-attn', 'flash_attn'}\nlines = []\nfor line in src.read_text().splitlines():\n    stripped = line.strip()\n    normalized = stripped.split('==')[0].split('>=')[0].split('<=')[0].split('~=')[0].split('[')[0].replace('_', '-').lower()\n    if normalized in skip:\n        print(f'Skipping optional CUDA build dependency: {stripped}')\n        continue\n    lines.append(line)\nout.write_text('\\n'.join(lines) + '\\n')\nPY",
+        "pip install -r /tmp/wan-requirements-no-flash.txt",
         "pip install 'huggingface_hub[cli]'",
     )
     .add_local_dir("gpu-worker", remote_path="/app")
