@@ -1,3 +1,4 @@
+import subprocess
 import modal
 
 # Deploy with:
@@ -6,9 +7,9 @@ import modal
 #   modal deploy gpu-worker/modal_app.py
 #
 # The deployed URL becomes VITE_ERASER_GPU_WORKER_URL in Vercel.
-# Wan model weights should live in the Modal volume mounted at /models.
-# First-time model download example inside a Modal shell/job:
-#   huggingface-cli download Wan-AI/Wan2.1-VACE-1.3B --local-dir /models/Wan2.1-VACE-1.3B
+# Wan model weights live in the Modal volume mounted at /models.
+# Download/update weights with:
+#   modal run gpu-worker/modal_app.py::download_wan_model
 
 wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
 
@@ -28,6 +29,27 @@ worker_image = (
 )
 
 app = modal.App("tvapp-video-eraser-gpu")
+
+
+@app.function(
+    image=worker_image,
+    timeout=60 * 60,
+    volumes={"/models": wan_models},
+)
+def download_wan_model():
+    """Download Wan2.1 VACE weights into the persistent Modal volume."""
+    command = [
+        "huggingface-cli",
+        "download",
+        "Wan-AI/Wan2.1-VACE-1.3B",
+        "--local-dir",
+        "/models/Wan2.1-VACE-1.3B",
+    ]
+    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stdout[-8000:] or "Wan model download failed")
+    wan_models.commit()
+    return "Wan2.1 VACE 1.3B is installed at /models/Wan2.1-VACE-1.3B"
 
 
 @app.function(
