@@ -34,7 +34,6 @@ export default async function handler(req: any, res: any) {
 
       const status = normalizeJobStatus(modal.phase || modal.status);
       const outputRaw = modalCompositeOutputFromPayload(modal);
-      const hasOutput = Boolean(outputRaw) || status === 'completed';
 
       return json(res, 200, {
         job_id: modal.job_id || modal.jobId || modal.id || jobId,
@@ -44,10 +43,10 @@ export default async function handler(req: any, res: any) {
         quality: modal.quality || 'source',
         created_at: modal.created_at || modal.createdAt,
         status_url: `${baseUrl}/api/v1/video-removal/jobs/${jobId}`,
-        output_url: hasOutput ? publicOutputUrl(baseUrl, jobId) : undefined,
+        output_url: outputRaw ? publicOutputUrl(baseUrl, jobId) : undefined,
         metadata: {
           ...(modal.metadata || { source: 'gpu_worker_fallback' }),
-          output_kind: outputRaw ? 'composite_preferred' : undefined,
+          output_kind: outputRaw ? 'strict_composite' : status === 'completed' ? 'raw_blob_only_no_public_output' : undefined,
         },
       });
     }
@@ -57,13 +56,12 @@ export default async function handler(req: any, res: any) {
       const modal = await readModalStatus(record.modal_status_url);
       const status = normalizeJobStatus(modal.phase || modal.status || record.status);
       const outputRaw = modalCompositeOutputFromPayload(modal);
-      const hasOutput = Boolean(outputRaw) || status === 'completed';
       updated = updateRememberedJob(jobId, {
         status,
-        output_url: hasOutput ? publicOutputUrl(baseUrl, jobId) : record.output_url,
+        output_url: outputRaw ? publicOutputUrl(baseUrl, jobId) : undefined,
         metadata: {
           ...(record.metadata || {}),
-          worker_output_kind: outputRaw ? 'composite_preferred' : undefined,
+          worker_output_kind: outputRaw ? 'strict_composite' : status === 'completed' ? 'raw_blob_only_no_public_output' : undefined,
         },
       }) || record;
     }
