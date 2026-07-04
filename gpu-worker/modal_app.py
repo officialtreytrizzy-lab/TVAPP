@@ -40,7 +40,7 @@ app = modal.App("tvapp-video-eraser-gpu")
 def download_wan_model():
     """Download Wan2.1 VACE weights into the persistent Modal volume."""
     command = [
-        "huggingface-cli",
+        "hf",
         "download",
         "Wan-AI/Wan2.1-VACE-1.3B",
         "--local-dir",
