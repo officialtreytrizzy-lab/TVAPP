@@ -22,7 +22,8 @@ export default async function handler(req: any, res: any) {
       worker_base: base,
       video_removal_upload_url: `${base}/v1/video-eraser/jobs`,
       video_transitions_mix_upload_url: `${base}/v1/video-transitions/mix/jobs`,
-      note: 'POST multipart form-data (video, mask | clip_a, clip_b) directly to these URLs for large files; poll {worker_base}/v1/.../jobs/{jobId} and fetch .../output when phase=completed.',
+      ai_remix_upload_url: `${base}/v1/ai-remix/jobs`,
+      note: 'POST multipart form-data directly to these URLs for large files; poll {worker_base}/v1/.../jobs/{jobId} and fetch .../output when phase=completed.',
     });
   } catch (e) {
     const err = e as any;
