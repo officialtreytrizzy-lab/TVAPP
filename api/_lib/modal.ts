@@ -15,6 +15,8 @@ export interface RemovalJobRequest {
   result_mode?: 'full_video' | 'patch' | string;
   output_kind?: 'full_video' | 'patch' | string;
   composite_output?: boolean;
+  full_frame_output?: boolean;
+  full_video_output?: boolean;
   patch_only?: boolean;
   return_patch?: boolean;
   webhook_url?: string;
@@ -73,7 +75,7 @@ export function modalBaseUrl(): string {
   return url.replace(/\/$/, '');
 }
 
-function absoluteModalUrl(pathOrUrl: string): string {
+export function absoluteModalUrl(pathOrUrl: string): string {
   if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
   const base = modalBaseUrl();
   return `${base}${pathOrUrl.startsWith('/') ? '' : '/'}${pathOrUrl}`;
@@ -96,8 +98,9 @@ export function modalMixTransitionOutputUrl(jobId: string): string {
 }
 
 export function modalCompositeOutputFromPayload(modal: any): string | undefined {
-  // Prefer final/full/composited outputs. Some workers expose preview/output as
-  // the patch artifact and finalOutputUrl as the actual full-frame video.
+  // Strict on purpose for video removal. The worker's generic output/preview
+  // fields have been returning raw patch/blob artifacts. Only accept names that
+  // explicitly mean the final full-frame composited erased video.
   return modal.finalCompositeUrl
     || modal.final_composite_url
     || modal.compositeOutputUrl
@@ -105,8 +108,11 @@ export function modalCompositeOutputFromPayload(modal: any): string | undefined 
     || modal.fullVideoUrl
     || modal.full_video_url
     || modal.finalOutputUrl
-    || modal.final_output_url
-    || modal.outputUrl
+    || modal.final_output_url;
+}
+
+function modalLooseOutputFromPayload(modal: any): string | undefined {
+  return modal.outputUrl
     || modal.output_url
     || modal.resultUrl
     || modal.result_url
@@ -135,6 +141,8 @@ function appendRemovalOutputIntent(form: FormData, input: RemovalJobRequest): vo
   const compositeOutput = input.composite_output !== false;
   const patchOnly = input.patch_only === true;
   const returnPatch = input.return_patch === true;
+  const fullFrameOutput = input.full_frame_output !== false;
+  const fullVideoOutput = input.full_video_output !== false;
 
   // These keys intentionally overlap because worker versions differ. Unknown
   // fields are harmless; known fields force the worker to return the finished
@@ -146,8 +154,8 @@ function appendRemovalOutputIntent(form: FormData, input: RemovalJobRequest): vo
   form.append('composite_output', String(compositeOutput));
   form.append('patch_only', String(patchOnly));
   form.append('return_patch', String(returnPatch));
-  form.append('full_frame_output', 'true');
-  form.append('full_video_output', 'true');
+  form.append('full_frame_output', String(fullFrameOutput));
+  form.append('full_video_output', String(fullVideoOutput));
 }
 
 export async function submitRemovalToModal(jobId: string, input: RemovalJobRequest): Promise<{
@@ -248,7 +256,7 @@ export async function submitMixTransitionToModal(jobId: string, input: MixTransi
   }
 
   const externalJobId = payload.jobId || payload.job_id || payload.id || jobId;
-  const outputRaw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url;
+  const outputRaw = modalLooseOutputFromPayload(payload) || payload.finalOutputUrl || payload.final_output_url;
   const statusRaw = payload.statusUrl || payload.status_url || `/v1/video-transitions/mix/jobs/${externalJobId}`;
 
   return {
