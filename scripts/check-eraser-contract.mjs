@@ -4,6 +4,10 @@ const requiredFiles = [
   'src/lib/eraser/gpu.ts',
   'src/components/eraser/Editor.tsx',
   'src/components/eraser/ProcessingPanel.tsx',
+  'api/_lib/trecut-eraser-proxy.ts',
+  'api/v1/trecut/eraser/jobs.ts',
+  'api/v1/trecut/eraser/jobs/[jobId].ts',
+  'api/v1/trecut/eraser/jobs/[jobId]/output.ts',
   'gpu-worker/modal_app.py',
   'gpu-worker/main.py',
   'gpu-worker/pipelines/sam2_propainter.py',
@@ -33,20 +37,32 @@ function forbidText(path, text, reason) {
 
 for (const path of requiredFiles) file(path);
 
-// Frontend must keep the GPU bridge and fallback split.
-requireText('src/lib/eraser/gpu.ts', 'VITE_ERASER_GPU_WORKER_URL', 'frontend must read the deployed worker URL from Vercel env');
-requireText('src/lib/eraser/gpu.ts', 'return raw ? absoluteUrl(raw) :', 'relative Modal output URLs must be normalized before playback');
-requireText('src/lib/eraser/gpu.ts', "form.append('video'", 'original video must be uploaded to the worker');
-requireText('src/lib/eraser/gpu.ts', "form.append('mask'", 'mask PNG must be uploaded to the worker');
-requireText('src/lib/eraser/gpu.ts', "form.append('selected_frame_index'", 'selected frame must be passed to the worker');
-requireText('src/lib/eraser/gpu.ts', "form.append('quality', outputQuality)", 'frontend must pass the selected output quality to Modal');
-requireText('src/lib/eraser/gpu.ts', "form.append('preserve_resolution', 'true')", 'frontend must request source-resolution restoration');
-requireText('src/lib/eraser/gpu.ts', "form.append('preserve_fps', 'true')", 'frontend must request source-FPS restoration');
-requireText('src/lib/eraser/gpu.ts', "form.append('preserve_audio', 'true')", 'frontend must request audio preservation');
-requireText('src/components/eraser/Editor.tsx', 'runGpuRemoval', 'editor must call GPU worker when configured');
-requireText('src/components/eraser/Editor.tsx', 'isGpuRemovalConfigured()', 'editor must choose GPU vs browser fallback explicitly');
+// Frontend must use the server-side proxy by default so the generated API key is never exposed in browser code.
+requireText('src/lib/eraser/gpu.ts', 'VITE_TRECUT_ERASER_PROXY_URL', 'frontend must read the local proxy path from Vercel env');
+requireText('src/lib/eraser/gpu.ts', "'/api/v1/trecut/eraser'", 'frontend must default to the local Trecut eraser proxy');
+requireText('src/lib/eraser/gpu.ts', 'USE_ERASER_API_PROXY', 'frontend must prefer the secure API proxy path');
+requireText('src/lib/eraser/gpu.ts', 'source_video_base64', 'frontend proxy payload must send source video data to the API proxy');
+requireText('src/lib/eraser/gpu.ts', 'mask_base64', 'frontend proxy payload must send the mask PNG data to the API proxy');
+requireText('src/lib/eraser/gpu.ts', 'selected_frame_index', 'selected frame must be included in metadata');
+requireText('src/lib/eraser/gpu.ts', 'preserve_resolution: true', 'frontend must request source-resolution restoration');
+requireText('src/lib/eraser/gpu.ts', 'preserve_fps: true', 'frontend must request source-FPS restoration');
+requireText('src/lib/eraser/gpu.ts', 'preserve_audio: true', 'frontend must request audio preservation');
+requireText('src/lib/eraser/gpu.ts', "form.append('video'", 'direct worker fallback must still upload original video when explicitly enabled');
+requireText('src/lib/eraser/gpu.ts', "form.append('mask'", 'direct worker fallback must still upload mask PNG when explicitly enabled');
+forbidText('src/lib/eraser/gpu.ts', 'VITE_ERASER_GPU_API_KEY', 'the generated eTreyser API key must not be exposed through Vite/browser env');
+
+// Proxy must hold and apply the generated bearer token server-side only.
+requireText('api/_lib/trecut-eraser-proxy.ts', 'TRECUT_ETREYSER_API_KEY', 'server proxy must read the generated eTreyser API key from server env');
+requireText('api/_lib/trecut-eraser-proxy.ts', 'Authorization', 'server proxy must attach the bearer token to licensed API calls');
+requireText('api/_lib/trecut-eraser-proxy.ts', 'rewriteVideoRemovalJobPayload', 'server proxy must rewrite protected API URLs back to proxy URLs');
+requireText('api/v1/trecut/eraser/jobs.ts', "fetchTreyVideoRemovalApi(req, '/jobs'", 'Trecut create endpoint must call licensed video-removal jobs API');
+requireText('api/v1/trecut/eraser/jobs/[jobId].ts', "fetchTreyVideoRemovalApi(req, `/jobs/${encodeURIComponent(jobId)}`", 'Trecut status endpoint must proxy licensed job reads');
+requireText('api/v1/trecut/eraser/jobs/[jobId]/output.ts', "fetchTreyVideoRemovalApi(req, `/jobs/${encodeURIComponent(jobId)}/output`", 'Trecut output endpoint must stream licensed job output');
+
+requireText('src/components/eraser/Editor.tsx', 'runGpuRemoval', 'editor must call the AI removal bridge when configured');
+requireText('src/components/eraser/Editor.tsx', 'isGpuRemovalConfigured()', 'editor must choose AI proxy/worker vs browser fallback explicitly');
 requireText('src/components/eraser/Editor.tsx', 'outputQuality', 'editor must keep the source/higher quality setting wired');
-requireText('src/components/eraser/ProcessingPanel.tsx', 'Mode: {processingMode}', 'UI must show whether GPU or browser fallback is active');
+requireText('src/components/eraser/ProcessingPanel.tsx', 'Mode: {processingMode}', 'UI must show whether proxy/GPU or browser fallback is active');
 requireText('src/components/eraser/ProcessingPanel.tsx', 'Same quality', 'UI must expose source-quality output');
 requireText('src/components/eraser/ProcessingPanel.tsx', 'Higher quality', 'UI must expose higher-quality output');
 
@@ -87,4 +103,4 @@ if (checks.length) {
   process.exit(1);
 }
 
-console.log('Eraser contract check passed. GPU worker, Modal settings, ProPainter path, quality controls, and frontend bridge are intact.');
+console.log('Eraser contract check passed. Trecut proxy, server-side eTreyser API key handling, GPU worker, quality controls, and frontend bridge are intact.');

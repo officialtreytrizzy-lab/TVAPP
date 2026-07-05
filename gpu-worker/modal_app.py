@@ -64,7 +64,7 @@ def download_models():
     image=worker_image,
     gpu="A10G",
     timeout=60 * 45,
-    scaledown_window=60 * 5,
+    scaledown_window=60 * 50,
     max_containers=1,
     volumes={"/models": wan_models},
 )
