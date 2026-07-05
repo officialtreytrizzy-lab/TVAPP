@@ -1,5 +1,7 @@
 import type { OpenCutAudioTrack, OpenCutClip, OpenCutTextLayer, OpenCutTimelineConfig } from './types';
-import { buildClipTimeline, timelineTimeToSourceTime } from './timeline';
+import type { OpenCutExportSettings } from './exportSettings';
+import { getOpenCutEstimatedBitrate, OPENCUT_DEFAULT_EXPORT_SETTINGS } from './exportSettings';
+import { buildClipTimeline, normalizeTimelineConfig, timelineTimeToSourceTime } from './timeline';
 
 type ExportAudioHandle = {
   track: OpenCutAudioTrack;
@@ -41,11 +43,17 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function seek(video: HTMLVideoElement, time: number): Promise<void> {
+function throwIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw new DOMException('Export canceled.', 'AbortError');
+}
+
+async function seek(video: HTMLVideoElement, time: number, signal?: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
   if (Math.abs(video.currentTime - time) < 0.018) return;
   const p = waitForEvent(video, 'seeked');
   video.currentTime = time;
   await p;
+  throwIfAborted(signal);
 }
 
 function clipFilter(clip: OpenCutClip) {
@@ -239,40 +247,61 @@ async function syncAudioForTimeline(handles: ExportAudioHandle[], timelineTime: 
   }
 }
 
+function qualityBitrate(width: number, exportSettings?: Partial<OpenCutExportSettings>) {
+  if (exportSettings) return Math.round(getOpenCutEstimatedBitrate({ ...OPENCUT_DEFAULT_EXPORT_SETTINGS, ...exportSettings }) * 1_000_000);
+  return width >= 2160 ? 68_000_000 : width >= 1920 ? 28_000_000 : width >= 1080 ? 18_000_000 : 12_000_000;
+}
+
 export async function exportOpenCutRender(opts: {
   clip?: OpenCutClip;
   clips?: OpenCutClip[];
   textLayers: OpenCutTextLayer[];
   audioTracks?: OpenCutAudioTrack[];
   timelineConfig?: Partial<OpenCutTimelineConfig>;
+  exportSettings?: Partial<OpenCutExportSettings>;
   width: number;
   height: number;
   fps?: number;
+  signal?: AbortSignal;
   onProgress?: (progress: number) => void;
 }): Promise<{ url: string; blob: Blob; mimeType: string; warnings: string[] }> {
   if (typeof MediaRecorder === 'undefined') {
     throw new Error('This browser does not support in-browser video export yet. Try desktop Chrome/Safari or export the project file.');
   }
 
-  const { clip, clips = clip ? [clip] : [], textLayers, audioTracks = [], timelineConfig, width, height, fps = timelineConfig?.fps ?? 30, onProgress } = opts;
+  const { clip, clips = clip ? [clip] : [], textLayers, audioTracks = [], timelineConfig, exportSettings, width, height, onProgress, signal } = opts;
   if (!clips.length) throw new Error('Import at least one video clip before exporting.');
+  const normalizedTimeline = normalizeTimelineConfig({ ...timelineConfig, fps: opts.fps ?? exportSettings?.fps ?? timelineConfig?.fps });
+  const fps = normalizedTimeline.fps;
+  const warnings: string[] = [];
+  if (opts.fps && opts.fps !== fps) warnings.push(`Export FPS was normalized from ${opts.fps} to ${fps}.`);
+  if (exportSettings?.fps && exportSettings.fps !== fps) warnings.push(`Preset FPS was normalized from ${exportSettings.fps} to ${fps}.`);
+  if (exportSettings?.codec === 'hevc' || exportSettings?.codec === 'prores' || exportSettings?.format === 'mov') {
+    warnings.push('This browser export path is using MediaRecorder fallback; HEVC, ProRes, and MOV require the native/cloud exporter path for guaranteed output.');
+  }
+
   const mimeType = pickMimeType();
   if (!mimeType) throw new Error('No supported video encoder was found in this browser.');
 
+  throwIfAborted(signal);
   const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d');
+  canvas.width = Math.max(2, width - (width % 2));
+  canvas.height = Math.max(2, height - (height % 2));
+  const ctx = canvas.getContext('2d', { alpha: false });
   if (!ctx) throw new Error('Could not create render canvas.');
 
-  const timeline = buildClipTimeline(clips, timelineConfig);
+  const timeline = buildClipTimeline(clips, normalizedTimeline);
   const totalDuration = Math.max(0.1, timeline[timeline.length - 1]?.end ?? 0.1);
   const videoById = new Map<string, HTMLVideoElement>();
-  for (const item of timeline) videoById.set(item.clip.id, await loadVideo(item.clip.url, item.clip.name));
+  for (const item of timeline) {
+    throwIfAborted(signal);
+    videoById.set(item.clip.id, await loadVideo(item.clip.url, item.clip.name));
+  }
 
   const stream = canvas.captureStream(fps);
-  const { handles: audioHandles, warnings } = attachAudioTracks(stream, audioTracks);
-  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: width >= 1920 ? 18_000_000 : 12_000_000 });
+  const audio = attachAudioTracks(stream, audioTracks);
+  warnings.push(...audio.warnings);
+  const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: qualityBitrate(canvas.width, exportSettings) });
   const chunks: Blob[] = [];
   recorder.ondataavailable = (event) => {
     if (event.data.size > 0) chunks.push(event.data);
@@ -284,26 +313,33 @@ export async function exportOpenCutRender(opts: {
   recorder.start(250);
   const startedAt = performance.now();
 
-  while (frame < totalFrames) {
-    const targetWallTime = startedAt + frame * frameMs;
-    const wait = targetWallTime - performance.now();
-    if (wait > 1) await sleep(wait);
+  try {
+    while (frame < totalFrames) {
+      throwIfAborted(signal);
+      const targetWallTime = startedAt + frame * frameMs;
+      const wait = targetWallTime - performance.now();
+      if (wait > 1) await sleep(wait);
 
-    const timelineTime = frame / fps;
-    await syncAudioForTimeline(audioHandles, timelineTime, warnings);
-    const item = timeline.find((entry) => timelineTime >= entry.start && timelineTime < entry.end) ?? timeline[timeline.length - 1];
-    const localOutput = Math.max(0, timelineTime - item.start);
-    const sourceTime = timelineTimeToSourceTime(item.clip, localOutput);
-    const video = videoById.get(item.clip.id);
-    if (!video) throw new Error(`Missing loaded video for ${item.clip.name}`);
-    await seek(video, sourceTime);
-    drawClip(ctx, video, item.clip, sourceTime, width, height, localOutput, item.duration);
-    drawTextLayers(ctx, textLayers, timelineTime, width, height);
-    onProgress?.(Math.min(99, (frame / totalFrames) * 100));
-    frame += 1;
+      const timelineTime = frame / fps;
+      await syncAudioForTimeline(audio.handles, timelineTime, warnings);
+      const item = timeline.find((entry) => timelineTime >= entry.start && timelineTime < entry.end) ?? timeline[timeline.length - 1];
+      const localOutput = Math.max(0, timelineTime - item.start);
+      const sourceTime = timelineTimeToSourceTime(item.clip, localOutput);
+      const video = videoById.get(item.clip.id);
+      if (!video) throw new Error(`Missing loaded video for ${item.clip.name}`);
+      await seek(video, sourceTime, signal);
+      drawClip(ctx, video, item.clip, sourceTime, canvas.width, canvas.height, localOutput, item.duration);
+      drawTextLayers(ctx, textLayers, timelineTime, canvas.width, canvas.height);
+      onProgress?.(Math.min(99, (frame / totalFrames) * 100));
+      frame += 1;
+    }
+  } catch (error) {
+    for (const { audio } of audio.handles) audio.pause();
+    if (recorder.state !== 'inactive') recorder.stop();
+    throw error;
   }
 
-  for (const { audio } of audioHandles) audio.pause();
+  for (const { audio } of audio.handles) audio.pause();
 
   await new Promise<void>((resolve) => {
     recorder.onstop = () => resolve();
