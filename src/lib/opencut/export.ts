@@ -1,4 +1,11 @@
-import type { OpenCutAudioTrack, OpenCutClip, OpenCutTextLayer } from './types';
+import type { OpenCutAudioTrack, OpenCutClip, OpenCutTextLayer, OpenCutTimelineConfig } from './types';
+import { buildClipTimeline, timelineTimeToSourceTime } from './timeline';
+
+type ExportAudioHandle = {
+  track: OpenCutAudioTrack;
+  audio: HTMLAudioElement;
+  started: boolean;
+};
 
 function pickMimeType(): string {
   const candidates = [
@@ -12,13 +19,11 @@ function pickMimeType(): string {
 }
 
 function waitForEvent(target: EventTarget, event: string): Promise<void> {
-  return new Promise((resolve) => {
-    target.addEventListener(event, () => resolve(), { once: true });
-  });
+  return new Promise((resolve) => target.addEventListener(event, () => resolve(), { once: true }));
 }
 
 function waitForMediaReady(media: HTMLMediaElement, label: string): Promise<void> {
-  if (media.readyState >= HTMLMediaElement.HAVE_METADATA) return Promise.resolve();
+  if (media.readyState >= 1) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const onLoaded = () => cleanup(resolve);
     const onError = () => cleanup(() => reject(new Error(`Could not load ${label} for export.`)));
@@ -49,24 +54,6 @@ function clipFilter(clip: OpenCutClip) {
   const saturation = clip.saturation ?? 100;
   const blur = clip.blur ?? 0;
   return `brightness(${brightness}%) contrast(${contrast}%) saturate(${saturation}%) blur(${blur}px)`;
-}
-
-function clipSourceDuration(clip: OpenCutClip) {
-  return Math.max(0.1, clip.end - clip.start);
-}
-
-function clipOutputDuration(clip: OpenCutClip) {
-  return Math.max(0.1, clipSourceDuration(clip) / Math.max(0.1, clip.speed || 1));
-}
-
-function buildTimeline(clips: OpenCutClip[]) {
-  let cursor = 0;
-  return clips.map((clip) => {
-    const start = cursor;
-    const duration = clipOutputDuration(clip);
-    cursor += duration;
-    return { clip, start, end: cursor, duration };
-  });
 }
 
 function fadeAlpha(clip: OpenCutClip, sourceTime: number) {
@@ -197,12 +184,12 @@ async function loadVideo(url: string, label: string) {
 }
 
 function attachAudioTracks(stream: MediaStream, audioTracks: OpenCutAudioTrack[]) {
-  const playable: HTMLAudioElement[] = [];
+  const handles: ExportAudioHandle[] = [];
   const warnings: string[] = [];
   for (const track of audioTracks) {
     const audio = document.createElement('audio');
     audio.src = track.url;
-    audio.volume = Math.max(0, Math.min(1, track.volume));
+    audio.volume = 0;
     audio.preload = 'auto';
     const capture = (audio as HTMLAudioElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream }).captureStream
       ?? (audio as HTMLAudioElement & { mozCaptureStream?: () => MediaStream }).mozCaptureStream;
@@ -217,9 +204,39 @@ function attachAudioTracks(stream: MediaStream, audioTracks: OpenCutAudioTrack[]
       continue;
     }
     for (const audioTrack of tracks) stream.addTrack(audioTrack);
-    playable.push(audio);
+    handles.push({ track, audio, started: false });
   }
-  return { playable, warnings };
+  return { handles, warnings };
+}
+
+async function syncAudioForTimeline(handles: ExportAudioHandle[], timelineTime: number, warnings: string[]) {
+  for (const handle of handles) {
+    const { track, audio } = handle;
+    const localTime = timelineTime - track.start;
+    const active = localTime >= 0 && localTime <= track.duration;
+    if (!active) {
+      audio.volume = 0;
+      if (handle.started) audio.pause();
+      continue;
+    }
+
+    const fadeIn = track.fadeIn ?? 0;
+    const fadeOut = track.fadeOut ?? 0;
+    let volume = Math.max(0, Math.min(1, track.volume));
+    if (fadeIn > 0) volume *= Math.min(1, Math.max(0, localTime / fadeIn));
+    if (fadeOut > 0) volume *= Math.min(1, Math.max(0, (track.duration - localTime) / fadeOut));
+    audio.volume = volume;
+
+    if (!handle.started || Math.abs(audio.currentTime - localTime) > 0.12) audio.currentTime = Math.max(0, localTime);
+    if (audio.paused) {
+      try {
+        await audio.play();
+        handle.started = true;
+      } catch {
+        warnings.push(`The browser blocked ${track.name} during export, so it may be silent.`);
+      }
+    }
+  }
 }
 
 export async function exportOpenCutRender(opts: {
@@ -227,6 +244,7 @@ export async function exportOpenCutRender(opts: {
   clips?: OpenCutClip[];
   textLayers: OpenCutTextLayer[];
   audioTracks?: OpenCutAudioTrack[];
+  timelineConfig?: Partial<OpenCutTimelineConfig>;
   width: number;
   height: number;
   fps?: number;
@@ -236,7 +254,7 @@ export async function exportOpenCutRender(opts: {
     throw new Error('This browser does not support in-browser video export yet. Try desktop Chrome/Safari or export the project file.');
   }
 
-  const { clip, clips = clip ? [clip] : [], textLayers, audioTracks = [], width, height, fps = 30, onProgress } = opts;
+  const { clip, clips = clip ? [clip] : [], textLayers, audioTracks = [], timelineConfig, width, height, fps = timelineConfig?.fps ?? 30, onProgress } = opts;
   if (!clips.length) throw new Error('Import at least one video clip before exporting.');
   const mimeType = pickMimeType();
   if (!mimeType) throw new Error('No supported video encoder was found in this browser.');
@@ -247,13 +265,13 @@ export async function exportOpenCutRender(opts: {
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('Could not create render canvas.');
 
-  const timeline = buildTimeline(clips);
+  const timeline = buildClipTimeline(clips, timelineConfig);
   const totalDuration = Math.max(0.1, timeline[timeline.length - 1]?.end ?? 0.1);
   const videoById = new Map<string, HTMLVideoElement>();
   for (const item of timeline) videoById.set(item.clip.id, await loadVideo(item.clip.url, item.clip.name));
 
   const stream = canvas.captureStream(fps);
-  const { playable: playableAudio, warnings } = attachAudioTracks(stream, audioTracks);
+  const { handles: audioHandles, warnings } = attachAudioTracks(stream, audioTracks);
   const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: width >= 1920 ? 18_000_000 : 12_000_000 });
   const chunks: Blob[] = [];
   recorder.ondataavailable = (event) => {
@@ -265,14 +283,6 @@ export async function exportOpenCutRender(opts: {
   const frameMs = 1000 / fps;
   recorder.start(250);
   const startedAt = performance.now();
-  for (const audio of playableAudio) {
-    try {
-      audio.currentTime = 0;
-      await audio.play();
-    } catch {
-      warnings.push('The browser blocked one audio track during export, so the rendered video may be silent.');
-    }
-  }
 
   while (frame < totalFrames) {
     const targetWallTime = startedAt + frame * frameMs;
@@ -280,9 +290,10 @@ export async function exportOpenCutRender(opts: {
     if (wait > 1) await sleep(wait);
 
     const timelineTime = frame / fps;
+    await syncAudioForTimeline(audioHandles, timelineTime, warnings);
     const item = timeline.find((entry) => timelineTime >= entry.start && timelineTime < entry.end) ?? timeline[timeline.length - 1];
     const localOutput = Math.max(0, timelineTime - item.start);
-    const sourceTime = Math.min(item.clip.end, item.clip.start + localOutput * Math.max(0.1, item.clip.speed || 1));
+    const sourceTime = timelineTimeToSourceTime(item.clip, localOutput);
     const video = videoById.get(item.clip.id);
     if (!video) throw new Error(`Missing loaded video for ${item.clip.name}`);
     await seek(video, sourceTime);
@@ -292,7 +303,7 @@ export async function exportOpenCutRender(opts: {
     frame += 1;
   }
 
-  for (const audio of playableAudio) audio.pause();
+  for (const { audio } of audioHandles) audio.pause();
 
   await new Promise<void>((resolve) => {
     recorder.onstop = () => resolve();
@@ -302,5 +313,5 @@ export async function exportOpenCutRender(opts: {
   const blob = new Blob(chunks, { type: mimeType.split(';')[0] || 'video/webm' });
   const url = URL.createObjectURL(blob);
   onProgress?.(100);
-  return { url, blob, mimeType: blob.type, warnings };
+  return { url, blob, mimeType: blob.type, warnings: Array.from(new Set(warnings)) };
 }
