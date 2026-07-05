@@ -1,5 +1,5 @@
-import MobileOpenCutStudioSafe from '@/components/opencut-mobile/MobileOpenCutStudioSafe';
+import MobileOpenCutStudio from '@/components/opencut-mobile/MobileOpenCutStudio';
 
 export default function MobileStudio() {
-  return <MobileOpenCutStudioSafe />;
+  return <MobileOpenCutStudio />;
 }
