@@ -1,7 +1,9 @@
 import type { OpenCutExportQuality } from './types';
+import type { OpenCutCodecKey, OpenCutExportSettings, OpenCutFormatKey, OpenCutHdrMode } from './exportSettings';
+import { OPENCUT_DEFAULT_EXPORT_SETTINGS } from './exportSettings';
 
-export type OpenCutExportCodec = 'auto' | 'h264' | 'hevc' | 'prores';
-export type OpenCutExportContainer = 'auto' | 'mp4' | 'mov' | 'webm' | 'wav';
+export type OpenCutExportCodec = 'auto' | OpenCutCodecKey;
+export type OpenCutExportContainer = 'auto' | OpenCutFormatKey | 'webm' | 'wav';
 export type OpenCutColorPipeline = 'auto' | 'sdr-rec709' | 'display-p3' | 'hdr-hlg' | 'hdr-pq' | 'dolby-vision-source';
 
 export interface OpenCutExportPreset {
@@ -18,6 +20,11 @@ export interface OpenCutExportPreset {
   colorPipeline: OpenCutColorPipeline;
   requiresNativeExporter?: boolean;
   note: string;
+  settings: OpenCutExportSettings;
+}
+
+function settings(overrides: Partial<OpenCutExportSettings>): OpenCutExportSettings {
+  return { ...OPENCUT_DEFAULT_EXPORT_SETTINGS, ...overrides };
 }
 
 export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
@@ -34,6 +41,7 @@ export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
     container: 'auto',
     colorPipeline: 'sdr-rec709',
     note: 'Fast preview export for rough review; not intended as final promo quality.',
+    settings: settings({ resolution: '720p', aspect: '9:16', quality: 'medium', fps: 30, codec: 'h264', format: 'mp4', bitrateMode: 'low', audioQuality: 'standard' }),
   },
   {
     id: 'vertical-1080p-30-social-standard',
@@ -48,6 +56,7 @@ export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
     container: 'mp4',
     colorPipeline: 'sdr-rec709',
     note: 'Compatibility-first vertical export for everyday social promos.',
+    settings: settings({ resolution: '1080p', aspect: '9:16', quality: 'high', fps: 30, codec: 'h264', format: 'mp4', bitrateMode: 'recommended', audioQuality: 'high' }),
   },
   {
     id: 'vertical-1080p-60-social-high',
@@ -61,7 +70,8 @@ export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
     codec: 'h264',
     container: 'mp4',
     colorPipeline: 'sdr-rec709',
-    note: 'Smooth high-quality social export. Web support depends on MediaRecorder codec availability.',
+    note: 'Smooth high-quality social export. Web support depends on MediaRecorder/WebCodecs availability.',
+    settings: settings({ resolution: '1080p', aspect: '9:16', quality: 'high', fps: 60, codec: 'h264', format: 'mp4', bitrateMode: 'high', audioQuality: 'high' }),
   },
   {
     id: 'vertical-4k-60-creator',
@@ -76,7 +86,8 @@ export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
     container: 'mp4',
     colorPipeline: 'sdr-rec709',
     requiresNativeExporter: true,
-    note: 'CapCut-class premium vertical export target. Requires native/cloud exporter for reliable HEVC and memory control.',
+    note: 'Premium vertical export target. Requires native/cloud exporter for reliable HEVC and memory control.',
+    settings: settings({ resolution: '4k', aspect: '9:16', quality: 'high', fps: 60, codec: 'hevc', format: 'mp4', bitrateMode: 'ultra', audioQuality: 'ultra' }),
   },
   {
     id: 'landscape-4k-60-master',
@@ -92,6 +103,7 @@ export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
     colorPipeline: 'display-p3',
     requiresNativeExporter: true,
     note: 'High-quality archive/master preset for landscape projects.',
+    settings: settings({ resolution: '4k', aspect: '16:9', quality: 'high', fps: 60, codec: 'hevc', format: 'mp4', bitrateMode: 'ultra', audioQuality: 'ultra' }),
   },
   {
     id: 'prores-mov-master',
@@ -107,6 +119,7 @@ export const OPENCUT_EXPORT_PRESETS: OpenCutExportPreset[] = [
     colorPipeline: 'display-p3',
     requiresNativeExporter: true,
     note: 'Professional intermediate/master target. Native iOS/macOS or cloud export path required; browser MediaRecorder cannot guarantee ProRes.',
+    settings: settings({ resolution: '4k', aspect: '16:9', quality: 'high', fps: 30, codec: 'prores', format: 'mov', bitrateMode: 'ultra', audioQuality: 'ultra' }),
   },
 ];
 
@@ -116,4 +129,10 @@ export function getOpenCutExportPreset(id: string) {
 
 export function getDefaultOpenCutExportPreset(quality: OpenCutExportQuality = 'social-high') {
   return OPENCUT_EXPORT_PRESETS.find((preset) => preset.quality === quality && !preset.requiresNativeExporter) ?? OPENCUT_EXPORT_PRESETS[1];
+}
+
+export function hdrModeForColorPipeline(colorPipeline: OpenCutColorPipeline): OpenCutHdrMode {
+  if (colorPipeline === 'hdr-hlg') return 'hlg';
+  if (colorPipeline === 'hdr-pq' || colorPipeline === 'dolby-vision-source') return 'pq';
+  return 'sdr';
 }
