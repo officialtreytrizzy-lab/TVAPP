@@ -17,6 +17,25 @@ function waitForEvent(target: EventTarget, event: string): Promise<void> {
   });
 }
 
+function waitForMediaReady(media: HTMLMediaElement, label: string): Promise<void> {
+  if (media.readyState >= HTMLMediaElement.HAVE_METADATA) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const onLoaded = () => cleanup(resolve);
+    const onError = () => cleanup(() => reject(new Error(`Could not load ${label} for export.`)));
+    const cleanup = (done: () => void) => {
+      media.removeEventListener('loadedmetadata', onLoaded);
+      media.removeEventListener('error', onError);
+      done();
+    };
+    media.addEventListener('loadedmetadata', onLoaded, { once: true });
+    media.addEventListener('error', onError, { once: true });
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
 async function seek(video: HTMLVideoElement, time: number): Promise<void> {
   if (Math.abs(video.currentTime - time) < 0.018) return;
   const p = waitForEvent(video, 'seeked');
@@ -167,18 +186,19 @@ function drawTextLayers(ctx: CanvasRenderingContext2D, layers: OpenCutTextLayer[
   }
 }
 
-async function loadVideo(url: string) {
+async function loadVideo(url: string, label: string) {
   const video = document.createElement('video');
-  video.src = url;
   video.muted = true;
   video.playsInline = true;
   video.preload = 'auto';
-  await waitForEvent(video, 'loadedmetadata');
+  video.src = url;
+  await waitForMediaReady(video, label);
   return video;
 }
 
 function attachAudioTracks(stream: MediaStream, audioTracks: OpenCutAudioTrack[]) {
   const playable: HTMLAudioElement[] = [];
+  const warnings: string[] = [];
   for (const track of audioTracks) {
     const audio = document.createElement('audio');
     audio.src = track.url;
@@ -186,12 +206,20 @@ function attachAudioTracks(stream: MediaStream, audioTracks: OpenCutAudioTrack[]
     audio.preload = 'auto';
     const capture = (audio as HTMLAudioElement & { captureStream?: () => MediaStream; mozCaptureStream?: () => MediaStream }).captureStream
       ?? (audio as HTMLAudioElement & { mozCaptureStream?: () => MediaStream }).mozCaptureStream;
-    if (!capture) continue;
+    if (!capture) {
+      warnings.push(`This browser cannot attach ${track.name} to the in-browser export.`);
+      continue;
+    }
     const audioStream = capture.call(audio) as MediaStream;
-    for (const audioTrack of audioStream.getAudioTracks()) stream.addTrack(audioTrack);
+    const tracks = audioStream.getAudioTracks();
+    if (!tracks.length) {
+      warnings.push(`No capturable audio stream was available for ${track.name}.`);
+      continue;
+    }
+    for (const audioTrack of tracks) stream.addTrack(audioTrack);
     playable.push(audio);
   }
-  return playable;
+  return { playable, warnings };
 }
 
 export async function exportOpenCutRender(opts: {
@@ -203,7 +231,7 @@ export async function exportOpenCutRender(opts: {
   height: number;
   fps?: number;
   onProgress?: (progress: number) => void;
-}): Promise<{ url: string; blob: Blob; mimeType: string }> {
+}): Promise<{ url: string; blob: Blob; mimeType: string; warnings: string[] }> {
   if (typeof MediaRecorder === 'undefined') {
     throw new Error('This browser does not support in-browser video export yet. Try desktop Chrome/Safari or export the project file.');
   }
@@ -222,10 +250,10 @@ export async function exportOpenCutRender(opts: {
   const timeline = buildTimeline(clips);
   const totalDuration = Math.max(0.1, timeline[timeline.length - 1]?.end ?? 0.1);
   const videoById = new Map<string, HTMLVideoElement>();
-  for (const item of timeline) videoById.set(item.clip.id, await loadVideo(item.clip.url));
+  for (const item of timeline) videoById.set(item.clip.id, await loadVideo(item.clip.url, item.clip.name));
 
   const stream = canvas.captureStream(fps);
-  const playableAudio = attachAudioTracks(stream, audioTracks);
+  const { playable: playableAudio, warnings } = attachAudioTracks(stream, audioTracks);
   const recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: width >= 1920 ? 18_000_000 : 12_000_000 });
   const chunks: Blob[] = [];
   recorder.ondataavailable = (event) => {
@@ -234,17 +262,23 @@ export async function exportOpenCutRender(opts: {
 
   const totalFrames = Math.max(1, Math.ceil(totalDuration * fps));
   let frame = 0;
+  const frameMs = 1000 / fps;
   recorder.start(250);
+  const startedAt = performance.now();
   for (const audio of playableAudio) {
     try {
       audio.currentTime = 0;
       await audio.play();
     } catch {
-      // Browsers may block programmatic audio playback; video export still completes without audio.
+      warnings.push('The browser blocked one audio track during export, so the rendered video may be silent.');
     }
   }
 
   while (frame < totalFrames) {
+    const targetWallTime = startedAt + frame * frameMs;
+    const wait = targetWallTime - performance.now();
+    if (wait > 1) await sleep(wait);
+
     const timelineTime = frame / fps;
     const item = timeline.find((entry) => timelineTime >= entry.start && timelineTime < entry.end) ?? timeline[timeline.length - 1];
     const localOutput = Math.max(0, timelineTime - item.start);
@@ -256,7 +290,6 @@ export async function exportOpenCutRender(opts: {
     drawTextLayers(ctx, textLayers, timelineTime, width, height);
     onProgress?.(Math.min(99, (frame / totalFrames) * 100));
     frame += 1;
-    await new Promise((resolve) => requestAnimationFrame(resolve));
   }
 
   for (const audio of playableAudio) audio.pause();
@@ -269,5 +302,5 @@ export async function exportOpenCutRender(opts: {
   const blob = new Blob(chunks, { type: mimeType.split(';')[0] || 'video/webm' });
   const url = URL.createObjectURL(blob);
   onProgress?.(100);
-  return { url, blob, mimeType: blob.type };
+  return { url, blob, mimeType: blob.type, warnings };
 }
