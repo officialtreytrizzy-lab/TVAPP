@@ -44,13 +44,12 @@ from fastapi.responses import JSONResponse
 APP_VERSION = "0.1.0"
 MCP_PROTOCOL_VERSION = "2024-11-05"
 DEFAULT_WORKER_PORT = int(os.environ.get("AI_REMIX_WORKER_PORT", "8000"))
-DEFAULT_WORKER_BASE_URL = os.environ.get("AI_REMIX_WORKER_BASE_URL", f"http://127.0.0.1:{DEFAULT_WORKER_PORT}").rstrip("/")
+WORKER_BASE_URL = os.environ.get("AI_REMIX_WORKER_BASE_URL", f"http://127.0.0.1:{DEFAULT_WORKER_PORT}").rstrip("/")
 WAN_ROOT = Path(os.environ.get("WAN_ROOT", "/teamspace/studios/this_studio/Wan2.1"))
 WAN_CKPT_DIR = Path(os.environ.get("WAN_CKPT_DIR", "/teamspace/studios/this_studio/models/Wan2.1-VACE-1.3B"))
 AI_REMIX_WORK_DIR = Path(os.environ.get("AI_REMIX_WORK_DIR", "/teamspace/studios/this_studio/runtime/ai-remix-jobs"))
 TOKEN_ENV = "LIGHTNING_MCP_TOKEN"
 PID_FILE = AI_REMIX_WORK_DIR / "lightning_worker.pid"
-WORKER_BASE_FILE = AI_REMIX_WORK_DIR / "lightning_worker_base_url.txt"
 MCP_LOG_FILE = AI_REMIX_WORK_DIR / "lightning_mcp.log"
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,96}$")
 
@@ -236,29 +235,6 @@ def _read_worker_pid() -> int | None:
         return None
 
 
-def _worker_base_url() -> str:
-    try:
-        saved = WORKER_BASE_FILE.read_text(encoding="utf-8").strip().rstrip("/")
-        if saved:
-            return saved
-    except Exception:
-        pass
-    return DEFAULT_WORKER_BASE_URL
-
-
-def _write_worker_base_url(url: str) -> None:
-    WORKER_BASE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    WORKER_BASE_FILE.write_text(url.rstrip("/") + "\n", encoding="utf-8")
-
-
-def _tail_file(path: Path, lines: int = 120) -> dict[str, Any]:
-    lines = max(1, min(int(lines), 1000))
-    if not path.exists():
-        return {"ok": False, "path": str(path), "error": "File not found"}
-    content = path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
-    return {"ok": True, "path": str(path), "lines": lines, "text": "\n".join(content)}
-
-
 def _tool_result(value: Any) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(value, indent=2, sort_keys=True)}], "isError": False}
 
@@ -270,7 +246,7 @@ def check_lightning_runtime() -> dict[str, Any]:
         "python": sys.version,
         "platform": platform.platform(),
         "cwd": str(Path.cwd()),
-        "worker_base_url": _worker_base_url(),
+        "worker_base_url": WORKER_BASE_URL,
         "ai_remix_work_dir": str(AI_REMIX_WORK_DIR),
         "wan_root": str(WAN_ROOT),
         "wan_ckpt_dir": str(WAN_CKPT_DIR),
@@ -334,16 +310,14 @@ def check_wan() -> dict[str, Any]:
 
 
 def get_worker_health() -> dict[str, Any]:
-    return _http_json(f"{_worker_base_url()}/health", timeout=15)
+    return _http_json(f"{WORKER_BASE_URL}/health", timeout=15)
 
 
 def start_worker(port: int = DEFAULT_WORKER_PORT) -> dict[str, Any]:
     port = max(1024, min(int(port), 65535))
     existing = _read_worker_pid()
-    worker_base_url = f"http://127.0.0.1:{port}"
     if existing and _pid_alive(existing):
-        _write_worker_base_url(worker_base_url)
-        return {"ok": True, "already_running": True, "pid": existing, "worker_base_url": worker_base_url}
+        return {"ok": True, "already_running": True, "pid": existing, "worker_base_url": f"http://127.0.0.1:{port}"}
 
     script_dir = Path(__file__).resolve().parent
     main_py = script_dir / "main.py"
@@ -359,7 +333,7 @@ def start_worker(port: int = DEFAULT_WORKER_PORT) -> dict[str, Any]:
     env.setdefault("AI_REMIX_GPU_ENABLED", "true")
     env.setdefault("AI_REMIX_ALLOW_MODAL", "false")
     env.setdefault("AI_REMIX_PIPELINE_CMD", f"python {pipeline_py}")
-    env.setdefault("ERASER_PUBLIC_BASE_URL", worker_base_url)
+    env.setdefault("ERASER_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
 
     log_path = AI_REMIX_WORK_DIR / "lightning_worker_uvicorn.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -373,11 +347,10 @@ def start_worker(port: int = DEFAULT_WORKER_PORT) -> dict[str, Any]:
         start_new_session=True,
     )
     PID_FILE.write_text(str(process.pid), encoding="utf-8")
-    _write_worker_base_url(worker_base_url)
     _log(f"started worker pid={process.pid} port={port}")
     time.sleep(2.0)
-    health = _http_json(f"{worker_base_url}/health", timeout=10)
-    return {"ok": process.poll() is None, "pid": process.pid, "worker_base_url": worker_base_url, "log_path": str(log_path), "health": health}
+    health = _http_json(f"http://127.0.0.1:{port}/health", timeout=10)
+    return {"ok": process.poll() is None, "pid": process.pid, "worker_base_url": f"http://127.0.0.1:{port}", "log_path": str(log_path), "health": health}
 
 
 def stop_worker() -> dict[str, Any]:
@@ -418,7 +391,6 @@ def _make_tiny_video(path: Path) -> dict[str, Any]:
 
 
 def start_tiny_smoke_remix(prompt: str = "Make it a neon R&B music video") -> dict[str, Any]:
-    worker_base_url = _worker_base_url()
     video_path = AI_REMIX_WORK_DIR / "smoke" / "tiny-1s.mp4"
     created = _make_tiny_video(video_path)
     if not created.get("ok"):
@@ -430,7 +402,7 @@ def start_tiny_smoke_remix(prompt: str = "Make it a neon R&B music video") -> di
         if not health.get("ok"):
             return {"ok": False, "phase": "worker_health", "start": started, "health": health}
     post = _post_multipart(
-        f"{worker_base_url}/v1/ai-remix/jobs",
+        f"{WORKER_BASE_URL}/v1/ai-remix/jobs",
         fields={
             "prompt": prompt,
             "intent": "full_video_to_video",
@@ -443,12 +415,12 @@ def start_tiny_smoke_remix(prompt: str = "Make it a neon R&B music video") -> di
         files={"video": video_path},
         timeout=60,
     )
-    return {"ok": bool(post.get("ok")), "fixture": str(video_path), "worker_base_url": worker_base_url, "response": post}
+    return {"ok": bool(post.get("ok")), "fixture": str(video_path), "worker_base_url": WORKER_BASE_URL, "response": post}
 
 
 def get_job_status(job_id: str) -> dict[str, Any]:
     clean = _safe_job_id(job_id)
-    remote = _http_json(f"{_worker_base_url()}/v1/ai-remix/jobs/{urllib.parse.quote(clean)}", timeout=15)
+    remote = _http_json(f"{WORKER_BASE_URL}/v1/ai-remix/jobs/{urllib.parse.quote(clean)}", timeout=15)
     if remote.get("ok"):
         return remote
     local_status = _read_json(_safe_job_dir(clean) / "status.json")
@@ -462,17 +434,9 @@ def tail_job_log(job_id: str, lines: int = 80) -> dict[str, Any]:
     candidates = [job_dir / "error.log", job_dir / "wan_pipeline.log"]
     for path in candidates:
         if path.exists():
-            tailed = _tail_file(path, lines=lines)
-            return {"job_id": clean, **tailed}
+            content = path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+            return {"ok": True, "job_id": clean, "path": str(path), "lines": lines, "text": "\n".join(content)}
     return {"ok": False, "job_id": clean, "error": "No log file found", "checked": [str(p) for p in candidates]}
-
-
-def tail_worker_log(lines: int = 160) -> dict[str, Any]:
-    return _tail_file(AI_REMIX_WORK_DIR / "lightning_worker_uvicorn.log", lines=lines)
-
-
-def tail_mcp_log(lines: int = 160) -> dict[str, Any]:
-    return _tail_file(MCP_LOG_FILE, lines=lines)
 
 
 def get_output_path(job_id: str) -> dict[str, Any]:
@@ -486,18 +450,7 @@ def get_output_path(job_id: str) -> dict[str, Any]:
         "exists": output.exists(),
         "size_bytes": output.stat().st_size if output.exists() else 0,
         "status": status,
-        "download_url": f"{_worker_base_url()}/v1/ai-remix/jobs/{urllib.parse.quote(clean)}/output",
-    }
-
-
-def get_job_bundle(job_id: str, log_lines: int = 120) -> dict[str, Any]:
-    clean = _safe_job_id(job_id)
-    return {
-        "ok": True,
-        "job_id": clean,
-        "status": get_job_status(clean),
-        "log": tail_job_log(clean, lines=log_lines),
-        "output": get_output_path(clean),
+        "download_url": f"{WORKER_BASE_URL}/v1/ai-remix/jobs/{urllib.parse.quote(clean)}/output",
     }
 
 
@@ -543,10 +496,7 @@ TOOL_REGISTRY: dict[str, tuple[Callable[..., dict[str, Any]], dict[str, Any], st
     "start_tiny_smoke_remix": (start_tiny_smoke_remix, {"type": "object", "properties": {"prompt": {"type": "string", "default": "Make it a neon R&B music video"}}, "additionalProperties": False}, "Create a tiny MP4 and submit it to the local AI Remix worker."),
     "get_job_status": (get_job_status, {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}}, "additionalProperties": False}, "Get AI Remix job status by ID."),
     "tail_job_log": (tail_job_log, {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "lines": {"type": "integer", "default": 80}}, "additionalProperties": False}, "Read the tail of a Wan/AI Remix job log."),
-    "tail_worker_log": (tail_worker_log, {"type": "object", "properties": {"lines": {"type": "integer", "default": 160}}, "additionalProperties": False}, "Read the FastAPI worker uvicorn log started by this MCP server."),
-    "tail_mcp_log": (tail_mcp_log, {"type": "object", "properties": {"lines": {"type": "integer", "default": 160}}, "additionalProperties": False}, "Read this MCP server's own operator log."),
     "get_output_path": (get_output_path, {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}}, "additionalProperties": False}, "Return the safe local output path and download URL for a job."),
-    "get_job_bundle": (get_job_bundle, {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "log_lines": {"type": "integer", "default": 120}}, "additionalProperties": False}, "Return status, log tail, and output metadata for one AI Remix job."),
     "list_recent_jobs": (list_recent_jobs, {"type": "object", "properties": {"limit": {"type": "integer", "default": 10}}, "additionalProperties": False}, "List recent AI Remix jobs under AI_REMIX_WORK_DIR."),
     "cancel_job": (cancel_job, {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}}, "additionalProperties": False}, "Write a cancellation marker for an AI Remix job."),
 }
@@ -609,7 +559,7 @@ async def health() -> dict[str, Any]:
         "server": "tvapp-lightning-ai-remix-mcp",
         "version": APP_VERSION,
         "token_configured": bool(_configured_token()),
-        "worker_base_url": _worker_base_url(),
+        "worker_base_url": WORKER_BASE_URL,
         "tools": sorted(TOOL_REGISTRY.keys()),
     }
 
