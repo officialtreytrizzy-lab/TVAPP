@@ -1,3 +1,7 @@
+export type OpenCutTransitionType = 'none' | 'fade' | 'flash' | 'wipe' | 'zoom' | 'glitch';
+
+export type OpenCutTextAnimation = 'none' | 'pop' | 'fade' | 'slide-up' | 'glow' | 'typewriter';
+
 export interface OpenCutClip {
   id: string;
   name: string;
@@ -20,6 +24,19 @@ export interface OpenCutClip {
   fit?: 'contain' | 'cover';
   fadeIn?: number;
   fadeOut?: number;
+  transition?: OpenCutTransitionType;
+  transitionDuration?: number;
+}
+
+export interface OpenCutAudioTrack {
+  id: string;
+  name: string;
+  url: string;
+  duration: number;
+  volume: number;
+  start: number;
+  fadeIn?: number;
+  fadeOut?: number;
 }
 
 export interface OpenCutTextLayer {
@@ -35,6 +52,7 @@ export interface OpenCutTextLayer {
   background: boolean;
   shadow?: boolean;
   uppercase?: boolean;
+  animation?: OpenCutTextAnimation;
 }
 
 export interface OpenCutProject {
@@ -43,6 +61,7 @@ export interface OpenCutProject {
   aspect: '9:16' | '1:1' | '16:9' | 'original';
   clips: OpenCutClip[];
   textLayers: OpenCutTextLayer[];
+  audioTracks: OpenCutAudioTrack[];
   selectedClipId?: string;
 }
 
@@ -51,4 +70,9 @@ export interface OpenCutVideoMeta {
   duration: number;
   width: number;
   height: number;
+}
+
+export interface OpenCutAudioMeta {
+  url: string;
+  duration: number;
 }
