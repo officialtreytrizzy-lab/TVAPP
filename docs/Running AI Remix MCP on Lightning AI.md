@@ -47,13 +47,16 @@ export AI_REMIX_PROVIDER="lightning-gpu"
 export AI_REMIX_GPU_ENABLED="true"
 export AI_REMIX_ALLOW_MODAL="false"
 
-export AI_REMIX_SIZE="512*288"
-export AI_REMIX_FRAME_NUM="17"
-export AI_REMIX_SAMPLE_STEPS="8"
-export AI_REMIX_MAX_SECONDS="2"
-export AI_REMIX_MAX_UPLOAD_MB="50"
-
 export AI_REMIX_PIPELINE_CMD="python /teamspace/studios/this_studio/TVAPP/gpu-worker/pipelines/wan_vace_remix.py"
+export AI_REMIX_SIZE="832*480"
+export AI_REMIX_FRAME_NUM="5"
+export AI_REMIX_SAMPLE_STEPS="4"
+export AI_REMIX_SAMPLE_GUIDE_SCALE="3.5"
+export AI_REMIX_SAMPLE_SHIFT="5"
+export AI_REMIX_MAX_SECONDS="0.5"
+export AI_REMIX_TIMEOUT_SECONDS="1800"
+export AI_REMIX_MAX_CONCURRENT_JOBS="1"
+export AI_REMIX_MAX_UPLOAD_MB="50"
 ```
 
 Create a long secret token. Do not commit this token.
@@ -218,3 +221,31 @@ VITE_AI_REMIX_ALLOW_MODAL=false
 ```
 
 MCP is for this chat / agents to control the Lightning AI worker. FastAPI is for TrizzyCut users to upload clips and receive output videos.
+
+## AI Remix job lifecycle guarantees
+
+The worker now initializes every accepted AI Remix job before returning from `POST /v1/ai-remix/jobs`. A valid `status.json` and `job.log` are created under `runtime/ai-remix-jobs/<job_id>/` with `phase=queued`, `progress=1`, provider `lightning-gpu`, and the submitted prompt. The status endpoint must never return `{}`: if a job folder exists without `status.json`, the worker marks the job failed with `missing_status_json` and appends the diagnostic to `job.log`.
+
+On worker startup, old job folders are recovered: missing status files become `missing_status_json_recovered_on_startup`, and stale `queued`, `preparing`, or `remixing` jobs older than `AI_REMIX_TIMEOUT_SECONDS` become `timed_out` with `wan_generation_timed_out`. Only one Wan process is allowed at a time by `AI_REMIX_MAX_CONCURRENT_JOBS=1`; overlapping submissions are failed cleanly with `worker_busy` instead of creating empty folders.
+
+Restart the worker after changing lifecycle code or environment:
+
+```bash
+cd /teamspace/studios/this_studio/TVAPP/gpu-worker
+python lightning_ai_remix_mcp.py
+# In MCP, call restart_worker with {"port": 8000}
+```
+
+Run one tiny smoke job through MCP:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8765/mcp?token=$LIGHTNING_MCP_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"start_tiny_smoke_remix","arguments":{"prompt":"Make it a neon R&B music video"}}}' | python -m json.tool
+```
+
+Validate the no-Wan lifecycle locally:
+
+```bash
+python scripts/no_wan_lifecycle_test.py
+```

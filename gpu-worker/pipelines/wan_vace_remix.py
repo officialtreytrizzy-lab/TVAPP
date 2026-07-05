@@ -205,8 +205,12 @@ def main() -> None:
     raw_wan_output = work_dir / "wan_raw_output.mp4"
 
     normalize_video(input_video, normalized)
-    generated = render_with_wan(normalized, input_mask, prompt, work_dir)
-    shutil.copyfile(generated, raw_wan_output)
+    if os.environ.get("AI_REMIX_DRY_RUN", "").strip().lower() in {"1", "true", "yes"}:
+        append_log("AI_REMIX_DRY_RUN=true; copying normalized input instead of launching Wan")
+        shutil.copyfile(normalized, raw_wan_output)
+    else:
+        generated = render_with_wan(normalized, input_mask, prompt, work_dir)
+        shutil.copyfile(generated, raw_wan_output)
 
     if preserve_audio:
         mux_original_audio(raw_wan_output, input_video, output_video)

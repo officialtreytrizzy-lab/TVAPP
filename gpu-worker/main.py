@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import shutil
+import traceback
 import subprocess
 import time
 import uuid
@@ -34,6 +35,10 @@ WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
 MAX_AI_REMIX_UPLOAD_BYTES = int(os.environ.get("AI_REMIX_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 MAX_AI_REMIX_SECONDS = float(os.environ.get("AI_REMIX_MAX_SECONDS", "6"))
+AI_REMIX_TIMEOUT_SECONDS = int(os.environ.get("AI_REMIX_TIMEOUT_SECONDS", "1800"))
+AI_REMIX_MAX_CONCURRENT_JOBS = int(os.environ.get("AI_REMIX_MAX_CONCURRENT_JOBS", "1"))
+AI_REMIX_PROVIDER = os.environ.get("AI_REMIX_PROVIDER", "lightning-gpu")
+AI_REMIX_SEMAPHORE = __import__("threading").BoundedSemaphore(max(AI_REMIX_MAX_CONCURRENT_JOBS, 1))
 
 app = FastAPI(title="TVAPP GPU Worker", version=APP_VERSION)
 app.add_middleware(
@@ -103,6 +108,12 @@ class JobState(BaseModel):
     fullVideoUrl: str | None = None
     finalOutputUrl: str | None = None
     outputKind: str | None = None
+    message: str | None = None
+    provider: str | None = None
+    has_output: bool = False
+    output_path: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     error: str | None = None
     prompt: str | None = None
     intent: str | None = None
@@ -125,13 +136,30 @@ def dump_job_payload(job: JobState, request: Request | None = None) -> dict[str,
     ):
         if data.get(camel):
             data[camel] = absolute_url(str(data[camel]), request)
-            data[snake] = data[camel]
+        data[snake] = data.get(camel)
+    data["message"] = data.get("message") or data.get("statusMessage")
+    data["has_output"] = bool(data.get("has_output"))
     return data
 
 
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def job_log_path(job_id: str) -> Path:
+    return job_dir_for(job_id) / "job.log"
+
+
 def set_job(job_id: str, **updates: Any) -> JobState:
+    now = utc_now()
+    updates.setdefault("updated_at", now)
+    if "statusMessage" in updates and "message" not in updates:
+        updates["message"] = updates["statusMessage"]
+    if "message" in updates and "statusMessage" not in updates:
+        updates["statusMessage"] = updates["message"]
+    updates.setdefault("provider", AI_REMIX_PROVIDER if job_id.startswith("remix") else None)
     with jobs_lock:
-        current = jobs.get(job_id) or JobState(jobId=job_id)
+        current = jobs.get(job_id) or JobState(jobId=job_id, created_at=now)
         data = current.model_dump()
         data.update(updates)
         updated = JobState(**data)
@@ -161,7 +189,41 @@ def get_job(job_id: str) -> JobState:
             return job
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Could not read job status: {exc}")
+    job_dir = job_dir_for(job_id)
+    if job_dir.exists() and job_id.startswith("remix"):
+        append_text_log(job_log_path(job_id), "ERROR missing_status_json: Job folder exists but status.json was never written.")
+        return set_job(job_id, phase="failed", progress=100, message="Job folder exists but status.json was never written.", error="missing_status_json", has_output=False)
     raise HTTPException(status_code=404, detail="Job not found")
+
+
+def recover_ai_remix_jobs() -> None:
+    now = time.time()
+    for job_dir in REMIX_WORK_DIR.glob("remix_*"):
+        if not job_dir.is_dir():
+            continue
+        job_id = job_dir.name
+        status_path = job_dir / "status.json"
+        if not status_path.exists():
+            append_text_log(job_dir / "job.log", "startup recovery: missing_status_json_recovered_on_startup")
+            set_job(job_id, phase="failed", progress=100, message="Job folder exists but status.json was never written.", error="missing_status_json_recovered_on_startup", has_output=False)
+            continue
+        try:
+            data = json.loads(status_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            append_text_log(job_dir / "job.log", f"startup recovery: invalid status.json: {exc}")
+            set_job(job_id, phase="failed", progress=100, message="Job status.json could not be read during startup recovery.", error="invalid_status_json_recovered_on_startup", has_output=False)
+            continue
+        phase = data.get("phase")
+        updated_raw = data.get("updated_at") or data.get("created_at")
+        age = now - status_path.stat().st_mtime
+        if phase in {"queued", "preparing", "remixing"} and age > AI_REMIX_TIMEOUT_SECONDS:
+            append_text_log(job_dir / "job.log", "startup recovery: wan_generation_timed_out")
+            set_job(job_id, phase="timed_out", progress=100, message="Job timed out while worker was offline or stuck.", error="wan_generation_timed_out", has_output=False)
+
+
+@app.on_event("startup")
+async def startup_recover_ai_remix_jobs() -> None:
+    recover_ai_remix_jobs()
 
 
 def public_output_url(job_id: str) -> str:
@@ -299,50 +361,44 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
     video_path = job_dir / "input_video"
     mask_path = job_dir / "mask.png"
     output_path = job_dir / "output.mp4"
-    pipeline_log_path = job_dir / "wan_pipeline.log"
+    pipeline_log_path = job_dir / "job.log"
+    wan_log_path = job_dir / "wan_pipeline.log"
     error_log_path = job_dir / "error.log"
     started_at = time.monotonic()
-    heartbeat_marks = [
-        (60, 40, "Wan is still generating…"),
-        (120, 45, "Wan is still generating…"),
-        (240, 50, "Wan is still generating…"),
-        (480, 60, "Wan is still generating…"),
-    ]
+    heartbeat_marks = [(60, 40, "Wan is still generating…"), (120, 45, "Wan is still generating…"), (240, 50, "Wan is still generating…"), (480, 60, "Wan is still generating…")]
     next_heartbeat_index = 0
     process: subprocess.Popen[str] | None = None
+    acquired = False
     try:
-        append_text_log(pipeline_log_path, f"timestamp={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-        append_text_log(pipeline_log_path, f"job_id={job_id}")
-        append_text_log(pipeline_log_path, f"input_path={video_path}")
+        append_text_log(pipeline_log_path, f"worker picked up job at={utc_now()}")
+        acquired = AI_REMIX_SEMAPHORE.acquire(blocking=False)
+        if not acquired:
+            append_text_log(pipeline_log_path, "worker_busy: another Wan job is already running")
+            set_job(job_id, phase="failed", progress=100, message="AI Remix worker is busy with another Wan job.", error="worker_busy", has_output=False, prompt=prompt, intent=intent, strength=strength)
+            return
+        set_job(job_id, phase="preparing", progress=5, message="Preparing Wan2.1 AI Remix.", prompt=prompt, intent=intent, strength=strength)
+        append_text_log(pipeline_log_path, f"env WAN_ROOT={WAN_ROOT}")
+        append_text_log(pipeline_log_path, f"env WAN_CKPT_DIR={WAN_CKPT_DIR}")
+        append_text_log(pipeline_log_path, f"env AI_REMIX_WORK_DIR={REMIX_WORK_DIR}")
+        append_text_log(pipeline_log_path, f"env AI_REMIX_PROVIDER={AI_REMIX_PROVIDER}")
+        append_text_log(pipeline_log_path, f"env AI_REMIX_ALLOW_MODAL={os.environ.get('AI_REMIX_ALLOW_MODAL', 'false')}")
+        append_text_log(pipeline_log_path, f"source_video_path={video_path}")
         append_text_log(pipeline_log_path, f"output_path={output_path}")
         append_text_log(pipeline_log_path, f"prompt={prompt}")
-        append_text_log(pipeline_log_path, f"worker_pid={os.getpid()}")
-        append_text_log(pipeline_log_path, f"worker_thread_id={get_ident()}")
+        append_text_log(pipeline_log_path, f"worker_pid={os.getpid()} thread_id={get_ident()}")
         append_text_log(pipeline_log_path, f"pipeline_command={AI_REMIX_PIPELINE_CMD}")
         if not AI_REMIX_PIPELINE_CMD:
             raise RuntimeError("AI_REMIX_PIPELINE_CMD is not configured. Point it at the Wan remix pipeline command.")
         if not prompt.strip():
             raise RuntimeError("AI Remix prompt is required.")
-        set_job(job_id, phase="preparing", progress=8, statusMessage="Preparing Wan2.1 AI Remix", prompt=prompt, intent=intent, strength=strength)
         env = os.environ.copy()
         env.update({
-            "AI_REMIX_JOB_ID": job_id,
-            "AI_REMIX_INPUT_VIDEO": str(video_path),
-            "AI_REMIX_INPUT_MASK": str(mask_path) if mask_path.exists() else "",
-            "AI_REMIX_OUTPUT_VIDEO": str(output_path),
-            "AI_REMIX_PROMPT": prompt,
-            "AI_REMIX_INTENT": intent,
-            "AI_REMIX_STRENGTH": strength,
-            "AI_REMIX_PRESERVE_AUDIO": preserve_audio,
-            "AI_REMIX_PRESERVE_FACE": preserve_face,
-            "AI_REMIX_PRESERVE_MOTION": preserve_motion,
-            "AI_REMIX_OUTPUT_QUALITY": quality,
-            "AI_REMIX_LOG_PATH": str(pipeline_log_path),
-            "PYTHONUNBUFFERED": "1",
-            "WAN_ROOT": os.environ.get("WAN_ROOT", "/opt/Wan2.1"),
-            "WAN_CKPT_DIR": os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B"),
+            "AI_REMIX_JOB_ID": job_id, "AI_REMIX_INPUT_VIDEO": str(video_path), "AI_REMIX_INPUT_MASK": str(mask_path) if mask_path.exists() else "",
+            "AI_REMIX_OUTPUT_VIDEO": str(output_path), "AI_REMIX_PROMPT": prompt, "AI_REMIX_INTENT": intent, "AI_REMIX_STRENGTH": strength,
+            "AI_REMIX_PRESERVE_AUDIO": preserve_audio, "AI_REMIX_PRESERVE_FACE": preserve_face, "AI_REMIX_PRESERVE_MOTION": preserve_motion,
+            "AI_REMIX_OUTPUT_QUALITY": quality, "AI_REMIX_LOG_PATH": str(wan_log_path), "PYTHONUNBUFFERED": "1", "WAN_ROOT": WAN_ROOT, "WAN_CKPT_DIR": WAN_CKPT_DIR,
         })
-        set_job(job_id, phase="remixing", progress=35, statusMessage="Generating prompt-based AI remix with Wan2.1")
+        set_job(job_id, phase="remixing", progress=35, message="Generating prompt-based AI remix with Wan2.1.", prompt=prompt, intent=intent, strength=strength)
         append_text_log(pipeline_log_path, "starting AI Remix pipeline subprocess")
         process = subprocess.Popen(AI_REMIX_PIPELINE_CMD, shell=True, cwd=str(job_dir), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
         append_text_log(pipeline_log_path, f"pipeline_pid={process.pid}")
@@ -353,38 +409,42 @@ def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, p
                 mark_seconds, mark_progress, mark_message = heartbeat_marks[next_heartbeat_index]
                 if elapsed >= mark_seconds:
                     append_text_log(pipeline_log_path, f"heartbeat elapsed={int(elapsed)}s progress={mark_progress}")
-                    set_job(job_id, phase="remixing", progress=mark_progress, statusMessage=mark_message, prompt=prompt, intent=intent, strength=strength)
+                    set_job(job_id, phase="remixing", progress=mark_progress, message=mark_message, prompt=prompt, intent=intent, strength=strength)
                     next_heartbeat_index += 1
-            if elapsed > 60 * 20:
-                append_text_log(pipeline_log_path, "AI Remix V1 timeout reached; killing Wan process group")
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except Exception:
-                    process.kill()
-                raise TimeoutError("Wan generation timed out.")
+            if elapsed > AI_REMIX_TIMEOUT_SECONDS:
+                append_text_log(pipeline_log_path, "wan_generation_timed_out; killing Wan process group")
+                try: os.killpg(process.pid, signal.SIGTERM)
+                except Exception: process.kill()
+                raise TimeoutError("wan_generation_timed_out")
             ready, _, _ = select.select([process.stdout], [], [], 1.0)
             if ready:
                 line = process.stdout.readline()
                 if line:
-                    append_text_log(pipeline_log_path, line.rstrip("\n"))
+                    append_text_log(pipeline_log_path, line.rstrip("\n")); append_text_log(wan_log_path, line.rstrip("\n"))
             if process.poll() is not None:
                 for line in process.stdout:
-                    append_text_log(pipeline_log_path, line.rstrip("\n"))
+                    append_text_log(pipeline_log_path, line.rstrip("\n")); append_text_log(wan_log_path, line.rstrip("\n"))
                 break
-        return_code = process.returncode
-        if return_code != 0:
-            raise RuntimeError(tail_text(pipeline_log_path) or f"AI Remix pipeline exited with {return_code}")
+        if process.returncode != 0:
+            append_text_log(pipeline_log_path, "Wan stdout/stderr tail:\n" + tail_text(wan_log_path))
+            raise RuntimeError(tail_text(wan_log_path) or f"AI Remix pipeline exited with {process.returncode}")
+        set_job(job_id, phase="finalizing", progress=90, message="Finalizing AI Remix output.", prompt=prompt, intent=intent, strength=strength)
         assert_playable_mp4(output_path)
         final_url = public_remix_output_url(job_id)
         append_text_log(pipeline_log_path, "AI Remix pipeline completed successfully")
-        set_job(job_id, phase="completed", progress=100, statusMessage="AI Remix complete", outputUrl=final_url, finalCompositeUrl=final_url, compositeOutputUrl=final_url, fullVideoUrl=final_url, finalOutputUrl=final_url, outputKind="ai_remix_video", error=None, prompt=prompt, intent=intent, strength=strength)
+        set_job(job_id, phase="completed", progress=100, message="AI Remix complete.", outputUrl=final_url, finalCompositeUrl=final_url, compositeOutputUrl=final_url, fullVideoUrl=final_url, finalOutputUrl=final_url, outputKind="ai_remix_video", error=None, has_output=True, output_path=str(output_path), prompt=prompt, intent=intent, strength=strength)
     except Exception as exc:
-        message = str(exc)
-        append_text_log(pipeline_log_path, f"ERROR: {message}")
-        diagnostic = tail_text(pipeline_log_path) or message
-        error_log_path.write_text(diagnostic, encoding="utf-8")
-        set_job(job_id, phase="failed", progress=100, statusMessage="Wan generation timed out." if isinstance(exc, TimeoutError) else "AI Remix failed. Check the job log for Wan/FFmpeg details.", error=diagnostic[-6000:], prompt=prompt, intent=intent, strength=strength)
-
+        phase = "timed_out" if isinstance(exc, TimeoutError) else "failed"
+        err = "wan_generation_timed_out" if isinstance(exc, TimeoutError) else str(exc)
+        tb = traceback.format_exc()[-6000:]
+        append_text_log(pipeline_log_path, f"ERROR: {err}")
+        append_text_log(pipeline_log_path, "traceback_tail=" + tb)
+        append_text_log(pipeline_log_path, "Wan stdout/stderr tail:\n" + tail_text(wan_log_path))
+        error_log_path.write_text((tail_text(pipeline_log_path) or err)[-6000:], encoding="utf-8")
+        set_job(job_id, phase=phase, progress=100, message="Wan generation timed out." if phase == "timed_out" else "AI Remix failed. Check the job log for Wan/FFmpeg details.", error=err if phase == "timed_out" else (tail_text(pipeline_log_path) or err)[-6000:], has_output=False, prompt=prompt, intent=intent, strength=strength)
+    finally:
+        if acquired:
+            AI_REMIX_SEMAPHORE.release()
 
 def process_mix_transition(job_id: str, duration: str, quality: str) -> None:
     job_dir = TRANSITION_WORK_DIR / job_id
@@ -433,7 +493,7 @@ def process_mix_transition(job_id: str, duration: str, quality: str) -> None:
 async def health(request: Request):
     wan_root = Path(WAN_ROOT)
     wan_ckpt_dir = Path(WAN_CKPT_DIR)
-    return {"ok": True, "worker": WORKER_NAME, "version": APP_VERSION, "has_wan_root": wan_root.exists(), "has_wan_generate": (wan_root / "generate.py").exists(), "has_wan_checkpoint": wan_ckpt_dir.exists(), "wan_root": str(wan_root), "wan_ckpt_dir": str(wan_ckpt_dir), "public_base_url": absolute_base_url(request), "ai_remix_pipeline_cmd": AI_REMIX_PIPELINE_CMD, "work_dir": str(WORK_DIR), "remix_work_dir": str(REMIX_WORK_DIR)}
+    return {"ok": True, "worker": WORKER_NAME, "version": APP_VERSION, "has_wan_root": wan_root.exists(), "has_wan_generate": (wan_root / "generate.py").exists(), "has_wan_checkpoint": wan_ckpt_dir.exists(), "wan_root": str(wan_root), "wan_ckpt_dir": str(wan_ckpt_dir), "public_base_url": absolute_base_url(request), "ai_remix_pipeline_cmd": AI_REMIX_PIPELINE_CMD, "work_dir": str(WORK_DIR), "remix_work_dir": str(REMIX_WORK_DIR), "ai_remix_timeout_seconds": AI_REMIX_TIMEOUT_SECONDS, "ai_remix_max_concurrent_jobs": AI_REMIX_MAX_CONCURRENT_JOBS}
 
 
 @app.get("/v1/ai-remix/debug")
@@ -479,25 +539,40 @@ async def create_ai_remix_job(request: Request, video: UploadFile = File(...), p
     save_upload(video, video_path)
     if video_path.stat().st_size > MAX_AI_REMIX_UPLOAD_BYTES:
         video_path.unlink(missing_ok=True)
+        append_text_log(job_dir / "job.log", "rejected: upload exceeds AI_REMIX_MAX_UPLOAD_MB")
+        set_job(remote_job_id, phase="failed", progress=100, message="AI Remix upload is too large.", error="upload_too_large", has_output=False, prompt=prompt, provider=AI_REMIX_PROVIDER)
         raise HTTPException(status_code=413, detail="AI Remix V1 supports short clips only. Trim to 2–5 seconds and try again.")
     if mask is not None and mask.filename:
         save_upload(mask, job_dir / "mask.png")
     if not prompt.strip():
+        append_text_log(job_dir / "job.log", "rejected: prompt is required")
+        set_job(remote_job_id, phase="failed", progress=100, message="AI Remix prompt is required.", error="prompt_required", has_output=False, provider=AI_REMIX_PROVIDER)
         raise HTTPException(status_code=400, detail="AI Remix prompt is required.")
     try:
         duration_seconds = ffprobe_duration(video_path)
     except Exception as exc:
+        append_text_log(job_dir / "job.log", f"rejected: ffprobe failed: {exc}")
+        set_job(remote_job_id, phase="failed", progress=100, message="Could not read uploaded video duration.", error=f"ffprobe_failed: {exc}", has_output=False, prompt=prompt, provider=AI_REMIX_PROVIDER)
         raise HTTPException(status_code=400, detail=f"Could not read uploaded video duration: {exc}")
     if duration_seconds > MAX_AI_REMIX_SECONDS:
+        append_text_log(job_dir / "job.log", f"rejected: duration_seconds={duration_seconds} exceeds max={MAX_AI_REMIX_SECONDS}")
+        set_job(remote_job_id, phase="failed", progress=100, message="AI Remix clip is too long.", error="clip_too_long", has_output=False, prompt=prompt, provider=AI_REMIX_PROVIDER)
         raise HTTPException(status_code=413, detail="AI Remix V1 supports short clips only. Trim to 2–5 seconds and try again.")
     normalized_strength = strength if strength in {"light", "medium", "heavy"} else "medium"
     normalized_quality = quality or "source"
     metadata_path = job_dir / "metadata.txt"
     metadata_path.write_text(f"prompt={prompt}\nintent={intent}\nstrength={normalized_strength}\npreserve_audio={preserve_audio}\npreserve_face={preserve_face}\npreserve_motion={preserve_motion}\nquality={normalized_quality}\n", encoding="utf-8")
+    log_path = job_dir / "job.log"
+    append_text_log(log_path, f"job accepted at={utc_now()}")
+    append_text_log(log_path, f"job_id={remote_job_id}")
+    append_text_log(log_path, f"source_video_path={video_path}")
+    append_text_log(log_path, f"pipeline_command={AI_REMIX_PIPELINE_CMD}")
+    append_text_log(log_path, f"env WAN_ROOT={WAN_ROOT} WAN_CKPT_DIR={WAN_CKPT_DIR} AI_REMIX_WORK_DIR={REMIX_WORK_DIR} provider={AI_REMIX_PROVIDER}")
     append_text_log(job_dir / "wan_pipeline.log", f"job_id={remote_job_id}")
-    append_text_log(job_dir / "wan_pipeline.log", f"queued_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    append_text_log(job_dir / "wan_pipeline.log", "queued AI Remix job; background worker thread will append lifecycle details")
-    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued AI Remix", prompt=prompt, intent=intent, strength=normalized_strength)
+    append_text_log(job_dir / "wan_pipeline.log", f"queued_at={utc_now()}")
+    state = set_job(remote_job_id, phase="queued", progress=1, message="Job accepted and queued.", error=None, outputUrl=None, has_output=False, prompt=prompt, intent=intent, strength=normalized_strength, provider=AI_REMIX_PROVIDER)
+    if not (job_dir / "status.json").exists():
+        raise HTTPException(status_code=500, detail="Failed to initialize AI Remix job status.json")
     thread = Thread(target=process_ai_remix_job, args=(remote_job_id, prompt, intent, normalized_strength, preserve_audio, preserve_face, preserve_motion, normalized_quality), daemon=True)
     thread.start()
     payload = dump_job_payload(state, request)
@@ -538,7 +613,7 @@ async def get_ai_remix_output(job_id: str):
 @app.get("/v1/ai-remix/jobs/{job_id}/log")
 async def get_ai_remix_log(job_id: str):
     job_dir = REMIX_WORK_DIR / job_id
-    for candidate in (job_dir / "error.log", job_dir / "wan_pipeline.log"):
+    for candidate in (job_dir / "job.log", job_dir / "error.log", job_dir / "wan_pipeline.log"):
         if candidate.exists():
             return PlainTextResponse(candidate.read_text(encoding="utf-8", errors="replace"), media_type="text/plain")
     return JSONResponse(status_code=404, content={"error": "No log file found", "job_id": job_id})

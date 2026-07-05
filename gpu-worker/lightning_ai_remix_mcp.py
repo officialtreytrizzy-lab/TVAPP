@@ -332,6 +332,14 @@ def start_worker(port: int = DEFAULT_WORKER_PORT) -> dict[str, Any]:
     env.setdefault("AI_REMIX_PROVIDER", "lightning-gpu")
     env.setdefault("AI_REMIX_GPU_ENABLED", "true")
     env.setdefault("AI_REMIX_ALLOW_MODAL", "false")
+    env.setdefault("AI_REMIX_SIZE", "832*480")
+    env.setdefault("AI_REMIX_FRAME_NUM", "5")
+    env.setdefault("AI_REMIX_SAMPLE_STEPS", "4")
+    env.setdefault("AI_REMIX_SAMPLE_GUIDE_SCALE", "3.5")
+    env.setdefault("AI_REMIX_SAMPLE_SHIFT", "5")
+    env.setdefault("AI_REMIX_MAX_SECONDS", "0.5")
+    env.setdefault("AI_REMIX_TIMEOUT_SECONDS", "1800")
+    env.setdefault("AI_REMIX_MAX_CONCURRENT_JOBS", "1")
     env.setdefault("AI_REMIX_PIPELINE_CMD", f"python {pipeline_py}")
     env.setdefault("ERASER_PUBLIC_BASE_URL", f"http://127.0.0.1:{port}")
 
@@ -415,7 +423,18 @@ def start_tiny_smoke_remix(prompt: str = "Make it a neon R&B music video") -> di
         files={"video": video_path},
         timeout=60,
     )
-    return {"ok": bool(post.get("ok")), "fixture": str(video_path), "worker_base_url": WORKER_BASE_URL, "response": post}
+    if not post.get("ok"):
+        return {"ok": False, "phase": "submit", "fixture": str(video_path), "worker_base_url": WORKER_BASE_URL, "response": post}
+    response = post.get("json") if isinstance(post.get("json"), dict) else post
+    job_id = response.get("job_id") or response.get("jobId") if isinstance(response, dict) else ""
+    if not job_id:
+        return {"ok": False, "phase": "status_lifecycle", "error": "Job was accepted but no job_id was returned.", "fixture": str(video_path), "response": post}
+    status_path = _safe_job_dir(job_id) / "status.json"
+    status = _http_json(f"{WORKER_BASE_URL}/v1/ai-remix/jobs/{urllib.parse.quote(job_id)}", timeout=15)
+    status_json = status.get("json") if isinstance(status.get("json"), dict) else status
+    if not status_path.exists() or not isinstance(status_json, dict) or not status_json or status_json == {}:
+        return {"ok": False, "phase": "status_lifecycle", "error": "Job was accepted but status lifecycle did not initialize.", "job_id": job_id, "status_path": str(status_path), "status_path_exists": status_path.exists(), "status": status, "response": post}
+    return {"ok": True, "fixture": str(video_path), "worker_base_url": WORKER_BASE_URL, "job_id": job_id, "status_path": str(status_path), "response": post, "status": status}
 
 
 def get_job_status(job_id: str) -> dict[str, Any]:
@@ -431,7 +450,7 @@ def tail_job_log(job_id: str, lines: int = 80) -> dict[str, Any]:
     clean = _safe_job_id(job_id)
     lines = max(1, min(int(lines), 400))
     job_dir = _safe_job_dir(clean)
-    candidates = [job_dir / "error.log", job_dir / "wan_pipeline.log"]
+    candidates = [job_dir / "job.log", job_dir / "error.log", job_dir / "wan_pipeline.log"]
     for path in candidates:
         if path.exists():
             content = path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
