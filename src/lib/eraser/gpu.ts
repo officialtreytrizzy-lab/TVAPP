@@ -43,8 +43,9 @@ function envFlag(name: string, fallback = 'false'): boolean {
   return String(import.meta.env[name] ?? fallback).toLowerCase() === 'true';
 }
 
-// Server-side proxy is the safe production default because the real GPU/API token
-// stays in Vercel server env. Direct worker calls still require an explicit allow flag.
+// Server-side proxy is the production route. The real GPU/API token stays in
+// Vercel server env, so old VITE_TRECUT_ERASER_USE_PROXY=false build values
+// must not force the live app back into browser fallback.
 const ALLOW_REMOTE_API = envFlag('VITE_ETREYSER_ALLOW_REMOTE_API');
 const ALLOW_MODAL = envFlag('VITE_ETREYSER_ALLOW_MODAL');
 const ALLOW_CLOUD_GPU = envFlag('VITE_ETREYSER_ALLOW_CLOUD_GPU');
@@ -52,7 +53,8 @@ const DIRECT_WORKER_ALLOWED = ALLOW_REMOTE_API || ALLOW_MODAL || ALLOW_CLOUD_GPU
 const RAW_DIRECT_WORKER_URL = String(import.meta.env.VITE_ERASER_GPU_WORKER_URL ?? '').replace(/\/$/, '');
 const DIRECT_WORKER_URL = DIRECT_WORKER_ALLOWED ? RAW_DIRECT_WORKER_URL : '';
 const ERASER_API_PROXY_URL = String(import.meta.env.VITE_TRECUT_ERASER_PROXY_URL ?? '/api/v1/trecut/eraser').replace(/\/$/, '');
-const USE_ERASER_API_PROXY = String(import.meta.env.VITE_TRECUT_ERASER_USE_PROXY ?? 'true').toLowerCase() !== 'false' && ERASER_API_PROXY_URL.length > 0;
+const PROXY_EXPLICITLY_DISABLED = envFlag('VITE_TRECUT_ERASER_DISABLE_PROXY');
+const USE_ERASER_API_PROXY = !PROXY_EXPLICITLY_DISABLED && ERASER_API_PROXY_URL.length > 0;
 const POLL_MS = 1400;
 const MAX_POLLS = 900; // about 21 minutes
 
@@ -72,6 +74,7 @@ export function gpuRemovalDiagnostics() {
     configured: isGpuRemovalConfigured(),
     proxyEnabled: USE_ERASER_API_PROXY,
     proxyUrl: ERASER_API_PROXY_URL,
+    proxyExplicitlyDisabled: PROXY_EXPLICITLY_DISABLED,
     directWorkerEnabled: Boolean(DIRECT_WORKER_URL),
     directWorkerAllowed: DIRECT_WORKER_ALLOWED,
     directWorkerUrlConfigured: Boolean(RAW_DIRECT_WORKER_URL),
@@ -235,7 +238,7 @@ async function waitForRemovalOutput(options: {
 }
 
 async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
-  if (!USE_ERASER_API_PROXY) throw new Error('Remote eTreyser API proxy is disabled. Set VITE_TRECUT_ERASER_USE_PROXY=true or leave it unset for the default server proxy.');
+  if (!USE_ERASER_API_PROXY) throw new Error('Remote eTreyser API proxy is disabled. Set VITE_TRECUT_ERASER_DISABLE_PROXY=false or leave it unset for the production GPU proxy.');
   const { jobId, file, selectedFrameIndex, maskCanvas, outputQuality = 'source', onPhase } = input;
 
   onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser GPU proxy...');
