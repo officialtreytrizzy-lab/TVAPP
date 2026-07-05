@@ -1,4 +1,4 @@
-import type { OpenCutVideoMeta } from './types';
+import type { OpenCutAudioMeta, OpenCutVideoMeta } from './types';
 
 export function probeOpenCutVideo(file: File): Promise<OpenCutVideoMeta> {
   return new Promise((resolve, reject) => {
@@ -20,6 +20,20 @@ export function probeOpenCutVideo(file: File): Promise<OpenCutVideoMeta> {
       reject(new Error('Could not read this video. Try MP4, MOV, or WebM.'));
     };
     video.src = url;
+  });
+}
+
+export function probeOpenCutAudio(file: File): Promise<OpenCutAudioMeta> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const audio = document.createElement('audio');
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => resolve({ url, duration: audio.duration || 0 });
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('Could not read this audio file. Try MP3, WAV, M4A, or AAC.'));
+    };
+    audio.src = url;
   });
 }
 
