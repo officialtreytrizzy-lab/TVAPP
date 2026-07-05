@@ -18,10 +18,7 @@ The MCP server exposes allowlisted tools so a connected AI client can inspect an
 - `start_tiny_smoke_remix`
 - `get_job_status`
 - `tail_job_log`
-- `tail_worker_log`
-- `tail_mcp_log`
 - `get_output_path`
-- `get_job_bundle`
 - `list_recent_jobs`
 - `cancel_job`
 
@@ -147,8 +144,6 @@ curl -s http://127.0.0.1:8765/mcp \
   | python -m json.tool
 ```
 
-If you start the worker on a non-default port, the MCP server now persists that local worker base URL under `AI_REMIX_WORK_DIR` and reuses it for later health, smoke, status, log, and output tools.
-
 Run a tiny one-second AI Remix smoke job:
 
 ```bash
@@ -179,85 +174,25 @@ curl -s http://127.0.0.1:8765/mcp \
   | python -m json.tool
 ```
 
-Bundle job status, latest log lines, and output metadata in one call:
-
-```bash
-curl -s http://127.0.0.1:8765/mcp \
-  -H "Authorization: Bearer $LIGHTNING_MCP_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"get_job_bundle","arguments":{"job_id":"remix_REPLACE_ME","log_lines":120}}}' \
-  | python -m json.tool
-```
-
-Tail the uvicorn worker log started by MCP:
-
-```bash
-curl -s http://127.0.0.1:8765/mcp \
-  -H "Authorization: Bearer $LIGHTNING_MCP_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tail_worker_log","arguments":{"lines":160}}}' \
-  | python -m json.tool
-```
-
-Tail the MCP operator log:
-
-```bash
-curl -s http://127.0.0.1:8765/mcp \
-  -H "Authorization: Bearer $LIGHTNING_MCP_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"tail_mcp_log","arguments":{"lines":160}}}' \
-  | python -m json.tool
-```
-
 ## Connect from an MCP-capable client
 
-For ChatGPT New App / Custom App connections, use the official MCP SDK server:
-
-```bash
-cd /teamspace/studios/this_studio/TVAPP
-python -m pip install -U "mcp[cli]" fastapi
-CHATGPT_MCP_PORT=8766 python gpu-worker/lightning_ai_remix_chatgpt_mcp.py --transport streamable-http
-```
-
-The Streamable HTTP endpoint is:
+Use the Lightning public URL for port `8765` as the remote MCP endpoint:
 
 ```text
-http://127.0.0.1:8766/mcp
+https://YOUR-LIGHTNING-PORT-8765-URL/mcp
 ```
 
-Expose it through Cloudflare Tunnel:
-
-```bash
-cloudflared tunnel --url http://127.0.0.1:8766 --no-autoupdate --edge-ip-version 4
-```
-
-Use this URL in ChatGPT New App:
+Add this header in the client configuration:
 
 ```text
-https://YOUR-TRYCLOUDFLARE-SUBDOMAIN.trycloudflare.com/mcp
+Authorization: Bearer YOUR_LIGHTNING_MCP_TOKEN
 ```
 
-Choose **No Auth** in ChatGPT for this MCP endpoint. Keep the random tunnel URL private. The server exposes only the allowlisted tools in this document and does not expose arbitrary shell execution or arbitrary file reads.
-
-If a client specifically requires legacy SSE, start the same server with:
-
-```bash
-CHATGPT_MCP_PORT=8766 python gpu-worker/lightning_ai_remix_chatgpt_mcp.py --transport sse
-```
-
-Then use:
-
-```text
-https://YOUR-TRYCLOUDFLARE-SUBDOMAIN.trycloudflare.com/sse
-```
-
-The older local JSON-RPC compatibility server remains available on port `8765`, but ChatGPT New App should use `lightning_ai_remix_chatgpt_mcp.py` on port `8766`.
+If the client supports custom headers, prefer the `Authorization` header. The server also accepts `X-Lightning-MCP-Token` or `?token=` for emergency testing, but header auth is cleaner.
 
 ## Security rules
 
-Do not expose the legacy port `8765` JSON-RPC compatibility MCP publicly without a secret token.
-
-For the ChatGPT-compatible port `8766` server, choose **No Auth** in ChatGPT and keep the random Cloudflare Tunnel URL private/unlisted. If your ChatGPT workspace supports a stronger auth mode for MCP servers, use that instead of a public unauthenticated URL.
+Do not expose this MCP publicly without a secret token.
 
 The MCP server can start GPU jobs, inspect files under `AI_REMIX_WORK_DIR`, and read logs. That is powerful enough to waste GPU time or expose project runtime details if shared carelessly.
 
