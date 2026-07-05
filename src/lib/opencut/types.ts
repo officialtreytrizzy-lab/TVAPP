@@ -2,6 +2,22 @@ export type OpenCutTransitionType = 'none' | 'fade' | 'flash' | 'wipe' | 'zoom' 
 
 export type OpenCutTextAnimation = 'none' | 'pop' | 'fade' | 'slide-up' | 'glow' | 'typewriter';
 
+export type OpenCutExportQuality = 'draft' | 'social-standard' | 'social-high' | 'archive';
+
+export interface OpenCutTimelineConfig {
+  fps: number;
+  timebase: number;
+  snapEnabled: boolean;
+  snapThresholdSeconds: number;
+  defaultClipDuration: number;
+  defaultTransitionDuration: number;
+  maxTransitionDuration: number;
+  minClipDuration: number;
+  textDefaultDuration: number;
+  audioDefaultVolume: number;
+  exportQuality: OpenCutExportQuality;
+}
+
 export interface OpenCutClip {
   id: string;
   name: string;
@@ -62,6 +78,7 @@ export interface OpenCutProject {
   clips: OpenCutClip[];
   textLayers: OpenCutTextLayer[];
   audioTracks: OpenCutAudioTrack[];
+  timeline?: Partial<OpenCutTimelineConfig>;
   selectedClipId?: string;
 }
 
