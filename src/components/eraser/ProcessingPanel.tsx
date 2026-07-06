@@ -43,6 +43,7 @@ export default function ProcessingPanel({
   const [showAfter, setShowAfter] = useState(true);
   const done = phase === 'completed' && finalUrl;
   const usingGpu = /gpu/i.test(processingMode);
+  const displayProgress = usingGpu && processing && phase === 'segmenting' && progress <= 22 ? 20 : progress;
 
   return (
     <div className="space-y-4 rounded-xl bg-slate-900/70 p-4 ring-1 ring-slate-800">
@@ -86,15 +87,15 @@ export default function ProcessingPanel({
         </div>
       )}
 
-      {(processing || progress > 0) && phase !== 'awaiting_mask' && (
+      {(processing || displayProgress > 0) && phase !== 'awaiting_mask' && (
         <div>
           <div className="mb-1 flex justify-between text-xs text-slate-400">
             <span>{statusMessage}</span>
-            <span className="font-mono text-slate-300">{Math.round(progress)}%</span>
+            <span className="font-mono text-slate-300">{Math.round(displayProgress)}%</span>
           </div>
           <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
             <div className="h-full rounded-full bg-gradient-to-r from-violet-500 to-blue-500 transition-all duration-300"
-              style={{ width: `${progress}%` }} />
+              style={{ width: `${displayProgress}%` }} />
           </div>
         </div>
       )}
