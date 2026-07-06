@@ -25,6 +25,10 @@ function isIdempotencyError(msg: string): boolean {
   return /Mask can only be set|already processing|mask already accepted/i.test(msg || '');
 }
 
+function isGpuConfigurationOrAvailabilityError(msg: string): boolean {
+  return /not configured|disabled or not configured|failed to fetch|networkerror|load failed|http (404|502|503|504)|worker unavailable|job_not_found|etreyser_first_party_job_failed/i.test(msg || '');
+}
+
 interface Meta { duration: number; width: number; height: number; fps: number; url: string; filename: string; }
 
 export default function Editor() {
@@ -155,34 +159,48 @@ export default function Editor() {
       setPhase('mask_ready');
       setProgress(20);
 
+      const runBrowserFallback = () => runPipeline({
+        jobId, video: videoRef.current!, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
+        selectedTime: current, maskCanvas, cancelRef: cancelRef.current,
+        onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
+      });
+
       const useGpu = isGpuRemovalConfigured() && !!sourceFileRef.current;
-      const out = useGpu
-        ? await runGpuRemoval({
-          jobId,
-          file: sourceFileRef.current!,
-          sourceUrl: meta.url,
-          fps: meta.fps,
-          duration: meta.duration,
-          width: meta.width,
-          height: meta.height,
-          selectedTime: current,
-          selectedFrameIndex,
-          maskCanvas,
-          outputQuality,
-          cancelRef: cancelRef.current,
-          onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
-        })
-        : await runPipeline({
-          jobId, video: videoRef.current, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
-          selectedTime: current, maskCanvas, cancelRef: cancelRef.current,
-          onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
-        });
+      let completedWithGpu = false;
+      let out: PipelineOutput;
+      if (useGpu) {
+        try {
+          out = await runGpuRemoval({
+            jobId,
+            file: sourceFileRef.current!,
+            sourceUrl: meta.url,
+            fps: meta.fps,
+            duration: meta.duration,
+            width: meta.width,
+            height: meta.height,
+            selectedTime: current,
+            selectedFrameIndex,
+            maskCanvas,
+            outputQuality,
+            cancelRef: cancelRef.current,
+            onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
+          });
+          completedWithGpu = true;
+        } catch (gpuError) {
+          const gpuMessage = (gpuError as Error).message || '';
+          if (gpuMessage === '__CANCELLED__' || !isGpuConfigurationOrAvailabilityError(gpuMessage)) throw gpuError;
+          setStatusMessage(`GPU worker unavailable (${gpuMessage}). Falling back to browser processing...`);
+          out = await runBrowserFallback();
+        }
+      } else {
+        out = await runBrowserFallback();
+      }
 
       outputRef.current = out;
       setFinalUrl(out.finalUrl);
       setPhase('completed');
       setProgress(100);
-      setStatusMessage(useGpu ? `Done with GPU AI removal (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).` : 'Done with browser fallback.');
+      setStatusMessage(completedWithGpu ? `Done with GPU AI removal (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).` : 'Done with browser fallback.');
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === '__CANCELLED__') {
