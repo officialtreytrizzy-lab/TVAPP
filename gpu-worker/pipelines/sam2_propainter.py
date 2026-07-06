@@ -1,14 +1,10 @@
-"""Tracked-mask ProPainter pipeline for the Modal video eraser worker.
+"""Tracked-mask eraser pipeline for the Modal video eraser worker.
 
-The first production worker used a single static PNG mask for every frame,
-which is fine for logos but drifts badly for moving objects. This pipeline now
-uses the user-selected frame/time as the anchor, tracks the masked patch forward
-and backward with local template matching, writes a frame-wise mask folder, and
-passes that folder into ProPainter.
-
-It still preserves the source video's resolution, frame rate, and audio. If
-tracking confidence drops on a frame, the previous mask is reused instead of
-jumping to the wrong region.
+This pipeline uses the user-selected frame/time as the anchor, tracks the
+masked patch forward and backward with local template matching, writes a
+frame-wise mask folder, then tries ProPainter. If ProPainter runs out of CUDA
+memory, the worker falls back to a tracked OpenCV inpaint pass so the job still
+finishes instead of dying at 99%.
 """
 
 from __future__ import annotations
@@ -76,8 +72,7 @@ def read_video_gray_frames(input_video: Path) -> list[np.ndarray]:
         ok, frame = cap.read()
         if not ok:
             break
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        frames.append(gray)
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
     cap.release()
 
     if not frames:
@@ -333,9 +328,6 @@ def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fp
 
 
 def processing_size(width: int, height: int, quality: str, max_side_cap: int | None = None) -> tuple[int, int]:
-    # A10G-safe default: do not start at source resolution. Full-res ProPainter
-    # optical flow can OOM even on short phone clips. Final mux scales back to
-    # source size, so this only changes internal inpainting memory pressure.
     default_max_side = 720 if quality == "higher" else 640
     max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", str(default_max_side)))
     if max_side_cap:
@@ -403,8 +395,6 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
     env = dict(os.environ)
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
 
-    # A10G-safe ladder. Starting lower is more reliable than failing full-res
-    # first, because RAFT/flow completion can fragment memory before retries.
     attempts: list[tuple[int, str, str, str, str]] = [
         (640, "12", "3", "8", "3"),
         (560, "10", "2", "8", "3"),
@@ -449,6 +439,77 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
     raise last_error or RuntimeError("ProPainter failed without output")
 
 
+def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path, fps: float) -> Path:
+    fallback_dir = work_dir / "opencv_tracked_inpaint"
+    if fallback_dir.exists():
+        shutil.rmtree(fallback_dir)
+    fallback_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_output = fallback_dir / "opencv_raw.mp4"
+    normalized_output = fallback_dir / "opencv_h264.mp4"
+
+    cap = cv2.VideoCapture(str(source_mp4))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open source video for OpenCV fallback: {source_mp4}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fallback_fps = fps if fps and fps > 0 else cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise RuntimeError("Could not read source dimensions for OpenCV fallback")
+
+    writer = cv2.VideoWriter(str(raw_output), cv2.VideoWriter_fourcc(*"mp4v"), fallback_fps, (width, height))
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError("Could not open OpenCV fallback video writer")
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    frame_index = 0
+    written = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+
+        mask_path = mask_dir / f"{frame_index:05d}.png"
+        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            mask = np.zeros((height, width), dtype=np.uint8)
+        elif mask.shape[1] != width or mask.shape[0] != height:
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+        mask = (mask > 24).astype(np.uint8) * 255
+        if mask_bbox(mask) is not None:
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            frame = cv2.inpaint(frame, mask, 3, cv2.INPAINT_TELEA)
+
+        writer.write(frame)
+        frame_index += 1
+        written += 1
+
+    cap.release()
+    writer.release()
+
+    if written <= 0 or not raw_output.exists() or raw_output.stat().st_size <= 0:
+        raise RuntimeError("OpenCV fallback did not write any frames")
+
+    try:
+        run([
+            "ffmpeg", "-y", "-i", str(raw_output),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(normalized_output),
+        ])
+        if normalized_output.exists() and normalized_output.stat().st_size > 0:
+            print(f"OpenCV tracked inpaint fallback completed: frames={written}", flush=True)
+            return normalized_output
+    except Exception as exc:
+        print(f"OpenCV fallback normalization failed, using raw mp4: {exc}", flush=True)
+
+    print(f"OpenCV tracked inpaint fallback completed with raw output: frames={written}", flush=True)
+    return raw_output
+
+
 def main() -> None:
     input_video = Path(required_env("ERASER_INPUT_VIDEO"))
     input_mask = Path(required_env("ERASER_INPUT_MASK"))
@@ -471,11 +532,19 @@ def main() -> None:
     prepare_source_mp4(input_video, source_mp4)
     fps, width, height = read_video_meta(source_mp4)
     tracked_masks = build_tracked_masks(source_mp4, input_mask, mask_dir, fps, width, height)
-    inpainted = run_propainter(source_mp4, tracked_masks, result_root, width, height, output_quality)
+
+    try:
+        inpainted = run_propainter(source_mp4, tracked_masks, result_root, width, height, output_quality)
+    except RuntimeError as exc:
+        if not is_cuda_oom(str(exc)):
+            raise
+        print("ProPainter CUDA OOM detected; falling back to tracked OpenCV inpaint.", flush=True)
+        inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
+
     mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
 
     if not output_video.exists() or output_video.stat().st_size <= 0:
-        raise RuntimeError("ProPainter pipeline did not create output video")
+        raise RuntimeError("Eraser pipeline did not create output video")
 
 
 if __name__ == "__main__":
