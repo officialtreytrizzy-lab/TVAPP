@@ -210,8 +210,6 @@ def clean_remove_mask(alpha: np.ndarray, width: int, height: int) -> np.ndarray:
     box_h = y2 - y1 + 1
     min_side = min(width, height)
 
-    # Cover the whole marked object, not just the exact brush stroke. This is
-    # intentionally conservative because ProPainter needs a full remove region.
     pad = max(4, min(28, int(max(box_w, box_h) * 0.25)))
     kernel_size = max(3, min(19, int(min_side * 0.008)))
     if kernel_size % 2 == 0:
@@ -253,13 +251,7 @@ def shift_mask(mask: np.ndarray, dx: int, dy: int, width: int, height: int) -> n
     return cv2.warpAffine(mask, matrix, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
 
-def track_next_mask(
-    prev_frame: np.ndarray,
-    next_frame: np.ndarray,
-    prev_mask: np.ndarray,
-    width: int,
-    height: int,
-) -> tuple[np.ndarray, float]:
+def track_next_mask(prev_frame: np.ndarray, next_frame: np.ndarray, prev_mask: np.ndarray, width: int, height: int) -> tuple[np.ndarray, float]:
     bbox = mask_bbox(prev_mask)
     if bbox is None:
         return prev_mask.copy(), 0.0
@@ -272,7 +264,7 @@ def track_next_mask(
     x1, y1, x2, y2 = template_bbox
     template_w = x2 - x1 + 1
     template_h = y2 - y1 + 1
-    motion_radius = max(32, min(260, int(max(template_w, template_h) * 1.15)))
+    motion_radius = max(32, min(220, int(max(template_w, template_h) * 1.0)))
 
     sx1 = max(0, x1 - motion_radius)
     sy1 = max(0, y1 - motion_radius)
@@ -283,8 +275,6 @@ def track_next_mask(
     if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
         return prev_mask.copy(), 0.0
 
-    # Stabilize contrast. This improves tracking on dark phone videos and clips
-    # with soft compression, without adding extra dependencies.
     template_eq = cv2.equalizeHist(template)
     search_eq = cv2.equalizeHist(search)
 
@@ -298,8 +288,7 @@ def track_next_mask(
     dx = int(round(new_x1 - x1))
     dy = int(round(new_y1 - y1))
 
-    # Prevent one bad match from jumping across the clip.
-    max_step = max(24, int(max(template_w, template_h) * 1.35))
+    max_step = max(24, int(max(template_w, template_h) * 1.15))
     dx = max(-max_step, min(max_step, dx))
     dy = max(-max_step, min(max_step, dy))
     return shift_mask(prev_mask, dx, dy, width, height), float(max_val)
@@ -313,10 +302,8 @@ def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fp
 
     masks: list[np.ndarray | None] = [None] * len(frames)
     masks[anchor] = base_mask
-
     scores: list[float] = []
 
-    # Track forward from the selected frame.
     prev_mask = base_mask
     for idx in range(anchor + 1, len(frames)):
         next_mask, score = track_next_mask(frames[idx - 1], frames[idx], prev_mask, width, height)
@@ -324,7 +311,6 @@ def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fp
         prev_mask = next_mask
         scores.append(score)
 
-    # Track backward from the selected frame.
     prev_mask = base_mask
     for idx in range(anchor - 1, -1, -1):
         next_mask, score = track_next_mask(frames[idx + 1], frames[idx], prev_mask, width, height)
@@ -342,20 +328,15 @@ def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fp
         cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
 
     avg_score = sum(scores) / len(scores) if scores else 1.0
-    print(
-        f"Tracked remove mask sequence: frames={len(frames)} anchor={anchor} avg_match={avg_score:.3f} dir={output_dir}",
-        flush=True,
-    )
+    print(f"Tracked remove mask sequence: frames={len(frames)} anchor={anchor} avg_match={avg_score:.3f} dir={output_dir}", flush=True)
     return output_dir
 
 
 def processing_size(width: int, height: int, quality: str, max_side_cap: int | None = None) -> tuple[int, int]:
-    # Default to source dimensions for 720x1280-style clips so ProPainter does
-    # not unnecessarily downgrade the render. Env override is still available
-    # if a GPU needs a lower cap.
-    default_max_side = max(width, height)
-    if quality == "higher":
-        default_max_side = max(default_max_side, 1440)
+    # A10G-safe default: do not start at source resolution. Full-res ProPainter
+    # optical flow can OOM even on short phone clips. Final mux scales back to
+    # source size, so this only changes internal inpainting memory pressure.
+    default_max_side = 720 if quality == "higher" else 640
     max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", str(default_max_side)))
     if max_side_cap:
         max_side = min(max_side, max_side_cap)
@@ -378,12 +359,7 @@ def find_propainter_output(result_root: Path) -> Path:
 
 def export_settings(quality: str, source_bitrate: int | None) -> tuple[str, str, list[str]]:
     if quality == "higher":
-        # Lower CRF = less compression. Higher mode can create a larger file,
-        # but it avoids adding compression noise after inpainting.
         return "slow", "11", ["-b:a", "256k"]
-
-    # Source mode keeps the same dimensions/fps/audio and uses a high-quality
-    # encode. If source bitrate is known, avoid going below it.
     if source_bitrate and source_bitrate > 0:
         target = max(source_bitrate, 8_000_000)
         return "medium", "14", ["-b:a", "192k", "-maxrate", str(int(target * 1.35)), "-bufsize", str(int(target * 2))]
@@ -398,124 +374,77 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, wid
 
     try:
         cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(inpainted_video),
-            "-i",
-            str(source_video),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-vf",
-            vf,
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            crf,
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            "-c:a",
-            "aac",
-            *audio_args,
-            "-shortest",
-            str(output_video),
+            "ffmpeg", "-y", "-i", str(inpainted_video), "-i", str(source_video),
+            "-map", "0:v:0", "-map", "1:a?", "-vf", vf,
+            "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-c:a", "aac", *audio_args, "-shortest", str(output_video),
         ]
         run(cmd)
     except Exception:
-        # No audio or mux failure: still return a playable video at source size/fps.
         run([
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(inpainted_video),
-            "-vf",
-            vf,
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            crf,
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
+            "ffmpeg", "-y", "-i", str(inpainted_video), "-vf", vf,
+            "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
             str(output_video),
         ])
 
 
 def is_cuda_oom(message: str) -> bool:
     lowered = message.lower()
-    return "out of memory" in lowered or "outofmemoryerror" in lowered
+    return "out of memory" in lowered or "outofmemoryerror" in lowered or "cuda oom" in lowered
 
 
 def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
         raise RuntimeError(
-            f"ProPainter is not installed at {PROPAINTER_ROOT}. "
-            "The Modal image must clone https://github.com/sczhou/ProPainter.git."
+            f"ProPainter is not installed at {PROPAINTER_ROOT}. The Modal image must clone https://github.com/sczhou/ProPainter.git."
         )
 
     env = dict(os.environ)
-    # Reduces fragmentation OOMs on long clips (recommended by PyTorch when
-    # reserved-but-unallocated memory is large).
-    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
 
-    # Attempt ladder: full requested size first, then progressively smaller
-    # internal processing sizes if the GPU runs out of memory. mux_audio
-    # scales the result back to source dimensions, so output size/fps/audio
-    # are preserved either way.
-    attempts: list[tuple[int | None, str]] = [(None, "50"), (960, "30"), (720, "20")]
+    # A10G-safe ladder. Starting lower is more reliable than failing full-res
+    # first, because RAFT/flow completion can fragment memory before retries.
+    attempts: list[tuple[int, str, str, str, str]] = [
+        (640, "12", "3", "8", "3"),
+        (560, "10", "2", "8", "3"),
+        (480, "8", "1", "6", "2"),
+        (384, "6", "1", "4", "2"),
+    ]
     last_error: RuntimeError | None = None
 
-    for index, (max_side_cap, subvideo_length) in enumerate(attempts):
+    for index, (max_side_cap, subvideo_length, neighbor_length, ref_stride, mask_dilation) in enumerate(attempts):
         if result_root.exists():
             shutil.rmtree(result_root)
         result_root.mkdir(parents=True, exist_ok=True)
 
         proc_w, proc_h = processing_size(width, height, quality, max_side_cap)
         cmd = [
-            "python",
-            str(inference),
-            "--video",
-            str(source_mp4),
-            "--mask",
-            str(mask_path),
-            "--output",
-            str(result_root),
-            "--height",
-            str(proc_h),
-            "--width",
-            str(proc_w),
+            "python", str(inference),
+            "--video", str(source_mp4),
+            "--mask", str(mask_path),
+            "--output", str(result_root),
+            "--height", str(proc_h),
+            "--width", str(proc_w),
             "--fp16",
-            "--subvideo_length",
-            subvideo_length,
-            "--neighbor_length",
-            "6",
-            "--ref_stride",
-            "10",
-            "--mask_dilation",
-            "4",
+            "--subvideo_length", subvideo_length,
+            "--neighbor_length", neighbor_length,
+            "--ref_stride", ref_stride,
+            "--mask_dilation", mask_dilation,
         ]
         try:
+            print(
+                f"Running ProPainter memory-safe attempt {index + 1}/{len(attempts)}: "
+                f"{proc_w}x{proc_h}, subvideo={subvideo_length}, neighbor={neighbor_length}, ref_stride={ref_stride}",
+                flush=True,
+            )
             run(cmd, cwd=PROPAINTER_ROOT, env=env)
             return find_propainter_output(result_root)
         except RuntimeError as exc:
             last_error = exc
             if index == len(attempts) - 1 or not is_cuda_oom(str(exc)):
                 raise
-            print(
-                f"ProPainter ran out of GPU memory at {proc_w}x{proc_h} "
-                f"(subvideo_length={subvideo_length}); retrying smaller...",
-                flush=True,
-            )
+            print(f"ProPainter CUDA OOM at {proc_w}x{proc_h}; retrying smaller...", flush=True)
 
     raise last_error or RuntimeError("ProPainter failed without output")
 
