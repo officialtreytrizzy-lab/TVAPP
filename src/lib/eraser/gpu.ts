@@ -97,6 +97,12 @@ function sleep(ms: number): Promise<void> {
 }
 
 function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
+  // The mask canvas paints WHITE on a transparent background, so the exported
+  // RGBA PNG is (255,255,255,255) where the user painted and (0,0,0,0) where
+  // they did not. That reads as "remove here" under every decode path the GPU
+  // worker might use: by alpha (255 vs 0), by grayscale (255 vs 0), or by color
+  // (white vs black). Do NOT flatten to opaque — the worker reads the alpha
+  // channel, and an all-opaque mask would mark the whole frame for removal.
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (!blob) reject(new Error('Could not export mask PNG.'));
