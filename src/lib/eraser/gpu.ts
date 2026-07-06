@@ -26,6 +26,12 @@ interface WorkerJobResponse {
   status_url?: string;
   outputUrl?: string;
   output_url?: string;
+  finalCompositeUrl?: string;
+  final_composite_url?: string;
+  compositeOutputUrl?: string;
+  composite_output_url?: string;
+  fullVideoUrl?: string;
+  full_video_url?: string;
   finalOutputUrl?: string;
   final_output_url?: string;
   previewUrl?: string;
@@ -57,6 +63,11 @@ const PROXY_EXPLICITLY_DISABLED = envFlag('VITE_TRECUT_ERASER_DISABLE_PROXY');
 const USE_ERASER_API_PROXY = !PROXY_EXPLICITLY_DISABLED && ERASER_API_PROXY_URL.length > 0;
 const POLL_MS = 1400;
 const MAX_POLLS = 900; // about 21 minutes
+// Vercel serverless functions reject request bodies over ~4.5MB with
+// FUNCTION_PAYLOAD_TOO_LARGE. Base64 inflates the video by ~33%, so only tiny
+// clips can use the JSON relay; everything else must upload directly to the
+// GPU worker via the upload-target discovery endpoint.
+const MAX_PROXY_JSON_BYTES = 4 * 1024 * 1024;
 
 export function isGpuRemovalConfigured(): boolean {
   return USE_ERASER_API_PROXY || DIRECT_WORKER_URL.length > 0;
@@ -113,7 +124,14 @@ function getRemoteJobId(payload: WorkerJobResponse): string {
 }
 
 function getOutputUrl(payload: WorkerJobResponse, baseUrl: string): string {
-  const raw = payload.outputUrl || payload.output_url || payload.finalOutputUrl || payload.final_output_url || payload.previewUrl || payload.preview_url || '';
+  // Prefer explicit composite/full-video fields: the worker's generic
+  // outputUrl has been known to point at raw patch artifacts.
+  const raw = payload.finalCompositeUrl || payload.final_composite_url
+    || payload.compositeOutputUrl || payload.composite_output_url
+    || payload.fullVideoUrl || payload.full_video_url
+    || payload.finalOutputUrl || payload.final_output_url
+    || payload.outputUrl || payload.output_url
+    || payload.previewUrl || payload.preview_url || '';
   return raw ? absoluteUrl(baseUrl, raw) : '';
 }
 
@@ -162,11 +180,60 @@ async function fetchStatus(statusUrl: string): Promise<WorkerJobResponse> {
   return parseWorkerResponse(res);
 }
 
-async function requestDirectWorkerCancel(remoteJobId: string): Promise<void> {
-  if (!remoteJobId || !DIRECT_WORKER_URL) return;
-  await fetch(`${DIRECT_WORKER_URL}/v1/video-eraser/jobs/${encodeURIComponent(remoteJobId)}/cancel`, {
+async function requestWorkerCancel(workerBase: string, remoteJobId: string): Promise<void> {
+  if (!remoteJobId || !workerBase) return;
+  await fetch(`${workerBase}/v1/video-eraser/jobs/${encodeURIComponent(remoteJobId)}/cancel`, {
     method: 'POST',
   }).catch(() => undefined);
+}
+
+function buildRemovalForm(input: GpuRemovalInput, maskBlob: Blob): FormData {
+  const { jobId, file, fps, duration, width, height, selectedTime, selectedFrameIndex, outputQuality = 'source' } = input;
+  const form = new FormData();
+  form.append('video', file, file.name || 'video.mp4');
+  form.append('mask', maskBlob, 'mask.png');
+  form.append('job_id', jobId);
+  form.append('selected_time', String(selectedTime));
+  form.append('selected_frame_index', String(selectedFrameIndex));
+  form.append('fps', String(fps));
+  form.append('duration', String(duration));
+  form.append('width', String(width));
+  form.append('height', String(height));
+  form.append('pipeline', 'sam2-propainter');
+  form.append('mask_semantics', 'alpha_gt_0_remove');
+  form.append('quality', outputQuality);
+  form.append('preserve_resolution', 'true');
+  form.append('preserve_fps', 'true');
+  form.append('preserve_audio', 'true');
+  form.append('output_mode', 'composite');
+  form.append('return_mode', 'composite');
+  form.append('result_mode', 'full_video');
+  form.append('output_kind', 'full_video');
+  form.append('composite_output', 'true');
+  form.append('full_frame_output', 'true');
+  form.append('full_video_output', 'true');
+  form.append('patch_only', 'false');
+  form.append('return_patch', 'false');
+  return form;
+}
+
+interface ProxyUploadTarget {
+  workerBase: string;
+  uploadUrl: string;
+}
+
+async function fetchProxyUploadTarget(): Promise<ProxyUploadTarget | null> {
+  try {
+    const res = await fetch(`${ERASER_API_PROXY_URL}/upload-target`, { method: 'GET' });
+    if (!res.ok) return null;
+    const payload = await res.json();
+    const workerBase = String(payload.worker_base || payload.workerBase || '').replace(/\/$/, '');
+    if (!workerBase) return null;
+    const uploadUrl = String(payload.upload_url || payload.uploadUrl || `${workerBase}/v1/video-eraser/jobs`);
+    return { workerBase, uploadUrl };
+  } catch {
+    return null;
+  }
 }
 
 function makePipelineOutput(outputUrl: string, input: GpuRemovalInput): PipelineOutput {
@@ -239,11 +306,49 @@ async function waitForRemovalOutput(options: {
 
 async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
   if (!USE_ERASER_API_PROXY) throw new Error('Remote eTreyser API proxy is disabled. Set VITE_TRECUT_ERASER_DISABLE_PROXY=false or leave it unset for the production GPU proxy.');
-  const { jobId, file, fps, duration, width, height, selectedTime, selectedFrameIndex, maskCanvas, outputQuality = 'source', onPhase } = input;
+  const { file, maskCanvas, onPhase } = input;
+
+  onPhase?.('segmenting', 18, 'Connecting to eTreyser GPU worker...');
+  const maskBlob = await canvasToPngBlob(maskCanvas);
+
+  // Preferred route: discover the GPU worker through the proxy, then upload
+  // the video/mask multipart directly to it. This bypasses Vercel's ~4.5MB
+  // function payload limit entirely (both upload and output download).
+  const target = await fetchProxyUploadTarget();
+  if (target) {
+    onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser GPU worker...');
+    const createRes = await fetch(target.uploadUrl, {
+      method: 'POST',
+      body: buildRemovalForm(input, maskBlob),
+    });
+    const initialPayload = await parseWorkerResponse(createRes);
+    return waitForRemovalOutput({
+      initialPayload,
+      baseUrl: target.workerBase,
+      statusPathPrefix: '/v1/video-eraser/jobs',
+      input,
+      onCancel: (remoteJobId) => requestWorkerCancel(target.workerBase, remoteJobId),
+    });
+  }
+
+  // Legacy fallback: base64 JSON through the Vercel proxy. Only possible for
+  // tiny clips because of the FUNCTION_PAYLOAD_TOO_LARGE limit.
+  const estimatedJsonBytes = Math.ceil((file.size * 4) / 3) + Math.ceil((maskBlob.size * 4) / 3) + 4096;
+  if (estimatedJsonBytes > MAX_PROXY_JSON_BYTES) {
+    throw new Error(
+      `This video is about ${(file.size / (1024 * 1024)).toFixed(1)}MB, which is too large to relay through the server proxy (~4.5MB limit), ` +
+      'and the direct GPU upload endpoint is unavailable. Check that the GPU worker URL is configured (ERASER_GPU_WORKER_URL) and the /upload-target route is deployed.',
+    );
+  }
+
+  return runLegacyJsonProxyRemoval(input, maskBlob);
+}
+
+async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob): Promise<PipelineOutput> {
+  const { jobId, file, fps, duration, width, height, selectedTime, selectedFrameIndex, outputQuality = 'source', onPhase } = input;
 
   onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser GPU proxy...');
 
-  const maskBlob = await canvasToPngBlob(maskCanvas);
   const [sourceVideoBase64, maskBase64] = await Promise.all([
     blobToDataUrl(file),
     blobToDataUrl(maskBlob),
@@ -304,43 +409,14 @@ async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutpu
 async function runDirectWorkerRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
   if (!DIRECT_WORKER_URL) throw new Error('GPU video eraser worker is disabled or not configured. Enable VITE_ETREYSER_ALLOW_CLOUD_GPU=true only when you intentionally want direct remote GPU processing.');
 
-  const {
-    jobId,
-    file,
-    fps,
-    duration,
-    width,
-    height,
-    selectedTime,
-    selectedFrameIndex,
-    maskCanvas,
-    outputQuality = 'source',
-    onPhase,
-  } = input;
+  const { maskCanvas, onPhase } = input;
 
   onPhase?.('segmenting', 22, 'Sending video and mask to GPU AI worker...');
 
   const maskBlob = await canvasToPngBlob(maskCanvas);
-  const form = new FormData();
-  form.append('video', file, file.name || 'video.mp4');
-  form.append('mask', maskBlob, 'mask.png');
-  form.append('job_id', jobId);
-  form.append('selected_time', String(selectedTime));
-  form.append('selected_frame_index', String(selectedFrameIndex));
-  form.append('fps', String(fps));
-  form.append('duration', String(duration));
-  form.append('width', String(width));
-  form.append('height', String(height));
-  form.append('pipeline', 'sam2-propainter');
-  form.append('mask_semantics', 'alpha_gt_0_remove');
-  form.append('quality', outputQuality);
-  form.append('preserve_resolution', 'true');
-  form.append('preserve_fps', 'true');
-  form.append('preserve_audio', 'true');
-
   const createRes = await fetch(`${DIRECT_WORKER_URL}/v1/video-eraser/jobs`, {
     method: 'POST',
-    body: form,
+    body: buildRemovalForm(input, maskBlob),
   });
 
   const initialPayload = await parseWorkerResponse(createRes);
@@ -349,7 +425,7 @@ async function runDirectWorkerRemoval(input: GpuRemovalInput): Promise<PipelineO
     baseUrl: DIRECT_WORKER_URL,
     statusPathPrefix: '/v1/video-eraser/jobs',
     input,
-    onCancel: requestDirectWorkerCancel,
+    onCancel: (remoteJobId) => requestWorkerCancel(DIRECT_WORKER_URL, remoteJobId),
   });
 }
 
