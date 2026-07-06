@@ -224,7 +224,7 @@ async function waitForRemovalOutput(options: {
     const msg = payload.statusMessage || payload.status_message || 'eTreyser is removing the selected object...';
     onPhase?.(phase === 'completed' ? 'generating_preview' : phase, progress, msg);
 
-    if (phase === 'failed') throw new Error(payload.error || payload.error_message || 'AI video removal failed.');
+    if (phase === 'failed') throw new Error(payload.error || payload.error_message || payload.statusMessage || payload.status_message || 'AI video removal failed.');
 
     outputUrl = getOutputUrl(payload, baseUrl);
     if (phase === 'completed' || outputUrl) {
@@ -239,7 +239,7 @@ async function waitForRemovalOutput(options: {
 
 async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutput> {
   if (!USE_ERASER_API_PROXY) throw new Error('Remote eTreyser API proxy is disabled. Set VITE_TRECUT_ERASER_DISABLE_PROXY=false or leave it unset for the production GPU proxy.');
-  const { jobId, file, selectedFrameIndex, maskCanvas, outputQuality = 'source', onPhase } = input;
+  const { jobId, file, fps, duration, width, height, selectedTime, selectedFrameIndex, maskCanvas, outputQuality = 'source', onPhase } = input;
 
   onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser GPU proxy...');
 
@@ -257,13 +257,37 @@ async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutpu
       mask_base64: maskBase64,
       mode: 'static_logo',
       quality: outputQuality,
+      selected_time: selectedTime,
+      selected_frame_index: selectedFrameIndex,
+      fps,
+      duration,
+      width,
+      height,
+      pipeline: 'sam2-propainter',
+      mask_semantics: 'alpha_gt_0_remove',
       preserve_resolution: true,
       preserve_fps: true,
       preserve_audio: true,
+      output_mode: 'composite',
+      return_mode: 'composite',
+      result_mode: 'full_video',
+      output_kind: 'full_video',
+      composite_output: true,
+      full_frame_output: true,
+      full_video_output: true,
+      patch_only: false,
+      return_patch: false,
       metadata: {
         source: 'trecut_eraser_tool',
         local_job_id: jobId,
+        selected_time: selectedTime,
         selected_frame_index: selectedFrameIndex,
+        fps,
+        duration,
+        width,
+        height,
+        pipeline: 'sam2-propainter',
+        mask_semantics: 'alpha_gt_0_remove',
       },
     }),
   });
