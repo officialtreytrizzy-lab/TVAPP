@@ -27,13 +27,14 @@ def required_env(name: str) -> str:
     return value
 
 
-def run(cmd: list[str], cwd: Path | None = None) -> str:
+def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
     completed = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
     )
     if completed.returncode != 0:
         raise RuntimeError(completed.stdout[-6000:] or f"Command failed: {' '.join(cmd)}")
@@ -182,7 +183,7 @@ def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: 
     cv2.imwrite(str(output_mask), clipped)
 
 
-def processing_size(width: int, height: int, quality: str) -> tuple[int, int]:
+def processing_size(width: int, height: int, quality: str, max_side_cap: int | None = None) -> tuple[int, int]:
     # Default to source dimensions for 720x1280-style clips so ProPainter does
     # not unnecessarily downgrade the render. Env override is still available
     # if a GPU needs a lower cap.
@@ -190,6 +191,8 @@ def processing_size(width: int, height: int, quality: str) -> tuple[int, int]:
     if quality == "higher":
         default_max_side = max(default_max_side, 1440)
     max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", str(default_max_side)))
+    if max_side_cap:
+        max_side = min(max_side, max_side_cap)
     scale = min(1.0, max_side / max(width, height))
     proc_w = max(8, int(width * scale) // 8 * 8)
     proc_h = max(8, int(height * scale) // 8 * 8)
@@ -281,6 +284,11 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, wid
         ])
 
 
+def is_cuda_oom(message: str) -> bool:
+    lowered = message.lower()
+    return "out of memory" in lowered or "outofmemoryerror" in lowered
+
+
 def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
@@ -289,36 +297,61 @@ def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: i
             "The Modal image must clone https://github.com/sczhou/ProPainter.git."
         )
 
-    if result_root.exists():
-        shutil.rmtree(result_root)
-    result_root.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    # Reduces fragmentation OOMs on long clips (recommended by PyTorch when
+    # reserved-but-unallocated memory is large).
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-    proc_w, proc_h = processing_size(width, height, quality)
-    cmd = [
-        "python",
-        str(inference),
-        "--video",
-        str(source_mp4),
-        "--mask",
-        str(mask_png),
-        "--output",
-        str(result_root),
-        "--height",
-        str(proc_h),
-        "--width",
-        str(proc_w),
-        "--fp16",
-        "--subvideo_length",
-        "50",
-        "--neighbor_length",
-        "6",
-        "--ref_stride",
-        "10",
-        "--mask_dilation",
-        "4",
-    ]
-    run(cmd, cwd=PROPAINTER_ROOT)
-    return find_propainter_output(result_root)
+    # Attempt ladder: full requested size first, then progressively smaller
+    # internal processing sizes if the GPU runs out of memory. mux_audio
+    # scales the result back to source dimensions, so output size/fps/audio
+    # are preserved either way.
+    attempts: list[tuple[int | None, str]] = [(None, "50"), (960, "30"), (720, "20")]
+    last_error: RuntimeError | None = None
+
+    for index, (max_side_cap, subvideo_length) in enumerate(attempts):
+        if result_root.exists():
+            shutil.rmtree(result_root)
+        result_root.mkdir(parents=True, exist_ok=True)
+
+        proc_w, proc_h = processing_size(width, height, quality, max_side_cap)
+        cmd = [
+            "python",
+            str(inference),
+            "--video",
+            str(source_mp4),
+            "--mask",
+            str(mask_png),
+            "--output",
+            str(result_root),
+            "--height",
+            str(proc_h),
+            "--width",
+            str(proc_w),
+            "--fp16",
+            "--subvideo_length",
+            subvideo_length,
+            "--neighbor_length",
+            "6",
+            "--ref_stride",
+            "10",
+            "--mask_dilation",
+            "4",
+        ]
+        try:
+            run(cmd, cwd=PROPAINTER_ROOT, env=env)
+            return find_propainter_output(result_root)
+        except RuntimeError as exc:
+            last_error = exc
+            if index == len(attempts) - 1 or not is_cuda_oom(str(exc)):
+                raise
+            print(
+                f"ProPainter ran out of GPU memory at {proc_w}x{proc_h} "
+                f"(subvideo_length={subvideo_length}); retrying smaller...",
+                flush=True,
+            )
+
+    raise last_error or RuntimeError("ProPainter failed without output")
 
 
 def main() -> None:
