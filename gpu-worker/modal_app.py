@@ -15,7 +15,7 @@ wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
 
 worker_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "git", "libgl1", "libglib2.0-0")
+    .apt_install("ffmpeg", "git", "curl", "libgl1", "libglib2.0-0")
     .pip_install("torch", "torchvision", index_url="https://download.pytorch.org/whl/cu121")
     .pip_install_from_requirements("gpu-worker/requirements.txt")
     .run_commands(
@@ -29,6 +29,9 @@ worker_image = (
         "pip install -r /tmp/wan-requirements-no-flash.txt",
         "pip install decord",
         "pip install 'huggingface_hub[cli]'",
+        "pip install 'numpy<2' 'Pillow>=9,<12' realesrgan==0.3.0 gfpgan==1.3.8 basicsr==1.4.2 facexlib==0.3.0 lmdb yapf",
+        "python - <<'PY'\nfrom pathlib import Path\nimport site\nfor site_dir in site.getsitepackages():\n    path = Path(site_dir) / 'basicsr' / 'data' / 'degradations.py'\n    if path.exists():\n        text = path.read_text()\n        text = text.replace('from torchvision.transforms.functional_tensor import rgb_to_grayscale', 'from torchvision.transforms.functional import rgb_to_grayscale')\n        path.write_text(text)\n        print(f'Patched basicsr torchvision import: {path}')\nPY",
+        "mkdir -p /opt/realesrgan_weights && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\nweights = {\n    'RealESRGAN_x4plus.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',\n    'RealESRGAN_x4plus_anime_6B.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/realesrgan-x4plus-anime_6B.pth',\n    'GFPGANv1.4.pth': 'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth',\n}\nroot = Path('/opt/realesrgan_weights')\nfor name, url in weights.items():\n    out = root / name\n    if not out.exists() or out.stat().st_size < 1000000:\n        print(f'Downloading {name}: {url}')\n        urlretrieve(url, out)\n    print(f'Ready {name}: {out.stat().st_size} bytes')\nPY",
     )
     .add_local_dir("gpu-worker", remote_path="/app")
 )
@@ -77,4 +80,20 @@ def fastapi_app():
     import sys
     sys.path.insert(0, "/app")
     from main import app as fastapi_application
+    return fastapi_application
+
+
+@app.function(
+    image=worker_image,
+    gpu="A10G",
+    timeout=60 * 20,
+    scaledown_window=60 * 20,
+    max_containers=1,
+)
+@modal.concurrent(max_inputs=1)
+@modal.asgi_app()
+def image_enhancer_app():
+    import sys
+    sys.path.insert(0, "/app")
+    from image_enhancer_app import app as fastapi_application
     return fastapi_application
