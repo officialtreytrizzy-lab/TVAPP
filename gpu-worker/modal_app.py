@@ -3,13 +3,13 @@ import modal
 
 # Deploy with:
 #   pip install modal
-#   modal setup
-#   modal deploy gpu-worker/modal_app.py
+#   modal token new --profile tvapp-new --activate
+#   MODAL_PROFILE=tvapp-new modal deploy gpu-worker/modal_app.py
 #
 # The deployed URL becomes VITE_ERASER_GPU_WORKER_URL in Vercel.
 # Wan model weights live in the Modal volume mounted at /models.
 # Download/update weights with:
-#   modal run gpu-worker/modal_app.py::download_models
+#   MODAL_PROFILE=tvapp-new modal run gpu-worker/modal_app.py::download_models
 
 wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
 
@@ -21,6 +21,9 @@ worker_image = (
     .run_commands(
         "rm -rf /opt/ProPainter && git clone --depth 1 https://github.com/sczhou/ProPainter.git /opt/ProPainter",
         "pip install -r /opt/ProPainter/requirements.txt",
+        "rm -rf /opt/sam2 && git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2",
+        "pip install -e /opt/sam2",
+        "mkdir -p /opt/sam2_checkpoints && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\ncheckpoint = Path('/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt')\nurl = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt'\nif not checkpoint.exists() or checkpoint.stat().st_size < 1000000:\n    print(f'Downloading SAM2 checkpoint: {url}')\n    urlretrieve(url, checkpoint)\nprint(f'SAM2 checkpoint ready: {checkpoint} ({checkpoint.stat().st_size} bytes)')\nPY",
         "rm -rf /opt/Wan2.1 && git clone --depth 1 https://github.com/Wan-Video/Wan2.1.git /opt/Wan2.1",
         "python - <<'PY'\nfrom pathlib import Path\nsrc = Path('/opt/Wan2.1/requirements.txt')\nout = Path('/tmp/wan-requirements-no-flash.txt')\nskip = {'flash-attn', 'flash_attn'}\nlines = []\nfor line in src.read_text().splitlines():\n    stripped = line.strip()\n    normalized = stripped.split('==')[0].split('>=')[0].split('<=')[0].split('~=')[0].split('[')[0].replace('_', '-').lower()\n    if normalized in skip:\n        print(f'Skipping optional CUDA build dependency: {stripped}')\n        continue\n    lines.append(line)\nout.write_text('\\n'.join(lines) + '\\n')\nPY",
         "pip install -r /tmp/wan-requirements-no-flash.txt",
