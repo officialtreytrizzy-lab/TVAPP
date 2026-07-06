@@ -1,23 +1,18 @@
-"""Tracked-mask eraser pipeline for the Modal video eraser worker.
-
-Tracks the user-selected remove mask through the clip, tries ProPainter, then
-verifies that the marked region actually changed. If ProPainter fails or returns
-a visually unchanged result, the worker falls back to a stronger tracked OpenCV
-inpaint pass so the job returns a real edited MP4 instead of a no-op video.
-"""
-
 from __future__ import annotations
 
 import json
 import os
 import shutil
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 PROPAINTER_ROOT = Path(os.environ.get("PROPAINTER_ROOT", "/opt/ProPainter"))
+SAM2_CHECKPOINT = os.environ.get("SAM2_CHECKPOINT", "/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt")
+SAM2_MODEL_CFG = os.environ.get("SAM2_MODEL_CFG", "configs/sam2.1/sam2.1_hiera_t.yaml")
 UNCHANGED_THRESHOLD = float(os.environ.get("ERASER_UNCHANGED_THRESHOLD", "2.25"))
 
 
@@ -29,7 +24,14 @@ def required_env(name: str) -> str:
 
 
 def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> str:
-    completed = subprocess.run(cmd, cwd=str(cwd) if cwd else None, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    completed = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
     if completed.returncode != 0:
         raise RuntimeError(completed.stdout[-6000:] or f"Command failed: {' '.join(cmd)}")
     return completed.stdout
@@ -55,25 +57,18 @@ def read_video_meta(input_video: Path) -> tuple[float, int, int]:
     return fps, width, height
 
 
-def read_video_gray_frames(input_video: Path) -> list[np.ndarray]:
-    cap = cv2.VideoCapture(str(input_video))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video for tracking: {input_video}")
-    frames: list[np.ndarray] = []
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-    cap.release()
-    if not frames:
-        raise RuntimeError("No frames could be read for mask tracking")
-    return frames
-
-
 def ffprobe_json(input_video: Path) -> dict:
     try:
-        out = run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(input_video)])
+        out = run([
+            "ffprobe",
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            str(input_video),
+        ])
         return json.loads(out)
     except Exception:
         return {}
@@ -96,12 +91,43 @@ def prepare_source_mp4(input_video: Path, source_mp4: Path) -> None:
     if source_mp4.exists():
         source_mp4.unlink()
     try:
-        run(["ffmpeg", "-y", "-i", str(input_video), "-map", "0:v:0", "-map", "0:a?", "-c", "copy", str(source_mp4)])
+        run([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c",
+            "copy",
+            str(source_mp4),
+        ])
     except Exception:
         run([
-            "ffmpeg", "-y", "-i", str(input_video), "-map", "0:v:0", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k", "-shortest", str(source_mp4),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(input_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-shortest",
+            str(source_mp4),
         ])
 
 
@@ -119,8 +145,7 @@ def selected_frame_index(fps: float, frame_count: int) -> int:
     if raw_index:
         return clean_int(raw_index, 0, 0, max(frame_count - 1, 0))
     try:
-        seconds = float(raw_time or "0")
-        return clean_int(str(seconds * fps), 0, 0, max(frame_count - 1, 0))
+        return clean_int(str(float(raw_time or "0") * fps), 0, 0, max(frame_count - 1, 0))
     except Exception:
         return 0
 
@@ -140,140 +165,269 @@ def read_mask_alpha(mask_path: Path, width: int, height: int) -> np.ndarray:
     return alpha
 
 
-def clean_remove_mask(alpha: np.ndarray, width: int, height: int) -> np.ndarray:
-    mask = (alpha > 24).astype(np.uint8) * 255
+def clean_mask(mask: np.ndarray, width: int, height: int, pad_ratio: float = 0.18) -> np.ndarray:
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    mask = (mask > 24).astype(np.uint8) * 255
     bbox = mask_bbox(mask)
     if bbox is None:
-        raise RuntimeError("Uploaded mask is empty. Draw over the object before processing.")
-    x1, y1, x2, y2 = bbox
-    box_w = x2 - x1 + 1
-    box_h = y2 - y1 + 1
-    min_side = min(width, height)
-    pad = max(4, min(28, int(max(box_w, box_h) * 0.25)))
-    kernel_size = max(3, min(19, int(min_side * 0.008)))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    mask = cv2.dilate(mask, kernel, iterations=1)
-    bbox = mask_bbox(mask)
-    if bbox is None:
-        raise RuntimeError("Mask became empty after cleanup.")
-    x1, y1, x2, y2 = bbox
+        raise RuntimeError("Painted mask is empty")
+
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    mask = cv2.dilate(mask, dilate_kernel, iterations=1)
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    if count > 1:
+        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        mask = (labels == largest).astype(np.uint8) * 255
+
+    x1, y1, x2, y2 = mask_bbox(mask) or bbox
+    pad = max(3, int(max(x2 - x1 + 1, y2 - y1 + 1) * pad_ratio))
     x1 = max(0, x1 - pad)
     y1 = max(0, y1 - pad)
     x2 = min(width - 1, x2 + pad)
     y2 = min(height - 1, y2 + pad)
-    clipped = np.zeros_like(mask)
-    clipped[y1 : y2 + 1, x1 : x2 + 1] = mask[y1 : y2 + 1, x1 : x2 + 1]
-    return clipped
+
+    expanded = np.zeros_like(mask)
+    expanded[y1 : y2 + 1, x1 : x2 + 1] = mask[y1 : y2 + 1, x1 : x2 + 1]
+    expanded = cv2.dilate(expanded, dilate_kernel, iterations=1)
+    return expanded
 
 
-def strengthen_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
-    binary = (mask > 24).astype(np.uint8) * 255
-    bbox = mask_bbox(binary)
+def extract_frames(video_path: Path, frames_dir: Path) -> tuple[int, int, int]:
+    if frames_dir.exists():
+        shutil.rmtree(frames_dir)
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"SAM2 could not open video: {video_path}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    count = 0
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cv2.imwrite(str(frames_dir / f"{count:05d}.jpg"), frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        count += 1
+
+    cap.release()
+
+    if count <= 0 or width <= 0 or height <= 0:
+        raise RuntimeError("SAM2 could not extract frames")
+
+    return count, width, height
+
+
+def prompt_from_mask(mask: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    bbox = mask_bbox(mask)
     if bbox is None:
-        return binary
+        raise RuntimeError("Mask prompt is empty")
+
     x1, y1, x2, y2 = bbox
-    box_w = x2 - x1 + 1
-    box_h = y2 - y1 + 1
-    pad = max(10, min(64, int(max(box_w, box_h) * 0.55)))
-    x1 = max(0, x1 - pad)
-    y1 = max(0, y1 - pad)
-    x2 = min(width - 1, x2 + pad)
-    y2 = min(height - 1, y2 + pad)
-    strong = np.zeros_like(binary)
-    strong[y1 : y2 + 1, x1 : x2 + 1] = 255
-    kernel_size = max(7, min(31, int(max(width, height) * 0.018)))
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    strong = cv2.dilate(strong, kernel, iterations=1)
-    return strong
+    pad = max(4, int(max(x2 - x1 + 1, y2 - y1 + 1) * 0.25))
+    box = np.array(
+        [
+            max(0, x1 - pad),
+            max(0, y1 - pad),
+            min(width - 1, x2 + pad),
+            min(height - 1, y2 + pad),
+        ],
+        dtype=np.float32,
+    )
+
+    moments = cv2.moments((mask > 0).astype(np.uint8))
+    if moments["m00"] > 0:
+        cx = float(moments["m10"] / moments["m00"])
+        cy = float(moments["m01"] / moments["m00"])
+    else:
+        cx = float((box[0] + box[2]) / 2)
+        cy = float((box[1] + box[3]) / 2)
+
+    points = np.array([[cx, cy]], dtype=np.float32)
+    labels = np.array([1], dtype=np.int32)
+    return box, points, labels
 
 
-def expand_bbox(bbox: tuple[int, int, int, int], width: int, height: int, ratio: float = 0.45) -> tuple[int, int, int, int]:
-    x1, y1, x2, y2 = bbox
-    box_w = x2 - x1 + 1
-    box_h = y2 - y1 + 1
-    pad = max(8, int(max(box_w, box_h) * ratio))
-    return max(0, x1 - pad), max(0, y1 - pad), min(width - 1, x2 + pad), min(height - 1, y2 + pad)
+def tensor_to_mask(mask_logits, width: int, height: int) -> np.ndarray:
+    if isinstance(mask_logits, (list, tuple)):
+        mask_logits = mask_logits[0]
+    if mask_logits.dim() == 4:
+        mask_logits = mask_logits[0, 0]
+    elif mask_logits.dim() == 3:
+        mask_logits = mask_logits[0]
+
+    mask = (mask_logits > 0).detach().to("cpu").numpy().astype(np.uint8) * 255
+    return clean_mask(mask, width, height, 0.10)
 
 
-def crop(gray: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
-    x1, y1, x2, y2 = bbox
-    return gray[y1 : y2 + 1, x1 : x2 + 1]
+def sam2_direction(
+    predictor,
+    frames_dir: Path,
+    anchor: int,
+    anchor_mask: np.ndarray,
+    reverse: bool,
+    frame_count: int,
+    width: int,
+    height: int,
+) -> dict[int, np.ndarray]:
+    import torch
+
+    state = predictor.init_state(
+        video_path=str(frames_dir),
+        offload_video_to_cpu=True,
+        offload_state_to_cpu=True,
+        async_loading_frames=False,
+    )
+
+    mode = os.environ.get("SAM2_PROMPT_MODE", "box").lower()
+    if mode == "mask":
+        predictor.add_new_mask(
+            inference_state=state,
+            frame_idx=anchor,
+            obj_id=1,
+            mask=anchor_mask.astype(bool),
+        )
+    else:
+        box, points, labels = prompt_from_mask(anchor_mask, width, height)
+        predictor.add_new_points_or_box(
+            inference_state=state,
+            frame_idx=anchor,
+            obj_id=1,
+            points=points,
+            labels=labels,
+            box=box,
+        )
+
+    masks: dict[int, np.ndarray] = {}
+    for frame_idx, _obj_ids, logits in predictor.propagate_in_video(
+        inference_state=state,
+        start_frame_idx=anchor,
+        max_frame_num_to_track=frame_count,
+        reverse=reverse,
+    ):
+        idx = int(frame_idx)
+        if 0 <= idx < frame_count:
+            masks[idx] = tensor_to_mask(logits, width, height)
+
+    try:
+        predictor.reset_state(state)
+    except Exception:
+        pass
+
+    del state
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return masks
 
 
-def shift_mask(mask: np.ndarray, dx: int, dy: int, width: int, height: int) -> np.ndarray:
-    if dx == 0 and dy == 0:
-        return mask.copy()
-    matrix = np.float32([[1, 0, dx], [0, 1, dy]])
-    return cv2.warpAffine(mask, matrix, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-
-def track_next_mask(prev_frame: np.ndarray, next_frame: np.ndarray, prev_mask: np.ndarray, width: int, height: int) -> tuple[np.ndarray, float]:
-    bbox = mask_bbox(prev_mask)
-    if bbox is None:
-        return prev_mask.copy(), 0.0
-    template_bbox = expand_bbox(bbox, width, height, ratio=0.45)
-    template = crop(prev_frame, template_bbox)
-    if template.shape[0] < 6 or template.shape[1] < 6:
-        return prev_mask.copy(), 0.0
-    x1, y1, x2, y2 = template_bbox
-    template_w = x2 - x1 + 1
-    template_h = y2 - y1 + 1
-    motion_radius = max(32, min(220, int(max(template_w, template_h) * 1.0)))
-    sx1 = max(0, x1 - motion_radius)
-    sy1 = max(0, y1 - motion_radius)
-    sx2 = min(width - 1, x2 + motion_radius)
-    sy2 = min(height - 1, y2 + motion_radius)
-    search = next_frame[sy1 : sy2 + 1, sx1 : sx2 + 1]
-    if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
-        return prev_mask.copy(), 0.0
-    result = cv2.matchTemplate(cv2.equalizeHist(search), cv2.equalizeHist(template), cv2.TM_CCOEFF_NORMED)
-    _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
-    if not np.isfinite(max_val) or max_val < 0.14:
-        return prev_mask.copy(), float(max_val if np.isfinite(max_val) else 0.0)
-    new_x1 = sx1 + max_loc[0]
-    new_y1 = sy1 + max_loc[1]
-    dx = int(round(new_x1 - x1))
-    dy = int(round(new_y1 - y1))
-    max_step = max(24, int(max(template_w, template_h) * 1.15))
-    dx = max(-max_step, min(max_step, dx))
-    dy = max(-max_step, min(max_step, dy))
-    return shift_mask(prev_mask, dx, dy, width, height), float(max_val)
-
-
-def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
-    frames = read_video_gray_frames(source_mp4)
-    alpha = read_mask_alpha(input_mask, width, height)
-    base_mask = clean_remove_mask(alpha, width, height)
-    anchor = selected_frame_index(fps, len(frames))
-    masks: list[np.ndarray | None] = [None] * len(frames)
-    masks[anchor] = base_mask
-    scores: list[float] = []
-    prev_mask = base_mask
-    for idx in range(anchor + 1, len(frames)):
-        next_mask, score = track_next_mask(frames[idx - 1], frames[idx], prev_mask, width, height)
-        masks[idx] = next_mask
-        prev_mask = next_mask
-        scores.append(score)
-    prev_mask = base_mask
-    for idx in range(anchor - 1, -1, -1):
-        next_mask, score = track_next_mask(frames[idx + 1], frames[idx], prev_mask, width, height)
-        masks[idx] = next_mask
-        prev_mask = next_mask
-        scores.append(score)
+def write_masks(
+    masks: dict[int, np.ndarray],
+    output_dir: Path,
+    frame_count: int,
+    width: int,
+    height: int,
+    anchor: int,
+    anchor_mask: np.ndarray,
+) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    for idx, mask in enumerate(masks):
+
+    masks[anchor] = clean_mask(anchor_mask, width, height, 0.10)
+    last: np.ndarray | None = None
+
+    for idx in range(frame_count):
+        mask = masks.get(idx)
         if mask is None:
-            mask = base_mask
+            if last is not None:
+                mask = last
+            else:
+                future = [key for key in masks if key >= idx]
+                mask = masks[min(future)] if future else np.zeros((height, width), dtype=np.uint8)
+
+        if mask.shape[1] != width or mask.shape[0] != height:
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+        mask = (mask > 24).astype(np.uint8) * 255
         cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
-    avg_score = sum(scores) / len(scores) if scores else 1.0
-    print(f"Tracked remove mask sequence: frames={len(frames)} anchor={anchor} avg_match={avg_score:.3f} dir={output_dir}", flush=True)
+        last = mask
+
+
+def build_sam2_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
+    import torch
+    from sam2.build_sam import build_sam2_video_predictor
+
+    frames_dir = output_dir.parent / "sam2_frames"
+    frame_count, width, height = extract_frames(source_mp4, frames_dir)
+
+    anchor = selected_frame_index(fps, frame_count)
+    anchor_mask = clean_mask(read_mask_alpha(input_mask, width, height), width, height, 0.18)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"SAM2 initialized: cfg={SAM2_MODEL_CFG} checkpoint={SAM2_CHECKPOINT} device={device}", flush=True)
+    print(f"Anchor frame index: {anchor}", flush=True)
+
+    predictor = build_sam2_video_predictor(
+        SAM2_MODEL_CFG,
+        SAM2_CHECKPOINT,
+        device=device,
+        vos_optimized=False,
+        apply_postprocessing=True,
+    )
+
+    masks: dict[int, np.ndarray] = {}
+    ctx = torch.autocast("cuda", dtype=torch.bfloat16) if device == "cuda" else nullcontext()
+
+    with torch.inference_mode(), ctx:
+        masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, False, frame_count, width, height))
+        masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, True, frame_count, width, height))
+
+    del predictor
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    write_masks(masks, output_dir, frame_count, width, height, anchor, anchor_mask)
+
+    print(f"SAM2 propagated masks for {frame_count} frames", flush=True)
+    print("Using SAM2 mask sequence for ProPainter", flush=True)
     return output_dir
+
+
+def build_static_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
+    cap = cv2.VideoCapture(str(source_mp4))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) or 1
+    cap.release()
+
+    mask = clean_mask(read_mask_alpha(input_mask, width, height), width, height, 0.25)
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx in range(frame_count):
+        cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
+
+    print(f"SAM2 unavailable; wrote static fallback masks for {frame_count} frames", flush=True)
+    return output_dir
+
+
+def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
+    if os.environ.get("ERASER_DISABLE_SAM2", "false").lower() == "true":
+        return build_static_masks(source_mp4, input_mask, output_dir, fps, width, height)
+
+    try:
+        return build_sam2_masks(source_mp4, input_mask, output_dir, fps, width, height)
+    except Exception as exc:
+        print(f"SAM2 propagation failed; using static fallback masks: {exc}", flush=True)
+        return build_static_masks(source_mp4, input_mask, output_dir, fps, width, height)
 
 
 def processing_size(width: int, height: int, quality: str, max_side_cap: int | None = None) -> tuple[int, int]:
@@ -282,9 +436,7 @@ def processing_size(width: int, height: int, quality: str, max_side_cap: int | N
     if max_side_cap:
         max_side = min(max_side, max_side_cap)
     scale = min(1.0, max_side / max(width, height))
-    proc_w = max(8, int(width * scale) // 8 * 8)
-    proc_h = max(8, int(height * scale) // 8 * 8)
-    return proc_w, proc_h
+    return max(8, int(width * scale) // 8 * 8), max(8, int(height * scale) // 8 * 8)
 
 
 def even_dimension(value: int) -> int:
@@ -301,9 +453,18 @@ def find_propainter_output(result_root: Path) -> Path:
 def export_settings(quality: str, source_bitrate: int | None) -> tuple[str, str, list[str]]:
     if quality == "higher":
         return "slow", "11", ["-b:a", "256k"]
+
     if source_bitrate and source_bitrate > 0:
         target = max(source_bitrate, 8_000_000)
-        return "medium", "14", ["-b:a", "192k", "-maxrate", str(int(target * 1.35)), "-bufsize", str(int(target * 2))]
+        return "medium", "14", [
+            "-b:a",
+            "192k",
+            "-maxrate",
+            str(int(target * 1.35)),
+            "-bufsize",
+            str(int(target * 2)),
+        ]
+
     return "medium", "14", ["-b:a", "192k"]
 
 
@@ -312,17 +473,56 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, wid
     out_h = even_dimension(height)
     preset, crf, audio_args = export_settings(quality, source_video_bitrate(source_video))
     vf = f"scale={out_w}:{out_h}:flags=lanczos,fps={fps:.6f}"
+
     try:
         run([
-            "ffmpeg", "-y", "-i", str(inpainted_video), "-i", str(source_video),
-            "-map", "0:v:0", "-map", "1:a?", "-vf", vf,
-            "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-            "-c:a", "aac", *audio_args, "-shortest", str(output_video),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(inpainted_video),
+            "-i",
+            str(source_video),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a?",
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            crf,
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            "-c:a",
+            "aac",
+            *audio_args,
+            "-shortest",
+            str(output_video),
         ])
     except Exception:
         run([
-            "ffmpeg", "-y", "-i", str(inpainted_video), "-vf", vf,
-            "-c:v", "libx264", "-preset", preset, "-crf", crf, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_video),
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(inpainted_video),
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            preset,
+            "-crf",
+            crf,
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(output_video),
         ])
 
 
@@ -334,23 +534,56 @@ def is_cuda_oom(message: str) -> bool:
 def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
-        raise RuntimeError(f"ProPainter is not installed at {PROPAINTER_ROOT}. The Modal image must clone https://github.com/sczhou/ProPainter.git.")
+        raise RuntimeError(f"ProPainter is not installed at {PROPAINTER_ROOT}")
+
     env = dict(os.environ)
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
-    attempts: list[tuple[int, str, str, str, str]] = [(640, "12", "3", "8", "3"), (560, "10", "2", "8", "3"), (480, "8", "1", "6", "2"), (384, "6", "1", "4", "2")]
+
+    attempts: list[tuple[int, str, str, str, str]] = [
+        (640, "12", "3", "8", "3"),
+        (560, "10", "2", "8", "3"),
+        (480, "8", "1", "6", "2"),
+        (384, "6", "1", "4", "2"),
+    ]
+
     last_error: RuntimeError | None = None
+
     for index, (max_side_cap, subvideo_length, neighbor_length, ref_stride, mask_dilation) in enumerate(attempts):
         if result_root.exists():
             shutil.rmtree(result_root)
         result_root.mkdir(parents=True, exist_ok=True)
+
         proc_w, proc_h = processing_size(width, height, quality, max_side_cap)
+
         cmd = [
-            "python", str(inference), "--video", str(source_mp4), "--mask", str(mask_path), "--output", str(result_root),
-            "--height", str(proc_h), "--width", str(proc_w), "--fp16",
-            "--subvideo_length", subvideo_length, "--neighbor_length", neighbor_length, "--ref_stride", ref_stride, "--mask_dilation", mask_dilation,
+            "python",
+            str(inference),
+            "--video",
+            str(source_mp4),
+            "--mask",
+            str(mask_path),
+            "--output",
+            str(result_root),
+            "--height",
+            str(proc_h),
+            "--width",
+            str(proc_w),
+            "--fp16",
+            "--subvideo_length",
+            subvideo_length,
+            "--neighbor_length",
+            neighbor_length,
+            "--ref_stride",
+            ref_stride,
+            "--mask_dilation",
+            mask_dilation,
         ]
+
         try:
-            print(f"Running ProPainter attempt {index + 1}/{len(attempts)}: {proc_w}x{proc_h}, subvideo={subvideo_length}, neighbor={neighbor_length}", flush=True)
+            print(
+                f"Running ProPainter attempt {index + 1}/{len(attempts)}: {proc_w}x{proc_h}, subvideo={subvideo_length}, neighbor={neighbor_length}",
+                flush=True,
+            )
             run(cmd, cwd=PROPAINTER_ROOT, env=env)
             return find_propainter_output(result_root)
         except RuntimeError as exc:
@@ -358,53 +591,62 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
             if index == len(attempts) - 1 or not is_cuda_oom(str(exc)):
                 raise
             print(f"ProPainter CUDA OOM at {proc_w}x{proc_h}; retrying smaller...", flush=True)
+
     raise last_error or RuntimeError("ProPainter failed without output")
 
 
 def masked_change_score(source_video: Path, candidate_video: Path, mask_dir: Path, width: int, height: int) -> float:
     source_cap = cv2.VideoCapture(str(source_video))
     candidate_cap = cv2.VideoCapture(str(candidate_video))
+
     if not source_cap.isOpened() or not candidate_cap.isOpened():
         source_cap.release()
         candidate_cap.release()
         return 0.0
-    frame_count = int(source_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if frame_count <= 0:
-        frame_count = 1
+
+    frame_count = int(source_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) or 1
     sample_indexes = sorted(set([0, frame_count // 4, frame_count // 2, (frame_count * 3) // 4, max(0, frame_count - 1)]))
+
     scores: list[float] = []
+
     for idx in sample_indexes:
         source_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         candidate_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+
         ok_a, frame_a = source_cap.read()
         ok_b, frame_b = candidate_cap.read()
+
         if not ok_a or not ok_b:
             continue
+
         if frame_b.shape[1] != width or frame_b.shape[0] != height:
             frame_b = cv2.resize(frame_b, (width, height), interpolation=cv2.INTER_LINEAR)
+
         mask = cv2.imread(str(mask_dir / f"{idx:05d}.png"), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             continue
+
         if mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-        strong_mask = strengthen_mask(mask, width, height)
-        selector = strong_mask > 24
+
+        selector = mask > 24
         if not np.any(selector):
             continue
+
         diff = cv2.absdiff(frame_a, frame_b)
         scores.append(float(diff[selector].mean()))
+
     source_cap.release()
     candidate_cap.release()
+
     return sum(scores) / len(scores) if scores else 0.0
 
 
 def force_visible_fill(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    # Last-resort patch when inpaint is too visually close to the original. It is
-    # intentionally conservative: blur only inside the remove region so the user
-    # can see that the selected object/mark was actually removed.
     k = max(31, min(91, (max(frame.shape[:2]) // 20) | 1))
     if k % 2 == 0:
         k += 1
+
     blurred = cv2.GaussianBlur(frame, (k, k), 0)
     out = frame.copy()
     out[mask > 24] = blurred[mask > 24]
@@ -413,65 +655,99 @@ def force_visible_fill(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
 
 def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path, fps: float) -> Path:
     fallback_dir = work_dir / "opencv_tracked_inpaint"
+
     if fallback_dir.exists():
         shutil.rmtree(fallback_dir)
     fallback_dir.mkdir(parents=True, exist_ok=True)
+
     raw_output = fallback_dir / "opencv_raw.mp4"
     normalized_output = fallback_dir / "opencv_h264.mp4"
+
     cap = cv2.VideoCapture(str(source_mp4))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open source video for OpenCV fallback: {source_mp4}")
+
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fallback_fps = fps if fps and fps > 0 else cap.get(cv2.CAP_PROP_FPS) or 30.0
-    if width <= 0 or height <= 0:
-        cap.release()
-        raise RuntimeError("Could not read source dimensions for OpenCV fallback")
+
     writer = cv2.VideoWriter(str(raw_output), cv2.VideoWriter_fourcc(*"mp4v"), fallback_fps, (width, height))
     if not writer.isOpened():
         cap.release()
         raise RuntimeError("Could not open OpenCV fallback video writer")
+
     frame_index = 0
     written = 0
     changes: list[float] = []
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+
         mask = cv2.imread(str(mask_dir / f"{frame_index:05d}.png"), cv2.IMREAD_GRAYSCALE)
         if mask is None:
             mask = np.zeros((height, width), dtype=np.uint8)
         elif mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-        mask = strengthen_mask(mask, width, height)
+
+        mask = clean_mask(mask, width, height, 0.12)
+
         if mask_bbox(mask) is not None:
             radius = max(5, min(14, int(max(width, height) * 0.012)))
+
             telea = cv2.inpaint(frame, mask, radius, cv2.INPAINT_TELEA)
             ns = cv2.inpaint(frame, mask, radius, cv2.INPAINT_NS)
+
             telea_score = float(cv2.absdiff(frame, telea)[mask > 24].mean())
             ns_score = float(cv2.absdiff(frame, ns)[mask > 24].mean())
+
             candidate = telea if telea_score >= ns_score else ns
             score = max(telea_score, ns_score)
+
             if score < UNCHANGED_THRESHOLD:
                 candidate = force_visible_fill(candidate, mask)
                 score = float(cv2.absdiff(frame, candidate)[mask > 24].mean())
+
             frame = candidate
             changes.append(score)
+
         writer.write(frame)
         frame_index += 1
         written += 1
+
     cap.release()
     writer.release()
+
     if written <= 0 or not raw_output.exists() or raw_output.stat().st_size <= 0:
         raise RuntimeError("OpenCV fallback did not write any frames")
+
     avg_change = sum(changes) / len(changes) if changes else 0.0
     print(f"OpenCV tracked inpaint wrote frames={written} avg_mask_change={avg_change:.3f}", flush=True)
+
     try:
-        run(["ffmpeg", "-y", "-i", str(raw_output), "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(normalized_output)])
+        run([
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(raw_output),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "16",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(normalized_output),
+        ])
         if normalized_output.exists() and normalized_output.stat().st_size > 0:
             return normalized_output
     except Exception as exc:
         print(f"OpenCV fallback normalization failed, using raw mp4: {exc}", flush=True)
+
     return raw_output
 
 
@@ -479,34 +755,46 @@ def main() -> None:
     input_video = Path(required_env("ERASER_INPUT_VIDEO"))
     input_mask = Path(required_env("ERASER_INPUT_MASK"))
     output_video = Path(required_env("ERASER_OUTPUT_VIDEO"))
+
     output_quality = os.environ.get("ERASER_OUTPUT_QUALITY", "source").strip().lower()
     if output_quality not in {"source", "higher"}:
         output_quality = "source"
+
     output_video.parent.mkdir(parents=True, exist_ok=True)
+
     if not input_video.exists() or input_video.stat().st_size <= 0:
         raise RuntimeError(f"Input video is missing or empty: {input_video}")
+
     if not input_mask.exists() or input_mask.stat().st_size <= 0:
         raise RuntimeError(f"Input mask is missing or empty: {input_mask}")
+
     work_dir = output_video.parent
     source_mp4 = work_dir / "source_for_propainter.mp4"
-    mask_dir = work_dir / "tracked_remove_masks"
+    mask_dir = work_dir / "sam2_remove_masks"
     result_root = work_dir / "propainter_results"
+
     prepare_source_mp4(input_video, source_mp4)
     fps, width, height = read_video_meta(source_mp4)
+
     tracked_masks = build_tracked_masks(source_mp4, input_mask, mask_dir, fps, width, height)
+
     try:
         inpainted = run_propainter(source_mp4, tracked_masks, result_root, width, height, output_quality)
         change_score = masked_change_score(source_mp4, inpainted, tracked_masks, width, height)
         print(f"ProPainter masked-region change score={change_score:.3f}", flush=True)
+
         if change_score < UNCHANGED_THRESHOLD:
-            print("ProPainter output looked unchanged in the marked region; forcing tracked OpenCV removal.", flush=True)
+            print("ProPainter output looked unchanged; forcing OpenCV fallback.", flush=True)
             inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
+
     except RuntimeError as exc:
         if not is_cuda_oom(str(exc)):
             raise
         print("ProPainter CUDA OOM detected; falling back to tracked OpenCV inpaint.", flush=True)
         inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
+
     mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
+
     if not output_video.exists() or output_video.stat().st_size <= 0:
         raise RuntimeError("Eraser pipeline did not create output video")
 
