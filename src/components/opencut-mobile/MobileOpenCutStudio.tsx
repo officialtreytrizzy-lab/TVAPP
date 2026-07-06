@@ -127,11 +127,24 @@ function textPreviewClass(animation?: OpenCutTextAnimation) {
   return '';
 }
 
+function isStickerLayer(layer: OpenCutTextLayer) {
+  return STICKERS.includes(layer.text.trim());
+}
+
+function timelinePercent(start: number, end: number, total: number) {
+  const safeTotal = Math.max(0.1, total);
+  const left = clamp((start / safeTotal) * 100, 0, 100);
+  const width = clamp(((end - start) / safeTotal) * 100, 1.5, 100 - left);
+  return { left: `${left}%`, width: `${width}%` };
+}
+
 export default function MobileOpenCutStudio() {
   const videoFileRef = useRef<HTMLInputElement | null>(null);
   const audioFileRef = useRef<HTMLInputElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const pendingTimelineSeekRef = useRef<{ clipId: string; sourceTime: number } | null>(null);
+
   const [project, setProject] = useState<OpenCutProject>({
     id: uid('project'),
     name: 'Untitled Promo',
@@ -157,8 +170,22 @@ export default function MobileOpenCutStudio() {
   const ActiveToolIcon = activeTool.icon;
   const selectedClipDuration = selectedClip ? selectedClip.end - selectedClip.start : 0;
   const totalDuration = projectDuration(project.clips);
+  const audioTimelineEnd = project.audioTracks.reduce((max, track) => Math.max(max, track.start + track.duration), 0);
+  const textTimelineEnd = project.textLayers.reduce((max, layer) => Math.max(max, layer.end), 0);
+  const timelineLength = Math.max(totalDuration, audioTimelineEnd, textTimelineEnd, selectedClipDuration, 1);
   const selectedClipTimelineStart = clipStartInProject(project.clips, selectedClip?.id);
   const currentTimeline = selectedClip ? selectedClipTimelineStart + ((current - selectedClip.start) / Math.max(0.1, selectedClip.speed || 1)) : 0;
+  const clipTimelineItems = useMemo(() => {
+    let cursor = 0;
+    return project.clips.map((clip, index) => {
+      const duration = segmentDuration(clip);
+      const item = { clip, index, start: cursor, end: cursor + duration, duration };
+      cursor += duration;
+      return item;
+    });
+  }, [project.clips]);
+  const textTimelineLayers = project.textLayers.filter((layer) => !isStickerLayer(layer));
+  const stickerTimelineLayers = project.textLayers.filter(isStickerLayer);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -193,14 +220,22 @@ export default function MobileOpenCutStudio() {
 
   useEffect(() => {
     if (!selectedClip || !videoRef.current) return;
+    const pending = pendingTimelineSeekRef.current;
+    const targetTime = pending?.clipId === selectedClip.id ? pending.sourceTime : selectedClip.start;
+    if (pending?.clipId === selectedClip.id) pendingTimelineSeekRef.current = null;
     videoRef.current.src = selectedClip.url;
-    videoRef.current.currentTime = selectedClip.start;
+    videoRef.current.currentTime = targetTime;
     videoRef.current.style.objectFit = selectedClip.fit === 'cover' ? 'cover' : 'contain';
     videoRef.current.playbackRate = selectedClip.speed || 1;
-    setCurrent(selectedClip.start);
+    setCurrent(targetTime);
     makeTimelineThumbs(selectedClip.url, 14).then(setThumbs).catch(() => setThumbs([]));
     if (playing) void videoRef.current.play();
   }, [selectedClip?.id]);
+
+  useEffect(() => {
+    if (!audioRef.current || !project.audioTracks[0]) return;
+    audioRef.current.volume = project.audioTracks[0].volume;
+  }, [project.audioTracks]);
 
   const importVideoFiles = async (files: FileList | File[]) => {
     setExportError(null);
@@ -287,6 +322,22 @@ export default function MobileOpenCutStudio() {
     if (audioRef.current) audioRef.current.currentTime = clamp(currentTimeline, 0, audioRef.current.duration || currentTimeline);
   };
 
+  const seekToTimeline = (timelineTime: number) => {
+    const safeTime = clamp(timelineTime, 0, timelineLength);
+    const item = clipTimelineItems.find((entry) => safeTime >= entry.start && safeTime <= entry.end) ?? clipTimelineItems[clipTimelineItems.length - 1];
+    if (!item) return;
+    const localTime = clamp(safeTime - item.start, 0, item.duration);
+    const sourceTime = clamp(item.clip.start + localTime * Math.max(0.1, item.clip.speed || 1), item.clip.start, item.clip.end);
+    pendingTimelineSeekRef.current = { clipId: item.clip.id, sourceTime };
+    setProject((prev) => ({ ...prev, selectedClipId: item.clip.id }));
+    requestAnimationFrame(() => {
+      if (!videoRef.current) return;
+      videoRef.current.currentTime = sourceTime;
+      setCurrent(sourceTime);
+      if (audioRef.current) audioRef.current.currentTime = safeTime;
+    });
+  };
+
   const togglePlay = () => {
     const video = videoRef.current;
     if (!video || !selectedClip) return;
@@ -334,11 +385,13 @@ export default function MobileOpenCutStudio() {
   };
 
   const createTextLayer = (patch: Partial<OpenCutTextLayer> = {}) => {
+    const start = clamp(currentTimeline, 0, Math.max(0, timelineLength - 0.1));
+    const end = Math.max(start + 1, Math.min(timelineLength || start + 4, start + 4));
     const layer: OpenCutTextLayer = {
       id: uid('text'),
       text: 'Tap to edit',
-      start: 0,
-      end: Math.max(3, totalDuration || selectedClipDuration || 5),
+      start,
+      end,
       x: 50,
       y: 78,
       size: 34,
@@ -352,7 +405,7 @@ export default function MobileOpenCutStudio() {
     };
     setProject((prev) => ({ ...prev, textLayers: [...prev.textLayers, layer] }));
     setSelectedTextId(layer.id);
-    setTool('text');
+    setTool(isStickerLayer(layer) ? 'stickers' : 'text');
   };
 
   const addCaption = () => {
@@ -371,7 +424,7 @@ export default function MobileOpenCutStudio() {
   };
 
   const applyTextPreset = (patch: Partial<OpenCutTextLayer>) => {
-    if (selectedText) updateText(patch);
+    if (selectedText && !isStickerLayer(selectedText)) updateText(patch);
     else createTextLayer(patch);
   };
 
@@ -429,7 +482,13 @@ export default function MobileOpenCutStudio() {
     setExportProgress(0);
     try {
       if (exportUrl) URL.revokeObjectURL(exportUrl);
-      const target = project.aspect === '16:9' ? { w: 1280, h: 720 } : project.aspect === '1:1' ? { w: 1080, h: 1080 } : project.aspect === 'original' && selectedClip && selectedClip.width > selectedClip.height ? { w: 1280, h: 720 } : { w: 1080, h: 1920 };
+      const target = project.aspect === '16:9'
+        ? { w: 1280, h: 720 }
+        : project.aspect === '1:1'
+          ? { w: 1080, h: 1080 }
+          : project.aspect === 'original' && selectedClip && selectedClip.width > selectedClip.height
+            ? { w: 1280, h: 720 }
+            : { w: 1080, h: 1920 };
       const rendered = await exportOpenCutRender({
         clips: project.clips,
         textLayers: project.textLayers,
@@ -470,12 +529,36 @@ export default function MobileOpenCutStudio() {
     event.currentTarget.value = '';
   };
 
+  const renderTimelineLane = (
+    label: string,
+    Icon: typeof Scissors,
+    emptyLabel: string,
+    children: React.ReactNode,
+  ) => (
+    <div className="grid grid-cols-[4.8rem_1fr] gap-2 rounded-2xl bg-black/25 p-2 ring-1 ring-white/10">
+      <button onClick={() => setTool(label.toLowerCase() as Tool)} className="flex min-h-10 items-center gap-1.5 rounded-xl bg-white/[0.06] px-2 text-left text-[10px] font-black uppercase tracking-wide text-white/60 ring-1 ring-white/10">
+        <Icon className="h-3.5 w-3.5" /> {label}
+      </button>
+      <div className="relative min-h-10 overflow-hidden rounded-xl bg-white/[0.045] ring-1 ring-white/10" onClick={(event) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        const pct = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+        seekToTimeline(pct * timelineLength);
+      }}>
+        <div className="absolute inset-y-0 w-px bg-white/80 shadow-[0_0_12px_rgba(255,255,255,0.9)]" style={{ left: `${clamp((currentTimeline / timelineLength) * 100, 0, 100)}%` }} />
+        {children || <div className="flex h-full items-center px-3 text-[10px] font-semibold text-white/25">{emptyLabel}</div>}
+      </div>
+    </div>
+  );
+
   const firstAudio = project.audioTracks[0];
 
   return (
     <div className="min-h-dvh overflow-x-hidden bg-[#03030a] text-white pb-safe">
       <div aria-hidden="true" className="pointer-events-none fixed inset-0 opacity-90" style={{ background: 'radial-gradient(circle at 50% -10%, rgba(168, 85, 247, 0.32), transparent 34%), radial-gradient(circle at 110% 18%, rgba(37, 99, 235, 0.22), transparent 28%), linear-gradient(180deg, #03030a 0%, #080817 52%, #03030a 100%)' }} />
       {firstAudio ? <audio ref={audioRef} src={firstAudio.url} preload="auto" /> : null}
+
+      <input ref={videoFileRef} type="file" accept="video/mp4,video/quicktime,video/webm,video/*" multiple hidden onChange={onVideoInput} />
+      <input ref={audioFileRef} type="file" accept="audio/mp3,audio/wav,audio/m4a,audio/aac,audio/ogg,audio/*" hidden onChange={onAudioInput} />
 
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#050510]/85 pt-safe backdrop-blur-2xl">
         <div className="mx-auto flex h-16 max-w-[430px] items-center gap-3 px-4 px-safe">
@@ -494,9 +577,11 @@ export default function MobileOpenCutStudio() {
           <section className="relative overflow-hidden rounded-[38px] border border-white/10 bg-white/[0.07] p-5 shadow-[0_28px_80px_rgba(0,0,0,0.45)] backdrop-blur-2xl">
             <div aria-hidden="true" className="absolute inset-0 opacity-80" style={{ background: 'linear-gradient(145deg, rgba(255,255,255,0.14), rgba(255,255,255,0.03) 48%, rgba(124,58,237,0.16))' }} />
             <div className="relative">
-              <div className="mb-5 flex items-center justify-between"><div className="inline-flex items-center gap-2 rounded-full bg-black/30 px-3 py-1.5 text-[11px] font-bold text-violet-100 ring-1 ring-white/10"><Sparkles className="h-3.5 w-3.5 text-violet-300" /> Promo video builder</div><div className="rounded-full bg-emerald-400/10 px-3 py-1.5 text-[11px] font-bold text-emerald-200 ring-1 ring-emerald-300/20">Ready</div></div>
-              <div className="grid h-24 w-24 place-items-center rounded-[32px] bg-gradient-to-br from-violet-500 via-fuchsia-500 to-blue-500 shadow-[0_20px_60px_rgba(124,58,237,0.45)]"><Film className="h-11 w-11" /></div>
-              <h1 className="mt-7 text-[2.7rem] font-black leading-[0.92] tracking-[-0.08em] text-white">Create a promo cut.</h1>
+              <div className="mb-5 flex items-center justify-between">
+                <div className="inline-flex items-center gap-2 rounded-full bg-black/30 px-3 py-1.5 text-[11px] font-bold text-violet-100 ring-1 ring-white/10"><Sparkles className="h-3.5 w-3.5 text-violet-300" /> Promo video builder</div>
+                <div className="rounded-full bg-emerald-400/10 px-3 py-1.5 text-[11px] font-bold text-emerald-200 ring-1 ring-emerald-300/20">Mobile ready</div>
+              </div>
+              <h1 className="max-w-sm text-4xl font-black leading-[0.95] tracking-tight text-white">Cut a promo that feels ready to post.</h1>
               <p className="mt-4 max-w-sm text-[15px] leading-6 text-white/60">Import a compilation of clips, add music or voiceover, stack animated text, and export a social-ready promo.</p>
               <div className="mt-5 flex flex-wrap gap-2">{QUALITY_CHIPS.map((chip) => <span key={chip} className="rounded-full bg-white/[0.08] px-3 py-1.5 text-[11px] font-bold text-white/75 ring-1 ring-white/10">{chip}</span>)}</div>
               <button onClick={() => videoFileRef.current?.click()} className="mt-7 flex min-h-14 w-full items-center justify-center gap-2 rounded-[22px] bg-white px-5 py-4 text-base font-black text-slate-950 shadow-[0_18px_50px_rgba(255,255,255,0.18)] active:scale-[0.985]"><Upload className="h-5 w-5" /> Import video clips</button>
@@ -519,11 +604,11 @@ export default function MobileOpenCutStudio() {
                 const visible = currentTimeline >= layer.start && currentTimeline <= layer.end;
                 if (!visible) return null;
                 const text = layer.uppercase ? layer.text.toUpperCase() : layer.text;
-                return <button key={layer.id} onClick={() => { setSelectedTextId(layer.id); setTool('text'); }} className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-2xl px-3 py-1.5 text-center font-black leading-tight ring-1 ring-white/10 transition ${textPreviewClass(layer.animation)} ${layer.background ? 'bg-black/60 backdrop-blur-md' : ''} ${layer.shadow ? 'drop-shadow-[0_8px_16px_rgba(0,0,0,0.75)]' : ''}`} style={{ left: `${layer.x}%`, top: `${layer.y}%`, color: layer.color, fontSize: `${Math.max(14, layer.size / 3.2)}px` }}>{text}</button>;
+                return <button key={layer.id} onClick={() => { setSelectedTextId(layer.id); setTool(isStickerLayer(layer) ? 'stickers' : 'text'); }} className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-2xl px-3 py-1.5 text-center font-black leading-tight ring-1 ring-white/10 transition ${textPreviewClass(layer.animation)} ${layer.background ? 'bg-black/60 backdrop-blur-md' : ''} ${layer.shadow ? 'drop-shadow-[0_8px_16px_rgba(0,0,0,0.75)]' : ''}`} style={{ left: `${layer.x}%`, top: `${layer.y}%`, color: layer.color, fontSize: `${Math.max(14, layer.size / 3.2)}px` }}>{text}</button>;
               })}
               <button onClick={togglePlay} aria-label={playing ? 'Pause video' : 'Play video'} className="absolute left-1/2 top-1/2 grid h-[4.35rem] w-[4.35rem] -translate-x-1/2 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-white shadow-[0_16px_45px_rgba(0,0,0,0.45)] ring-1 ring-white/20 backdrop-blur-xl active:scale-95">{playing ? <Pause className="h-8 w-8" /> : <Play className="ml-1 h-8 w-8" />}</button>
             </div>
-            <div className="mt-2 grid grid-cols-3 gap-2 px-1 text-center text-[11px]"><div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Clips</span><span className="font-mono text-white/70">{project.clips.length}</span></div><div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Promo</span><span className="font-mono text-white/70">{formatTime(totalDuration)}</span></div><div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Aspect</span><span className="font-mono text-white/70">{project.aspect}</span></div></div>
+            <div className="mt-2 grid grid-cols-3 gap-2 px-1 text-center text-[11px]"><div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Clips</span><span className="font-mono text-white/70">{project.clips.length}</span></div><div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Timeline</span><span className="font-mono text-white/70">{formatTime(timelineLength)}</span></div><div className="rounded-2xl bg-white/[0.055] px-2 py-2 ring-1 ring-white/10"><span className="block text-white/40">Aspect</span><span className="font-mono text-white/70">{project.aspect}</span></div></div>
           </section>
 
           <section className="mt-3 rounded-[28px] border border-white/10 bg-white/[0.06] p-3 shadow-[0_18px_55px_rgba(0,0,0,0.28)] backdrop-blur-xl">
@@ -533,6 +618,22 @@ export default function MobileOpenCutStudio() {
             <div className="no-scrollbar mt-3 flex gap-2 overflow-x-auto pb-1">{project.clips.map((clip, index) => <button key={clip.id} onClick={() => setProject((p) => ({ ...p, selectedClipId: clip.id }))} className={`min-w-32 rounded-2xl px-3 py-2 text-left text-xs ring-1 active:scale-95 ${clip.id === selectedClip.id ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.055] text-white/60 ring-white/10'}`}><span className="block truncate font-black">{index + 1}. {clip.name}</span><span className="font-mono text-[10px] opacity-70">{formatTime(segmentDuration(clip))} · {clip.transition || 'none'}</span></button>)}</div>
           </section>
 
+          <section className="mt-3 rounded-[28px] border border-white/10 bg-white/[0.06] p-3 shadow-[0_18px_55px_rgba(0,0,0,0.28)] backdrop-blur-xl">
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-black">Layer timeline</h2>
+                <p className="text-[11px] text-white/40">Video, audio, text, and stickers stay on separate lines.</p>
+              </div>
+              <div className="font-mono text-[11px] text-white/45">{formatTime(currentTimeline)} / {formatTime(timelineLength)}</div>
+            </div>
+            <div className="space-y-2">
+              {renderTimelineLane('Video', Film, 'Import video clips', clipTimelineItems.map((item) => <button key={item.clip.id} onClick={(event) => { event.stopPropagation(); setProject((p) => ({ ...p, selectedClipId: item.clip.id })); seekToTimeline(item.start); }} className={`absolute inset-y-1 rounded-lg px-2 text-left text-[10px] font-black leading-8 ring-1 active:scale-[0.99] ${item.clip.id === selectedClip.id ? 'bg-white text-slate-950 ring-white' : 'bg-violet-400/70 text-white ring-violet-200/40'}`} style={timelinePercent(item.start, item.end, timelineLength)}>{item.index + 1}. {item.clip.name}</button>))}
+              {renderTimelineLane('Audio', Volume2, 'No audio yet', project.audioTracks.map((track) => <button key={track.id} onClick={(event) => { event.stopPropagation(); setTool('audio'); seekToTimeline(track.start); }} className="absolute inset-y-1 rounded-lg bg-emerald-400/75 px-2 text-left text-[10px] font-black leading-8 text-slate-950 ring-1 ring-emerald-200/50 active:scale-[0.99]" style={timelinePercent(track.start, track.start + track.duration, timelineLength)}>{track.name}</button>))}
+              {renderTimelineLane('Text', Type, 'No text layers', textTimelineLayers.map((layer) => <button key={layer.id} onClick={(event) => { event.stopPropagation(); setSelectedTextId(layer.id); setTool('text'); seekToTimeline(layer.start); }} className="absolute inset-y-1 rounded-lg bg-fuchsia-400/75 px-2 text-left text-[10px] font-black leading-8 text-slate-950 ring-1 ring-fuchsia-200/50 active:scale-[0.99]" style={timelinePercent(layer.start, layer.end, timelineLength)}>{layer.text}</button>))}
+              {renderTimelineLane('Stickers', Sparkles, 'No stickers yet', stickerTimelineLayers.map((layer) => <button key={layer.id} onClick={(event) => { event.stopPropagation(); setSelectedTextId(layer.id); setTool('stickers'); seekToTimeline(layer.start); }} className="absolute inset-y-1 rounded-lg bg-amber-300/80 px-2 text-left text-[10px] font-black leading-8 text-slate-950 ring-1 ring-amber-100/50 active:scale-[0.99]" style={timelinePercent(layer.start, layer.end, timelineLength)}>{layer.text}</button>))}
+            </div>
+          </section>
+
           <section className="mt-3 min-h-44 rounded-[28px] border border-white/10 bg-white/[0.065] p-4 shadow-[0_18px_55px_rgba(0,0,0,0.28)] backdrop-blur-xl">
             <div className="mb-4 flex items-center justify-between"><div className="flex items-center gap-2"><div className="grid h-9 w-9 place-items-center rounded-2xl bg-white/[0.08] ring-1 ring-white/10"><ActiveToolIcon className="h-4 w-4" /></div><div><h3 className="text-sm font-black">{activeTool.label}</h3><p className="text-[11px] text-white/40">Promo builder tool</p></div></div><button onClick={() => videoFileRef.current?.click()} className="rounded-full bg-white/[0.08] px-3 py-2 text-[11px] font-bold text-white/70 ring-1 ring-white/10 active:scale-95">Add clips</button></div>
 
@@ -540,13 +641,13 @@ export default function MobileOpenCutStudio() {
 
             {tool === 'split' && <div className="space-y-3"><button onClick={splitAtPlayhead} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 font-black text-slate-950 active:scale-[0.985]"><SplitSquareHorizontal className="h-5 w-5" /> Split at playhead</button><div className="grid grid-cols-2 gap-2"><button onClick={duplicateClip} className="flex min-h-12 items-center justify-center gap-2 rounded-2xl bg-white/[0.09] px-4 py-3 font-bold ring-1 ring-white/10"><Copy className="h-4 w-4" /> Duplicate</button><button onClick={deleteClip} className="flex min-h-12 items-center justify-center gap-2 rounded-2xl bg-red-500/20 px-4 py-3 font-bold text-red-100 ring-1 ring-red-300/20"><Trash2 className="h-4 w-4" /> Delete</button></div></div>}
 
-            {tool === 'text' && <div className="space-y-3"><div className="flex items-center justify-between"><p className="text-xs leading-5 text-white/50">Titles, hooks, lower thirds, and animated promo text.</p><button onClick={() => createTextLayer()} className="rounded-full bg-white px-3 py-2 text-xs font-black text-slate-950"><Plus className="inline h-3.5 w-3.5" /> Add</button></div><div className="grid grid-cols-2 gap-2 text-xs">{TEXT_PRESETS.map((preset) => <button key={preset.label} onClick={() => applyTextPreset(preset.patch)} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">{preset.label}</button>)}</div>{selectedText ? <><input value={selectedText.text} onChange={(e) => updateText({ text: e.target.value })} className="w-full rounded-2xl bg-black/30 px-4 py-3 text-sm font-semibold outline-none ring-1 ring-white/10" /><div className="grid grid-cols-2 gap-2 text-xs text-white/60"><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">Y position<input type="range" min={10} max={90} value={selectedText.y} onChange={(e) => updateText({ y: Number(e.target.value) })} className="w-full accent-violet-500" /></label><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">Size<input type="range" min={22} max={96} value={selectedText.size} onChange={(e) => updateText({ size: Number(e.target.value) })} className="w-full accent-violet-500" /></label></div><div className="grid grid-cols-3 gap-2 text-xs"><button onClick={() => updateText({ background: !selectedText.background })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">BG</button><button onClick={() => updateText({ shadow: !selectedText.shadow })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Shadow</button><button onClick={() => updateText({ uppercase: !selectedText.uppercase })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Caps</button></div><div className="grid grid-cols-3 gap-2 text-xs">{TEXT_ANIMATIONS.map((animation) => <button key={animation} onClick={() => updateText({ animation })} className={`rounded-2xl px-3 py-3 font-bold ring-1 ${selectedText.animation === animation ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.08] text-white ring-white/10'}`}>{animation}</button>)}</div><button onClick={removeText} className="rounded-2xl bg-red-500/20 px-3 py-2 text-xs font-bold text-red-100 ring-1 ring-red-300/20">Remove text</button></> : <button onClick={() => createTextLayer()} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white/[0.09] px-4 py-4 text-sm font-bold text-white/80 ring-1 ring-white/10"><Captions className="h-4 w-4" /> Add your first text layer</button>}</div>}
+            {tool === 'text' && <div className="space-y-3"><div className="flex items-center justify-between"><p className="text-xs leading-5 text-white/50">Titles, hooks, lower thirds, and animated promo text.</p><button onClick={() => createTextLayer()} className="rounded-full bg-white px-3 py-2 text-xs font-black text-slate-950"><Plus className="inline h-3.5 w-3.5" /> Add</button></div><div className="grid grid-cols-2 gap-2 text-xs">{TEXT_PRESETS.map((preset) => <button key={preset.label} onClick={() => applyTextPreset(preset.patch)} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">{preset.label}</button>)}</div>{selectedText ? <><input value={selectedText.text} onChange={(e) => updateText({ text: e.target.value })} className="w-full rounded-2xl bg-black/30 px-4 py-3 text-sm font-semibold outline-none ring-1 ring-white/10" /><div className="grid grid-cols-2 gap-2 text-xs text-white/60"><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">Start · {formatTime(selectedText.start)}<input type="range" min={0} max={timelineLength} step={0.05} value={selectedText.start} onChange={(e) => updateText({ start: clamp(Number(e.target.value), 0, selectedText.end - 0.1) })} className="w-full accent-violet-500" /></label><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">End · {formatTime(selectedText.end)}<input type="range" min={0.1} max={timelineLength} step={0.05} value={selectedText.end} onChange={(e) => updateText({ end: clamp(Number(e.target.value), selectedText.start + 0.1, timelineLength) })} className="w-full accent-violet-500" /></label><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">Y position<input type="range" min={10} max={90} value={selectedText.y} onChange={(e) => updateText({ y: Number(e.target.value) })} className="w-full accent-violet-500" /></label><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">Size<input type="range" min={22} max={96} value={selectedText.size} onChange={(e) => updateText({ size: Number(e.target.value) })} className="w-full accent-violet-500" /></label></div><div className="grid grid-cols-3 gap-2 text-xs"><button onClick={() => updateText({ background: !selectedText.background })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">BG</button><button onClick={() => updateText({ shadow: !selectedText.shadow })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Shadow</button><button onClick={() => updateText({ uppercase: !selectedText.uppercase })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Caps</button></div><div className="grid grid-cols-3 gap-2 text-xs">{TEXT_ANIMATIONS.map((animation) => <button key={animation} onClick={() => updateText({ animation })} className={`rounded-2xl px-3 py-3 font-bold ring-1 ${selectedText.animation === animation ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.08] text-white ring-white/10'}`}>{animation}</button>)}</div><button onClick={removeText} className="rounded-2xl bg-red-500/20 px-3 py-2 text-xs font-bold text-red-100 ring-1 ring-red-300/20">Remove text</button></> : <button onClick={() => createTextLayer()} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white/[0.09] px-4 py-4 text-sm font-bold text-white/80 ring-1 ring-white/10"><Captions className="h-4 w-4" /> Add your first text layer</button>}</div>}
 
-            {tool === 'captions' && <div className="space-y-3"><button onClick={addCaption} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 font-black text-slate-950"><Captions className="h-5 w-5" /> Add caption bar</button><div className="grid grid-cols-2 gap-2 text-xs"><button onClick={() => applyTextPreset({ y: 84, size: 32, background: true, shadow: true, animation: 'fade' })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Bottom captions</button><button onClick={() => applyTextPreset({ y: 16, size: 34, background: false, shadow: true, uppercase: true, animation: 'typewriter' })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Top hook</button></div><p className="text-xs leading-5 text-white/40">Caption layers are project-level overlays, so they follow the whole promo timeline and export with the render.</p></div>}
+            {tool === 'captions' && <div className="space-y-3"><button onClick={addCaption} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 font-black text-slate-950"><Captions className="h-5 w-5" /> Add caption bar</button><div className="grid grid-cols-2 gap-2 text-xs"><button onClick={() => applyTextPreset({ y: 84, size: 32, background: true, shadow: true, animation: 'fade' })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Bottom captions</button><button onClick={() => applyTextPreset({ y: 16, size: 34, background: false, shadow: true, uppercase: true, animation: 'typewriter' })} className="rounded-2xl bg-white/[0.08] px-3 py-3 font-bold ring-1 ring-white/10">Top hook</button></div><p className="text-xs leading-5 text-white/40">Caption layers appear on the Text line and export with the render.</p></div>}
 
-            {tool === 'stickers' && <div className="space-y-3"><div className="grid grid-cols-6 gap-2 text-2xl">{STICKERS.map((emoji) => <button key={emoji} onClick={() => addSticker(emoji)} className="grid min-h-12 place-items-center rounded-2xl bg-white/[0.08] ring-1 ring-white/10 active:scale-95">{emoji}</button>)}</div><p className="text-xs leading-5 text-white/40">Emoji stickers are animated text layers, so they export with the final promo.</p></div>}
+            {tool === 'stickers' && <div className="space-y-3"><div className="grid grid-cols-6 gap-2 text-2xl">{STICKERS.map((emoji) => <button key={emoji} onClick={() => addSticker(emoji)} className="grid min-h-12 place-items-center rounded-2xl bg-white/[0.08] ring-1 ring-white/10 active:scale-95">{emoji}</button>)}</div>{selectedText && isStickerLayer(selectedText) ? <div className="grid grid-cols-2 gap-2 text-xs text-white/60"><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">Start · {formatTime(selectedText.start)}<input type="range" min={0} max={timelineLength} step={0.05} value={selectedText.start} onChange={(e) => updateText({ start: clamp(Number(e.target.value), 0, selectedText.end - 0.1) })} className="w-full accent-violet-500" /></label><label className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10">End · {formatTime(selectedText.end)}<input type="range" min={0.1} max={timelineLength} step={0.05} value={selectedText.end} onChange={(e) => updateText({ end: clamp(Number(e.target.value), selectedText.start + 0.1, timelineLength) })} className="w-full accent-violet-500" /></label></div> : null}<p className="text-xs leading-5 text-white/40">Emoji stickers sit on their own Sticker line, separate from text captions.</p></div>}
 
-            {tool === 'audio' && <div className="space-y-3"><button onClick={() => audioFileRef.current?.click()} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 font-black text-slate-950"><Music2 className="h-5 w-5" /> Add audio file</button>{project.audioTracks.map((track) => <div key={track.id} className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10"><div className="mb-2 flex items-center justify-between gap-2"><div className="min-w-0"><p className="truncate text-sm font-black">{track.name}</p><p className="font-mono text-[10px] text-white/40">{formatTime(track.duration)}</p></div><button onClick={() => removeAudio(track.id)} className="rounded-full bg-red-500/20 px-3 py-2 text-[11px] font-bold text-red-100">Remove</button></div><label className="block text-xs font-bold text-white/60">Volume · {Math.round(track.volume * 100)}%<input type="range" min={0} max={1} step={0.01} value={track.volume} onChange={(e) => updateAudio(track.id, { volume: Number(e.target.value) })} className="mt-1 w-full accent-violet-500" /></label></div>)}<p className="text-xs leading-5 text-white/40">Preview uses the first audio track. Export attaches browser-capturable audio tracks when the current browser allows it.</p></div>}
+            {tool === 'audio' && <div className="space-y-3"><button onClick={() => audioFileRef.current?.click()} className="flex min-h-12 w-full items-center justify-center gap-2 rounded-2xl bg-white px-4 py-3 font-black text-slate-950"><Music2 className="h-5 w-5" /> Add audio file</button>{project.audioTracks.map((track) => <div key={track.id} className="rounded-2xl bg-black/25 p-3 ring-1 ring-white/10"><div className="mb-2 flex items-center justify-between gap-2"><div className="min-w-0"><p className="truncate text-sm font-black">{track.name}</p><p className="font-mono text-[10px] text-white/40">{formatTime(track.start)} → {formatTime(track.start + track.duration)}</p></div><button onClick={() => removeAudio(track.id)} className="rounded-full bg-red-500/20 px-3 py-2 text-[11px] font-bold text-red-100">Remove</button></div><div className="grid grid-cols-2 gap-2"><label className="block text-xs font-bold text-white/60">Start · {formatTime(track.start)}<input type="range" min={0} max={timelineLength} step={0.05} value={track.start} onChange={(e) => updateAudio(track.id, { start: Number(e.target.value) })} className="mt-1 w-full accent-violet-500" /></label><label className="block text-xs font-bold text-white/60">Volume · {Math.round(track.volume * 100)}%<input type="range" min={0} max={1} step={0.01} value={track.volume} onChange={(e) => updateAudio(track.id, { volume: Number(e.target.value) })} className="mt-1 w-full accent-violet-500" /></label></div></div>)}<p className="text-xs leading-5 text-white/40">Preview uses the first audio track. The new Audio line shows where every imported track starts.</p></div>}
 
             {tool === 'speed' && <div className="space-y-3"><div className="grid grid-cols-4 gap-2">{[0.5, 0.75, 1, 1.5, 2, 3, 4, 0.25].map((speed) => <button key={speed} onClick={() => updateClip({ speed })} className={`min-h-12 rounded-2xl px-3 py-3 text-sm font-black ring-1 active:scale-95 ${selectedClip.speed === speed ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.08] text-white ring-white/10'}`}>{speed}×</button>)}</div></div>}
 
@@ -564,13 +665,12 @@ export default function MobileOpenCutStudio() {
           </section>
 
           <nav className="fixed inset-x-0 bottom-0 z-50 border-t border-white/10 bg-[#050510]/90 pb-safe backdrop-blur-2xl">
-            <div className="no-scrollbar mx-auto flex max-w-[430px] gap-2 overflow-x-auto px-3 py-3">{TOOLS.map(({ id, label, icon: Icon }) => <button key={id} onClick={() => setTool(id)} className={`flex min-w-[4.9rem] flex-col items-center justify-center gap-1 rounded-2xl px-3 py-2 text-[10px] font-black ring-1 active:scale-95 ${tool === id ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.07] text-white/65 ring-white/10'}`}><Icon className="h-4 w-4" />{label}</button>)}</div>
+            <div className="no-scrollbar mx-auto flex max-w-[430px] gap-2 overflow-x-auto px-3 py-3">
+              {TOOLS.map(({ id, label, icon: Icon }) => <button key={id} onClick={() => setTool(id)} className={`flex min-w-[4.75rem] flex-col items-center gap-1 rounded-2xl px-3 py-2 text-[10px] font-black ring-1 active:scale-95 ${tool === id ? 'bg-white text-slate-950 ring-white' : 'bg-white/[0.07] text-white/60 ring-white/10'}`}><Icon className="h-4 w-4" />{label}</button>)}
+            </div>
           </nav>
         </main>
       )}
-
-      <input ref={videoFileRef} type="file" accept="video/mp4,video/quicktime,video/webm,video/*" multiple className="hidden" onChange={onVideoInput} />
-      <input ref={audioFileRef} type="file" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg,audio/*" className="hidden" onChange={onAudioInput} />
     </div>
   );
 }
