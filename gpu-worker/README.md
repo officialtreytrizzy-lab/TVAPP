@@ -17,16 +17,27 @@ Do not hard-code Modal tokens into this repo.
 From your computer:
 
 ```bash
-pip install modal
-modal setup
-modal deploy gpu-worker/modal_app.py
+python -m pip install --upgrade modal
+modal token new --profile tvapp-new --activate
+modal profile current
+modal token info
+MODAL_PROFILE=tvapp-new modal deploy gpu-worker/modal_app.py
 ```
 
 Modal prints a deployed web URL. Put that URL in Vercel:
 
 ```bash
 VITE_ERASER_GPU_WORKER_URL=https://your-workspace--tvapp-video-eraser-gpu-fastapi-app.modal.run
+ERASER_GPU_WORKER_URL=https://your-workspace--tvapp-video-eraser-gpu-fastapi-app.modal.run
 ```
+
+Then populate the fresh Modal volume in the new account:
+
+```bash
+MODAL_PROFILE=tvapp-new modal run gpu-worker/modal_app.py::download_models
+```
+
+For the full account-switch checklist, see `docs/modal-account-migration.md`.
 
 Optional auth can be added later with:
 
