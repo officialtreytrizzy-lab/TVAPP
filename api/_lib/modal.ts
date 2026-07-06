@@ -7,6 +7,14 @@ export interface RemovalJobRequest {
   mask_base64?: string;
   mode?: 'static_logo' | 'moving_object';
   quality?: 'source' | 'higher';
+  selected_time?: number | string;
+  selected_frame_index?: number | string;
+  fps?: number | string;
+  duration?: number | string;
+  width?: number | string;
+  height?: number | string;
+  pipeline?: string;
+  mask_semantics?: string;
   preserve_resolution?: boolean;
   preserve_fps?: boolean;
   preserve_audio?: boolean;
@@ -169,6 +177,13 @@ function base64ToBlob(base64: string, mimeType: string): Blob {
   return new Blob([Buffer.from(clean, 'base64')], { type: mimeType });
 }
 
+function metadataValue(input: RemovalJobRequest, key: string, fallback: string | number): string {
+  const direct = input[key as keyof RemovalJobRequest];
+  const fromMetadata = input.metadata?.[key];
+  const value = direct ?? fromMetadata ?? fallback;
+  return String(value);
+}
+
 function appendRemovalOutputIntent(form: FormData, input: RemovalJobRequest): void {
   const outputMode = input.output_mode || 'composite';
   const returnMode = input.return_mode || 'composite';
@@ -219,13 +234,14 @@ export async function submitRemovalToModal(jobId: string, input: RemovalJobReque
   form.append('video', videoBlob, `${jobId}.mp4`);
   form.append('mask', maskBlob, `${jobId}-mask.png`);
   form.append('job_id', jobId);
-  form.append('selected_time', '0');
-  form.append('selected_frame_index', '0');
-  form.append('fps', '30');
-  form.append('duration', '0');
-  form.append('width', '0');
-  form.append('height', '0');
-  form.append('pipeline', 'sam2-propainter');
+  form.append('selected_time', metadataValue(input, 'selected_time', 0));
+  form.append('selected_frame_index', metadataValue(input, 'selected_frame_index', 0));
+  form.append('fps', metadataValue(input, 'fps', 30));
+  form.append('duration', metadataValue(input, 'duration', 0));
+  form.append('width', metadataValue(input, 'width', 0));
+  form.append('height', metadataValue(input, 'height', 0));
+  form.append('pipeline', input.pipeline || String(input.metadata?.pipeline || 'sam2-propainter'));
+  form.append('mask_semantics', input.mask_semantics || String(input.metadata?.mask_semantics || 'alpha_gt_0_remove'));
   form.append('quality', input.quality || 'source');
   form.append('preserve_resolution', String(input.preserve_resolution !== false));
   form.append('preserve_fps', String(input.preserve_fps !== false));
