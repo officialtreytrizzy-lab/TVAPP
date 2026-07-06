@@ -1,4 +1,4 @@
-import { publicBaseUrl } from './http.js';
+import { publicBaseUrl } from './http';
 
 const TOKEN_ENV_NAMES = [
   'TRECUT_ETREYSER_API_KEY',
