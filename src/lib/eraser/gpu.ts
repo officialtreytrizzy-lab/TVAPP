@@ -220,15 +220,11 @@ function buildRemovalForm(input: GpuRemovalInput, maskBlob: Blob): FormData {
   form.append('preserve_resolution', 'true');
   form.append('preserve_fps', 'true');
   form.append('preserve_audio', 'true');
-  form.append('output_mode', 'composite');
-  form.append('return_mode', 'composite');
-  form.append('result_mode', 'full_video');
-  form.append('output_kind', 'full_video');
-  form.append('composite_output', 'true');
-  form.append('full_frame_output', 'true');
-  form.append('full_video_output', 'true');
-  form.append('patch_only', 'false');
-  form.append('return_patch', 'false');
+  // NOTE: intentionally NOT sending output_mode/return_mode/result_mode/
+  // output_kind/composite_output/patch_only/return_patch. Those were added on
+  // 2026-07-05 and coincided with the eraser producing a passthrough (nothing
+  // removed). The last-known-good build (2026-07-04) sent only the fields
+  // above, so we keep the request identical to that.
   return form;
 }
 
@@ -355,23 +351,29 @@ async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutpu
   onPhase?.('segmenting', 18, 'Connecting to eTreyser GPU worker...');
   const maskBlob = await canvasToPngBlob(maskCanvas);
 
-  // Preferred route: discover the GPU worker through the proxy, then upload
-  // the video/mask multipart directly to it. This bypasses Vercel's ~4.5MB
-  // function payload limit entirely (both upload and output download).
-  const target = await fetchProxyUploadTarget();
-  if (target) {
+  // Upload the video/mask multipart straight to the GPU worker, exactly like
+  // the last-known-good 2026-07-04 build. Prefer the worker URL baked into the
+  // client env (VITE_ERASER_GPU_WORKER_URL) — that is the worker that actually
+  // removed the object — and only fall back to server-side discovery if the
+  // client env is not set. This bypasses Vercel's ~4.5MB function payload limit.
+  let workerBase = RAW_DIRECT_WORKER_URL;
+  if (!workerBase) {
+    const target = await fetchProxyUploadTarget();
+    if (target) workerBase = target.workerBase;
+  }
+  if (workerBase) {
     onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser GPU worker...');
-    const createRes = await fetch(target.uploadUrl, {
+    const createRes = await fetch(`${workerBase}/v1/video-eraser/jobs`, {
       method: 'POST',
       body: buildRemovalForm(input, maskBlob),
     });
     const initialPayload = await parseWorkerResponse(createRes);
     return waitForRemovalOutput({
       initialPayload,
-      baseUrl: target.workerBase,
+      baseUrl: workerBase,
       statusPathPrefix: '/v1/video-eraser/jobs',
       input,
-      onCancel: (remoteJobId) => requestWorkerCancel(target.workerBase, remoteJobId),
+      onCancel: (remoteJobId) => requestWorkerCancel(workerBase, remoteJobId),
     });
   }
 
