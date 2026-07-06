@@ -245,6 +245,31 @@ async function fetchProxyUploadTarget(): Promise<ProxyUploadTarget | null> {
   }
 }
 
+async function materializeOutput(outputUrl: string, input: GpuRemovalInput): Promise<PipelineOutput> {
+  // iOS Safari refuses to play a cross-origin progressive MP4 streamed straight
+  // from the worker: the player hangs on a spinner with an unknown (--:--)
+  // duration. Download the finished clip once and play it from a local object
+  // URL, which always plays and makes Before/After + Download instant.
+  let res: Response;
+  try {
+    res = await fetch(outputUrl);
+  } catch {
+    // Could not even reach the output via fetch (CORS/network). Fall back to
+    // letting the <video> element try progressive playback directly, so we do
+    // not regress desktop browsers that handle it fine.
+    return makePipelineOutput(outputUrl, input);
+  }
+  if (!res.ok) {
+    throw new Error(
+      `eTreyser reported the removal finished, but the output video was not available to download (HTTP ${res.status}). ` +
+      'The GPU worker may have recycled the job before the file was served.',
+    );
+  }
+  const blob = await res.blob();
+  if (!blob.size) throw new Error('eTreyser returned an empty output video (0 bytes).');
+  return makePipelineOutput(URL.createObjectURL(blob), input);
+}
+
 function makePipelineOutput(outputUrl: string, input: GpuRemovalInput): PipelineOutput {
   return {
     finalUrl: outputUrl,
@@ -279,8 +304,10 @@ async function waitForRemovalOutput(options: {
   let outputUrl = getReadyOutputUrl(payload, baseUrl);
 
   if (outputUrl) {
+    onPhase?.('generating_preview', 96, 'Downloading the finished video...');
+    const result = await materializeOutput(outputUrl, input);
     onPhase?.('completed', 100, outputQuality === 'higher' ? 'AI removal complete in higher quality.' : 'AI removal complete at source quality.');
-    return makePipelineOutput(outputUrl, input);
+    return result;
   }
 
   const statusUrl = getStatusUrl(payload, baseUrl, statusPathPrefix);
@@ -305,8 +332,10 @@ async function waitForRemovalOutput(options: {
     outputUrl = getReadyOutputUrl(payload, baseUrl);
     if (phase === 'completed' || outputUrl) {
       if (!outputUrl) throw new Error('eTreyser completed but did not return an output URL.');
+      onPhase?.('generating_preview', 96, 'Downloading the finished video...');
+      const result = await materializeOutput(outputUrl, input);
       onPhase?.('completed', 100, outputQuality === 'higher' ? 'AI removal complete in higher quality.' : 'AI removal complete at source quality.');
-      return makePipelineOutput(outputUrl, input);
+      return result;
     }
   }
 
