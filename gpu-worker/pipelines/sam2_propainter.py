@@ -1,9 +1,14 @@
-"""Static-mask ProPainter pipeline for the Modal video eraser worker.
+"""Tracked-mask ProPainter pipeline for the Modal video eraser worker.
 
-This version targets fixed logo/watermark cleanup first. It prepares the
-uploaded mask as a static video mask, calls ProPainter, then restores the result
-back to the source video's resolution, frame rate, and audio. The frontend can
-request either source-quality export or a higher-quality/lower-compression MP4.
+The first production worker used a single static PNG mask for every frame,
+which is fine for logos but drifts badly for moving objects. This pipeline now
+uses the user-selected frame/time as the anchor, tracks the masked patch forward
+and backward with local template matching, writes a frame-wise mask folder, and
+passes that folder into ProPainter.
+
+It still preserves the source video's resolution, frame rate, and audio. If
+tracking confidence drops on a frame, the previous mask is reused instead of
+jumping to the wrong region.
 """
 
 from __future__ import annotations
@@ -59,6 +64,25 @@ def read_video_meta(input_video: Path) -> tuple[float, int, int]:
     if width <= 0 or height <= 0:
         raise RuntimeError("Could not read video dimensions")
     return fps, width, height
+
+
+def read_video_gray_frames(input_video: Path) -> list[np.ndarray]:
+    cap = cv2.VideoCapture(str(input_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video for tracking: {input_video}")
+
+    frames: list[np.ndarray] = []
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frames.append(gray)
+    cap.release()
+
+    if not frames:
+        raise RuntimeError("No frames could be read for mask tracking")
+    return frames
 
 
 def ffprobe_json(input_video: Path) -> dict:
@@ -135,7 +159,29 @@ def prepare_source_mp4(input_video: Path, source_mp4: Path) -> None:
         ])
 
 
-def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: int) -> None:
+def clean_int(value: str | None, fallback: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(round(float(str(value))))
+    except Exception:
+        parsed = fallback
+    return max(min(parsed, maximum), minimum)
+
+
+def selected_frame_index(fps: float, frame_count: int) -> int:
+    raw_index = os.environ.get("ERASER_SELECTED_FRAME_INDEX", "").strip()
+    raw_time = os.environ.get("ERASER_SELECTED_TIME", "").strip()
+
+    if raw_index:
+        return clean_int(raw_index, 0, 0, max(frame_count - 1, 0))
+
+    try:
+        seconds = float(raw_time or "0")
+        return clean_int(str(seconds * fps), 0, 0, max(frame_count - 1, 0))
+    except Exception:
+        return 0
+
+
+def read_mask_alpha(mask_path: Path, width: int, height: int) -> np.ndarray:
     raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
     if raw is None:
         raise RuntimeError(f"Could not read mask image: {mask_path}")
@@ -150,6 +196,10 @@ def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: 
     if alpha.shape[1] != width or alpha.shape[0] != height:
         alpha = cv2.resize(alpha, (width, height), interpolation=cv2.INTER_NEAREST)
 
+    return alpha
+
+
+def clean_remove_mask(alpha: np.ndarray, width: int, height: int) -> np.ndarray:
     mask = (alpha > 24).astype(np.uint8) * 255
     bbox = mask_bbox(mask)
     if bbox is None:
@@ -160,9 +210,9 @@ def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: 
     box_h = y2 - y1 + 1
     min_side = min(width, height)
 
-    # Fixed logo/static-mark path: keep it local but make sure the full mark is
-    # covered. ProPainter handles the fill; this just defines the remove area.
-    pad = max(4, min(24, int(max(box_w, box_h) * 0.22)))
+    # Cover the whole marked object, not just the exact brush stroke. This is
+    # intentionally conservative because ProPainter needs a full remove region.
+    pad = max(4, min(28, int(max(box_w, box_h) * 0.25)))
     kernel_size = max(3, min(19, int(min_side * 0.008)))
     if kernel_size % 2 == 0:
         kernel_size += 1
@@ -180,7 +230,123 @@ def prepare_static_mask(mask_path: Path, output_mask: Path, width: int, height: 
 
     clipped = np.zeros_like(mask)
     clipped[y1 : y2 + 1, x1 : x2 + 1] = mask[y1 : y2 + 1, x1 : x2 + 1]
-    cv2.imwrite(str(output_mask), clipped)
+    return clipped
+
+
+def expand_bbox(bbox: tuple[int, int, int, int], width: int, height: int, ratio: float = 0.45) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    box_w = x2 - x1 + 1
+    box_h = y2 - y1 + 1
+    pad = max(8, int(max(box_w, box_h) * ratio))
+    return max(0, x1 - pad), max(0, y1 - pad), min(width - 1, x2 + pad), min(height - 1, y2 + pad)
+
+
+def crop(gray: np.ndarray, bbox: tuple[int, int, int, int]) -> np.ndarray:
+    x1, y1, x2, y2 = bbox
+    return gray[y1 : y2 + 1, x1 : x2 + 1]
+
+
+def shift_mask(mask: np.ndarray, dx: int, dy: int, width: int, height: int) -> np.ndarray:
+    if dx == 0 and dy == 0:
+        return mask.copy()
+    matrix = np.float32([[1, 0, dx], [0, 1, dy]])
+    return cv2.warpAffine(mask, matrix, (width, height), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def track_next_mask(
+    prev_frame: np.ndarray,
+    next_frame: np.ndarray,
+    prev_mask: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, float]:
+    bbox = mask_bbox(prev_mask)
+    if bbox is None:
+        return prev_mask.copy(), 0.0
+
+    template_bbox = expand_bbox(bbox, width, height, ratio=0.45)
+    template = crop(prev_frame, template_bbox)
+    if template.shape[0] < 6 or template.shape[1] < 6:
+        return prev_mask.copy(), 0.0
+
+    x1, y1, x2, y2 = template_bbox
+    template_w = x2 - x1 + 1
+    template_h = y2 - y1 + 1
+    motion_radius = max(32, min(260, int(max(template_w, template_h) * 1.15)))
+
+    sx1 = max(0, x1 - motion_radius)
+    sy1 = max(0, y1 - motion_radius)
+    sx2 = min(width - 1, x2 + motion_radius)
+    sy2 = min(height - 1, y2 + motion_radius)
+    search = next_frame[sy1 : sy2 + 1, sx1 : sx2 + 1]
+
+    if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
+        return prev_mask.copy(), 0.0
+
+    # Stabilize contrast. This improves tracking on dark phone videos and clips
+    # with soft compression, without adding extra dependencies.
+    template_eq = cv2.equalizeHist(template)
+    search_eq = cv2.equalizeHist(search)
+
+    result = cv2.matchTemplate(search_eq, template_eq, cv2.TM_CCOEFF_NORMED)
+    _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+    if not np.isfinite(max_val) or max_val < 0.14:
+        return prev_mask.copy(), float(max_val if np.isfinite(max_val) else 0.0)
+
+    new_x1 = sx1 + max_loc[0]
+    new_y1 = sy1 + max_loc[1]
+    dx = int(round(new_x1 - x1))
+    dy = int(round(new_y1 - y1))
+
+    # Prevent one bad match from jumping across the clip.
+    max_step = max(24, int(max(template_w, template_h) * 1.35))
+    dx = max(-max_step, min(max_step, dx))
+    dy = max(-max_step, min(max_step, dy))
+    return shift_mask(prev_mask, dx, dy, width, height), float(max_val)
+
+
+def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
+    frames = read_video_gray_frames(source_mp4)
+    alpha = read_mask_alpha(input_mask, width, height)
+    base_mask = clean_remove_mask(alpha, width, height)
+    anchor = selected_frame_index(fps, len(frames))
+
+    masks: list[np.ndarray | None] = [None] * len(frames)
+    masks[anchor] = base_mask
+
+    scores: list[float] = []
+
+    # Track forward from the selected frame.
+    prev_mask = base_mask
+    for idx in range(anchor + 1, len(frames)):
+        next_mask, score = track_next_mask(frames[idx - 1], frames[idx], prev_mask, width, height)
+        masks[idx] = next_mask
+        prev_mask = next_mask
+        scores.append(score)
+
+    # Track backward from the selected frame.
+    prev_mask = base_mask
+    for idx in range(anchor - 1, -1, -1):
+        next_mask, score = track_next_mask(frames[idx + 1], frames[idx], prev_mask, width, height)
+        masks[idx] = next_mask
+        prev_mask = next_mask
+        scores.append(score)
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for idx, mask in enumerate(masks):
+        if mask is None:
+            mask = base_mask
+        cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
+
+    avg_score = sum(scores) / len(scores) if scores else 1.0
+    print(
+        f"Tracked remove mask sequence: frames={len(frames)} anchor={anchor} avg_match={avg_score:.3f} dir={output_dir}",
+        flush=True,
+    )
+    return output_dir
 
 
 def processing_size(width: int, height: int, quality: str, max_side_cap: int | None = None) -> tuple[int, int]:
@@ -289,7 +455,7 @@ def is_cuda_oom(message: str) -> bool:
     return "out of memory" in lowered or "outofmemoryerror" in lowered
 
 
-def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
+def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
         raise RuntimeError(
@@ -321,7 +487,7 @@ def run_propainter(source_mp4: Path, mask_png: Path, result_root: Path, width: i
             "--video",
             str(source_mp4),
             "--mask",
-            str(mask_png),
+            str(mask_path),
             "--output",
             str(result_root),
             "--height",
@@ -370,13 +536,13 @@ def main() -> None:
 
     work_dir = output_video.parent
     source_mp4 = work_dir / "source_for_propainter.mp4"
-    mask_png = work_dir / "static_remove_mask.png"
+    mask_dir = work_dir / "tracked_remove_masks"
     result_root = work_dir / "propainter_results"
 
     prepare_source_mp4(input_video, source_mp4)
     fps, width, height = read_video_meta(source_mp4)
-    prepare_static_mask(input_mask, mask_png, width, height)
-    inpainted = run_propainter(source_mp4, mask_png, result_root, width, height, output_quality)
+    tracked_masks = build_tracked_masks(source_mp4, input_mask, mask_dir, fps, width, height)
+    inpainted = run_propainter(source_mp4, tracked_masks, result_root, width, height, output_quality)
     mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
 
     if not output_video.exists() or output_video.stat().st_size <= 0:
