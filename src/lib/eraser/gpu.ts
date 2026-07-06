@@ -123,15 +123,24 @@ function getRemoteJobId(payload: WorkerJobResponse): string {
   return payload.jobId || payload.job_id || payload.id || '';
 }
 
-function getOutputUrl(payload: WorkerJobResponse, baseUrl: string): string {
-  // Prefer explicit composite/full-video fields: the worker's generic
-  // outputUrl has been known to point at raw patch artifacts.
+function strictOutputUrl(payload: WorkerJobResponse, baseUrl: string): string {
+  // Explicit composite/full-video fields are only populated once the pipeline
+  // has actually written the finished video.
   const raw = payload.finalCompositeUrl || payload.final_composite_url
     || payload.compositeOutputUrl || payload.composite_output_url
     || payload.fullVideoUrl || payload.full_video_url
-    || payload.finalOutputUrl || payload.final_output_url
-    || payload.outputUrl || payload.output_url
-    || payload.previewUrl || payload.preview_url || '';
+    || payload.finalOutputUrl || payload.final_output_url || '';
+  return raw ? absoluteUrl(baseUrl, raw) : '';
+}
+
+function getReadyOutputUrl(payload: WorkerJobResponse, baseUrl: string): string {
+  const strict = strictOutputUrl(payload, baseUrl);
+  if (strict) return strict;
+  // The worker pre-fills the generic outputUrl on job creation, before the
+  // file exists (it 404s with "Output not ready" until then). Only trust the
+  // loose fields once the job reports completed.
+  if (normalizePhase(payload) !== 'completed') return '';
+  const raw = payload.outputUrl || payload.output_url || payload.previewUrl || payload.preview_url || '';
   return raw ? absoluteUrl(baseUrl, raw) : '';
 }
 
@@ -267,7 +276,7 @@ async function waitForRemovalOutput(options: {
   const { outputQuality = 'source', cancelRef, onPhase } = input;
   let payload = options.initialPayload;
   let remoteJobId = getRemoteJobId(payload);
-  let outputUrl = getOutputUrl(payload, baseUrl);
+  let outputUrl = getReadyOutputUrl(payload, baseUrl);
 
   if (outputUrl) {
     onPhase?.('completed', 100, outputQuality === 'higher' ? 'AI removal complete in higher quality.' : 'AI removal complete at source quality.');
@@ -293,7 +302,7 @@ async function waitForRemovalOutput(options: {
 
     if (phase === 'failed') throw new Error(payload.error || payload.error_message || payload.statusMessage || payload.status_message || 'AI video removal failed.');
 
-    outputUrl = getOutputUrl(payload, baseUrl);
+    outputUrl = getReadyOutputUrl(payload, baseUrl);
     if (phase === 'completed' || outputUrl) {
       if (!outputUrl) throw new Error('eTreyser completed but did not return an output URL.');
       onPhase?.('completed', 100, outputQuality === 'higher' ? 'AI removal complete in higher quality.' : 'AI removal complete at source quality.');
