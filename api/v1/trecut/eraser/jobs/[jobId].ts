@@ -1,5 +1,5 @@
-import { error, handleOptions, json, methodNotAllowed } from '../../../../_lib/http';
-import { fetchTreyVideoRemovalApi, readUpstreamJson, rewriteVideoRemovalJobPayload } from '../../../../_lib/trecut-eraser-proxy';
+import { error, handleOptions, json, methodNotAllowed } from '../../../../_lib/http.js';
+import { fetchTreyVideoRemovalApi, readUpstreamJson, rewriteVideoRemovalJobPayload } from '../../../../_lib/trecut-eraser-proxy.js';
 
 export default async function handler(req: any, res: any) {
   if (handleOptions(req, res)) return;
