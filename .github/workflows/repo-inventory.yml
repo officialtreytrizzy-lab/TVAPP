@@ -1,0 +1,28 @@
+name: Repo Inventory
+
+on:
+  push:
+    branches:
+      - fix/vercel-function-limit
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: List deployment files
+        run: |
+          {
+            echo "API FILES"
+            find api -type f -print 2>/dev/null | sort
+            echo
+            echo "VERCEL CONFIG"
+            find . -maxdepth 2 -type f \( -name 'vercel.json' -o -name 'package.json' -o -name 'vite.config.*' \) -print | sort
+          } | tee repo-inventory.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repo-inventory
+          path: repo-inventory.txt
