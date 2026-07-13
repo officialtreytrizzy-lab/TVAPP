@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/vercel-function-limit
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
