@@ -1,5 +1,5 @@
-import { error, handleOptions, json, methodNotAllowed } from '../../../_lib/http.js';
-import { modalBaseUrl } from '../../../_lib/modal.js';
+import { error, handleOptions, json, methodNotAllowed } from '../../../../_lib/http.js';
+import { modalBaseUrl } from '../../../../_lib/modal.js';
 
 const DEFAULT_WORKER_BASE = 'https://californiatrey--tvapp-video-eraser-gpu-fastapi-app.modal.run';
 
