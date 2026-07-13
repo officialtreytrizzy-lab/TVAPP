@@ -20,3 +20,12 @@ jobs:
 
       - name: Check locked contracts
         run: npm run check:contracts
+
+      - name: Compile eraser Python entrypoints
+        run: |
+          python -m py_compile \
+            gpu-worker/pipelines/sam2_propainter.py \
+            gpu-worker/pipelines/sam2_propainter_resilient.py \
+            gpu-worker/pipelines/sam2_propainter_verified.py \
+            gpu-worker/main.py \
+            gpu-worker/modal_app.py
