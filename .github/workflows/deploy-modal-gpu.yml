@@ -7,6 +7,12 @@ on:
     paths:
       - "gpu-worker/**"
       - ".github/workflows/deploy-modal-gpu.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "gpu-worker/**"
+      - ".github/workflows/deploy-modal-gpu.yml"
   workflow_dispatch:
 
 concurrency:
@@ -15,6 +21,7 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.event_name != 'pull_request' || github.head_ref == 'ops/modal-gpu-deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
