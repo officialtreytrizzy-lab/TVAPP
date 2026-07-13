@@ -13,6 +13,7 @@ const requiredFiles = [
   'gpu-worker/main.py',
   'gpu-worker/pipelines/sam2_propainter.py',
   'gpu-worker/pipelines/sam2_propainter_resilient.py',
+  'gpu-worker/pipelines/sam2_propainter_verified.py',
   'gpu-worker/requirements.txt',
 ];
 
@@ -81,7 +82,7 @@ requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'worker must request a real
 requireText('gpu-worker/modal_app.py', 'max_containers=1', 'status polling depends on single-container state until durable storage is added');
 requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'ProPainter jobs must not run concurrently in one container');
 requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'ProPainter jobs need enough time for video inpainting');
-requireText('gpu-worker/modal_app.py', 'sam2_propainter_resilient.py', 'Modal must execute the resilient production entrypoint');
+requireText('gpu-worker/modal_app.py', 'sam2_propainter_verified.py', 'Modal must execute the exact-selection verified production entrypoint');
 
 // Worker command and API contract.
 requireText('gpu-worker/main.py', 'python /app/pipelines/sam2_propainter.py', 'worker must retain a safe core default outside Modal');
@@ -112,6 +113,13 @@ requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'Final ProPaint
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'using tracked fallback', 'non-OOM ProPainter failures must also produce a moving fallback result');
 forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(480, "8", "1"', 'neighbor_length=1 creates a zero range step in upstream ProPainter');
 
+// Exact-selection acceptance invariants. A playable moving result is still a failure when the marked spot remains.
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_selection_changed', 'the selected frame must be checked directly, not inferred from unrelated sample frames');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'SelectionNotRemovedError', 'unchanged selections must fail instead of being reported as complete');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'build_stronger_masks', 'the fallback must expand tracked masks when normal inpainting misses the selected edges');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'Final verified fallback output', 'the final muxed MP4 must pass exact-selection verification');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'ERASER_ANCHOR_MIN_CHANGED_RATIO', 'selection-change sensitivity must remain configurable');
+
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');
 requireText('gpu-worker/requirements.txt', 'numpy', 'mask preparation uses NumPy');
 
@@ -121,4 +129,4 @@ if (checks.length) {
   process.exit(1);
 }
 
-console.log('Eraser contract check passed. Proxy security, locked SAM2/ProPainter behavior, resilient fallbacks, liveness validation, quality controls, and frontend bridge are intact.');
+console.log('Eraser contract check passed. Proxy security, locked SAM2/ProPainter behavior, resilient fallbacks, frozen-video checks, exact-selection verification, quality controls, and frontend bridge are intact.');
