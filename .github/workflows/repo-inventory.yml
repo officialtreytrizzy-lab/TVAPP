@@ -1,9 +1,9 @@
 name: Consolidate Vercel Functions
 
 on:
-  push:
+  pull_request:
     branches:
-      - fix/vercel-function-limit
+      - main
 
 permissions:
   contents: write
