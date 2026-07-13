@@ -20,7 +20,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  modal-auth:
+    if: github.event_name != 'pull_request' || github.head_ref == 'ops/modal-gpu-deploy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install Modal CLI quietly
+        run: python -m pip install --quiet --upgrade modal
+
+      - name: Validate Modal token
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          test -n "$MODAL_TOKEN_ID" || (echo "Missing repository secret MODAL_TOKEN_ID" && exit 1)
+          test -n "$MODAL_TOKEN_SECRET" || (echo "Missing repository secret MODAL_TOKEN_SECRET" && exit 1)
+          set +e
+          output="$(modal token info 2>&1)"
+          code=$?
+          printf '%s\n' "$output" | tail -n 20
+          exit $code
+
   deploy:
+    needs: modal-auth
     if: github.event_name != 'pull_request' || github.head_ref == 'ops/modal-gpu-deploy'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -38,28 +60,7 @@ jobs:
           cache: pip
 
       - name: Install Modal CLI
-        run: python -m pip install --upgrade modal
-
-      - name: Check MODAL_TOKEN_ID
-        continue-on-error: true
-        env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-        run: test -n "$MODAL_TOKEN_ID"
-
-      - name: Check MODAL_TOKEN_SECRET
-        continue-on-error: true
-        env:
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-        run: test -n "$MODAL_TOKEN_SECRET"
-
-      - name: Verify Modal credentials
-        env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
-        run: |
-          test -n "$MODAL_TOKEN_ID" || (echo "Missing repository secret MODAL_TOKEN_ID" && exit 1)
-          test -n "$MODAL_TOKEN_SECRET" || (echo "Missing repository secret MODAL_TOKEN_SECRET" && exit 1)
-          modal token info
+        run: python -m pip install --quiet --upgrade modal
 
       - name: Deploy A10G worker
         env:
