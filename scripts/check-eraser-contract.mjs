@@ -5,10 +5,11 @@ const requiredFiles = [
   'src/components/eraser/Editor.tsx',
   'src/components/eraser/ProcessingPanel.tsx',
   'api/_lib/trecut-eraser-proxy.ts',
-  'api/v1/trecut/eraser/jobs.ts',
-  'api/v1/trecut/eraser/jobs/[jobId].ts',
-  'api/v1/trecut/eraser/jobs/[jobId]/output.ts',
-  'api/v1/trecut/eraser/upload-target.ts',
+  'api/v1/trecut/eraser/[...path].ts',
+  'api/v1/trecut/eraser/_handlers/jobs.ts',
+  'api/v1/trecut/eraser/_handlers/job.ts',
+  'api/v1/trecut/eraser/_handlers/output.ts',
+  'api/v1/trecut/eraser/_handlers/upload-target.ts',
   'gpu-worker/modal_app.py',
   'gpu-worker/main.py',
   'gpu-worker/pipelines/sam2_propainter.py',
@@ -58,12 +59,12 @@ forbidText('src/lib/eraser/gpu.ts', 'VITE_ERASER_GPU_API_KEY', 'the generated eT
 requireText('api/_lib/trecut-eraser-proxy.ts', 'TRECUT_ETREYSER_API_KEY', 'server proxy must read the generated eTreyser API key from server env');
 requireText('api/_lib/trecut-eraser-proxy.ts', 'Authorization', 'server proxy must attach the bearer token to licensed API calls');
 requireText('api/_lib/trecut-eraser-proxy.ts', 'rewriteVideoRemovalJobPayload', 'server proxy must rewrite protected API URLs back to proxy URLs');
-requireText('api/v1/trecut/eraser/jobs.ts', 'submitRemovalToModal', 'Trecut create endpoint must submit jobs to the first-party GPU worker');
-requireText('api/v1/trecut/eraser/jobs/[jobId].ts', 'readModalStatus', 'Trecut status endpoint must read status from the first-party GPU worker');
-requireText('api/v1/trecut/eraser/jobs/[jobId]/output.ts', 'modalCompositeOutputFromPayload', 'Trecut output endpoint must only stream the strict composite output');
+requireText('api/v1/trecut/eraser/_handlers/jobs.ts', 'submitRemovalToModal', 'Trecut create endpoint must submit jobs to the first-party GPU worker');
+requireText('api/v1/trecut/eraser/_handlers/job.ts', 'readModalStatus', 'Trecut status endpoint must read status from the first-party GPU worker');
+requireText('api/v1/trecut/eraser/_handlers/output.ts', 'modalCompositeOutputFromPayload', 'Trecut output endpoint must only stream the strict composite output');
 
 // Large uploads must not flow through Vercel functions (~4.5MB FUNCTION_PAYLOAD_TOO_LARGE limit).
-requireText('api/v1/trecut/eraser/upload-target.ts', 'modalBaseUrl', 'upload-target must resolve the GPU worker from server env');
+requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'modalBaseUrl', 'upload-target must resolve the GPU worker from server env');
 requireText('src/lib/eraser/gpu.ts', 'upload-target', 'frontend must discover the direct GPU upload URL to bypass the ~4.5MB Vercel payload limit');
 requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'frontend must size-guard the legacy base64 relay fallback');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'PYTORCH_CUDA_ALLOC_CONF', 'ProPainter must run with the expandable-segments allocator to reduce CUDA OOMs');

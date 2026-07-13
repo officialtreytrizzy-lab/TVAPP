@@ -1,6 +1,6 @@
-import { requireApiKey } from '../../../../_lib/auth.js';
-import { error, handleOptions, methodNotAllowed } from '../../../../_lib/http.js';
-import { absoluteModalUrl, getRememberedJob, modalAiRemixOutputFromPayload, modalAiRemixStatusUrl, readModalStatus } from '../../../../_lib/modal.js';
+import { requireApiKey } from '../../../_lib/auth.js';
+import { error, handleOptions, methodNotAllowed } from '../../../_lib/http.js';
+import { absoluteModalUrl, getRememberedJob, modalAiRemixOutputFromPayload, modalAiRemixStatusUrl, readModalStatus } from '../../../_lib/modal.js';
 
 function normalizeJobStatus(value: unknown): string {
   const status = String(value || '').toLowerCase();

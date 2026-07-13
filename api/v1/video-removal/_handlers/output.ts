@@ -1,5 +1,6 @@
-import { error, handleOptions, methodNotAllowed } from '../../../../../_lib/http.js';
-import { absoluteModalUrl, getRememberedJob, modalCompositeOutputFromPayload, modalJobStatusUrl, readModalStatus } from '../../../../../_lib/modal.js';
+import { requireApiKey } from '../../../_lib/auth.js';
+import { error, handleOptions, methodNotAllowed } from '../../../_lib/http.js';
+import { absoluteModalUrl, getRememberedJob, modalCompositeOutputFromPayload, modalJobStatusUrl, readModalStatus } from '../../../_lib/modal.js';
 
 function normalizeJobStatus(value: unknown): string {
   const status = String(value || '').toLowerCase();
@@ -13,6 +14,7 @@ export default async function handler(req: any, res: any) {
   if (req.method !== 'GET') return methodNotAllowed(res, ['GET']);
 
   try {
+    requireApiKey(req, 'video_removal:read');
     const jobId = String(req.query.jobId || '');
     const record = getRememberedJob(jobId);
     const externalJobId = record?.external_job_id || jobId;
@@ -22,15 +24,15 @@ export default async function handler(req: any, res: any) {
     try {
       modal = await readModalStatus(statusUrl);
     } catch {
-      return error(res, 404, 'Could not read first-party eTreyser worker status for this removal job.', 'etreyser_worker_status_not_found');
+      return error(res, 404, 'Could not read ETreyser worker status for this removal job.', 'worker_status_not_found');
     }
 
     const status = normalizeJobStatus(modal.phase || modal.status);
     const preferred = modalCompositeOutputFromPayload(modal);
     if (!preferred) {
       const message = status === 'completed'
-        ? 'eTreyser finished but only exposed a raw blob/patch output, not a full erased video.'
-        : 'eTreyser composite output is not ready yet.';
+        ? 'ETreyser finished but only exposed a raw blob/patch output, not a full erased video.'
+        : 'ETreyser composite output is not ready yet.';
       return error(res, status === 'completed' ? 502 : 202, message, status === 'completed' ? 'raw_blob_only' : 'composite_not_ready');
     }
 
@@ -42,7 +44,7 @@ export default async function handler(req: any, res: any) {
 
     const contentType = upstream.headers.get('content-type') || 'video/mp4';
     if (!contentType.toLowerCase().startsWith('video/') && contentType.toLowerCase() !== 'application/octet-stream') {
-      return error(res, 502, `eTreyser composite output was not video content (${contentType}).`, 'invalid_composite_content_type');
+      return error(res, 502, `ETreyser composite output was not video content (${contentType}).`, 'invalid_composite_content_type');
     }
 
     res.setHeader('Content-Type', contentType === 'application/octet-stream' ? 'video/mp4' : contentType);
@@ -52,6 +54,6 @@ export default async function handler(req: any, res: any) {
     res.status(200).send(buffer);
   } catch (e) {
     const err = e as any;
-    error(res, err.status || 500, err.message || 'Could not read first-party eTreyser output.', err.code || 'etreyser_first_party_output_failed');
+    error(res, err.status || 500, err.message || 'Could not read video-removal output.', err.code || 'video_removal_output_failed');
   }
 }
