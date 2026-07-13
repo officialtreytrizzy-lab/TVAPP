@@ -1,34 +1,32 @@
-name: Repo Inventory
+name: Consolidate Vercel Functions
 
 on:
   push:
     branches:
       - fix/vercel-function-limit
-  pull_request:
-    branches:
-      - main
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  inventory:
+  consolidate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: List deployment files
-        run: |
-          {
-            echo "API FILES"
-            find api -type f -print 2>/dev/null | sort
-            echo
-            echo "VERCEL CONFIG"
-            find . -maxdepth 2 -type f \( -name 'vercel.json' -o -name 'package.json' -o -name 'vite.config.*' \) -print | sort
-          } | tee repo-inventory.txt
-          tar -czf deployment-source.tar.gz api package.json vercel.json tsconfig.json tsconfig.app.json tsconfig.node.json 2>/dev/null || tar -czf deployment-source.tar.gz api package.json vercel.json
-      - uses: actions/upload-artifact@v4
         with:
-          name: repo-inventory
-          path: |
-            repo-inventory.txt
-            deployment-source.tar.gz
+          ref: fix/vercel-function-limit
+      - name: Consolidate API routes
+        run: python scripts/consolidate-vercel-functions.py
+      - name: Verify contracts
+        run: npm run check:contracts
+      - name: Commit consolidated routes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Consolidate Vercel API functions"
+          git push origin HEAD:fix/vercel-function-limit
