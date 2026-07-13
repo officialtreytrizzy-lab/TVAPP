@@ -13,9 +13,36 @@ const PHASE_LABEL: Record<string, string> = {
   attaching_audio: 'Reattaching audio',
   generating_preview: 'Exporting',
   completed: 'Completed',
-  failed: 'Failed',
+  failed: 'Needs attention',
   cancelled: 'Cancelled',
 };
+
+const TECHNICAL_ERROR_PATTERN = /traceback|userwarning|importerror|subprocess|pipeline exited|sam2|propainter|frame loading|propagate in video|file\s+"[^"]+\.py"|\/(?:opt|app|tmp)\/|\.py:\d+|\d+\/\d+\s+\[[^\]]*<[^\]]*\]/i;
+
+function userFacingProcessingError(rawError: string): string {
+  const raw = String(rawError || '').trim();
+  const normalized = raw.replace(/\s+/g, ' ').trim();
+
+  if (!normalized) return 'The removal could not be completed. Please try again.';
+
+  if (/timed out|timeout/i.test(normalized)) {
+    return 'The removal took too long to finish. Try a shorter clip or a smaller selection.';
+  }
+
+  if (/failed to fetch|networkerror|load failed|worker unavailable|http\s+(502|503|504)/i.test(normalized)) {
+    return 'The AI processor is temporarily unavailable. Please try again in a moment.';
+  }
+
+  if (/output.*(not available|empty|0 bytes|missing|playable)/i.test(normalized)) {
+    return 'The edit finished, but the output video could not be prepared. Please try again.';
+  }
+
+  if (raw.includes('\n') || raw.length > 280 || TECHNICAL_ERROR_PATTERN.test(raw)) {
+    return 'The AI processor stopped before it could finish the edit. Try again with a shorter clip or a tighter mask.';
+  }
+
+  return normalized.length > 220 ? `${normalized.slice(0, 217)}...` : normalized;
+}
 
 interface Props {
   phase: string;
@@ -44,6 +71,8 @@ export default function ProcessingPanel({
   const done = phase === 'completed' && finalUrl;
   const usingGpu = /gpu/i.test(processingMode);
   const displayProgress = usingGpu && processing && phase === 'segmenting' && progress <= 22 ? 20 : progress;
+  const displayStatusMessage = phase === 'failed' ? 'Removal could not be completed.' : statusMessage;
+  const displayError = error ? userFacingProcessingError(error) : null;
 
   return (
     <div className="space-y-4 rounded-xl bg-slate-900/70 p-4 ring-1 ring-slate-800">
@@ -90,7 +119,7 @@ export default function ProcessingPanel({
       {(processing || displayProgress > 0) && phase !== 'awaiting_mask' && (
         <div>
           <div className="mb-1 flex justify-between text-xs text-slate-400">
-            <span>{statusMessage}</span>
+            <span>{displayStatusMessage}</span>
             <span className="font-mono text-slate-300">{Math.round(displayProgress)}%</span>
           </div>
           <div className="h-2.5 w-full overflow-hidden rounded-full bg-slate-800">
@@ -100,9 +129,10 @@ export default function ProcessingPanel({
         </div>
       )}
 
-      {error && (
+      {displayError && (
         <div className="flex items-start gap-2 rounded-lg bg-red-500/10 p-3 text-sm text-red-300">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /> <span>{error}</span>
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="break-words">{displayError}</span>
         </div>
       )}
 
