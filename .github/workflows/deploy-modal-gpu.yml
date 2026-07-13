@@ -40,6 +40,18 @@ jobs:
       - name: Install Modal CLI
         run: python -m pip install --upgrade modal
 
+      - name: Check MODAL_TOKEN_ID
+        continue-on-error: true
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+        run: test -n "$MODAL_TOKEN_ID"
+
+      - name: Check MODAL_TOKEN_SECRET
+        continue-on-error: true
+        env:
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: test -n "$MODAL_TOKEN_SECRET"
+
       - name: Verify Modal credentials
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
