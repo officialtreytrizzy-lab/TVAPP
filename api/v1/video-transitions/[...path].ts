@@ -5,7 +5,14 @@ import readOutput from './_handlers/output.js';
 
 function routeSegment(req: any): string {
   const value = req.query?.path;
-  return String(Array.isArray(value) ? value[0] || '' : value || '');
+  const querySegment = String(Array.isArray(value) ? value[0] || '' : value || '').split('/').filter(Boolean)[0];
+  if (querySegment) return querySegment;
+
+  const pathname = String(req.url || '').split('?')[0];
+  const marker = '/api/v1/video-transitions/';
+  const markerIndex = pathname.indexOf(marker);
+  const remainder = markerIndex >= 0 ? pathname.slice(markerIndex + marker.length) : '';
+  return decodeURIComponent(remainder.split('/').filter(Boolean)[0] || '');
 }
 
 export default async function handler(req: any, res: any) {
