@@ -33,7 +33,6 @@ worker_image = (
         "python - <<'PY'\nfrom pathlib import Path\nimport site\nfor site_dir in site.getsitepackages():\n    path = Path(site_dir) / 'basicsr' / 'data' / 'degradations.py'\n    if path.exists():\n        text = path.read_text()\n        text = text.replace('from torchvision.transforms.functional_tensor import rgb_to_grayscale', 'from torchvision.transforms.functional import rgb_to_grayscale')\n        path.write_text(text)\n        print(f'Patched basicsr torchvision import: {path}')\nPY",
         "mkdir -p /opt/realesrgan_weights && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\nweights = {\n    'RealESRGAN_x4plus.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',\n    'RealESRGAN_x4plus_anime_6B.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth',\n    'GFPGANv1.4.pth': 'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth',\n}\nroot = Path('/opt/realesrgan_weights')\nfor name, url in weights.items():\n    out = root / name\n    if not out.exists() or out.stat().st_size < 1000000:\n        print(f'Downloading {name}: {url}')\n        urlretrieve(url, out)\n    print(f'Ready {name}: {out.stat().st_size} bytes')\nPY",
     )
-    .env({"ERASER_PIPELINE_CMD": "python /app/pipelines/sam2_propainter_resilient.py"})
     .add_local_dir("gpu-worker", remote_path="/app")
 )
 
@@ -78,7 +77,9 @@ def download_models():
 @modal.concurrent(max_inputs=1)
 @modal.asgi_app()
 def fastapi_app():
+    import os
     import sys
+    os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_resilient.py"
     sys.path.insert(0, "/app")
     from main import app as fastapi_application
     return fastapi_application
