@@ -79,7 +79,7 @@ def download_models():
 def fastapi_app():
     import os
     import sys
-    os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_resilient.py"
+    os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_verified.py"
     sys.path.insert(0, "/app")
     from main import app as fastapi_application
     return fastapi_application
