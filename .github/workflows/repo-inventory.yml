@@ -25,7 +25,10 @@ jobs:
             echo "VERCEL CONFIG"
             find . -maxdepth 2 -type f \( -name 'vercel.json' -o -name 'package.json' -o -name 'vite.config.*' \) -print | sort
           } | tee repo-inventory.txt
+          tar -czf deployment-source.tar.gz api package.json vercel.json tsconfig.json tsconfig.app.json tsconfig.node.json 2>/dev/null || tar -czf deployment-source.tar.gz api package.json vercel.json
       - uses: actions/upload-artifact@v4
         with:
           name: repo-inventory
-          path: repo-inventory.txt
+          path: |
+            repo-inventory.txt
+            deployment-source.tar.gz
