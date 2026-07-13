@@ -77,7 +77,9 @@ def download_models():
 @modal.concurrent(max_inputs=1)
 @modal.asgi_app()
 def fastapi_app():
+    import os
     import sys
+    os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_resilient.py"
     sys.path.insert(0, "/app")
     from main import app as fastapi_application
     return fastapi_application

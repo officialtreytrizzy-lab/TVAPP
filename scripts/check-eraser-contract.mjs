@@ -12,6 +12,7 @@ const requiredFiles = [
   'gpu-worker/modal_app.py',
   'gpu-worker/main.py',
   'gpu-worker/pipelines/sam2_propainter.py',
+  'gpu-worker/pipelines/sam2_propainter_resilient.py',
   'gpu-worker/requirements.txt',
 ];
 
@@ -65,7 +66,7 @@ requireText('api/v1/trecut/eraser/upload-target.ts', 'modalBaseUrl', 'upload-tar
 requireText('src/lib/eraser/gpu.ts', 'upload-target', 'frontend must discover the direct GPU upload URL to bypass the ~4.5MB Vercel payload limit');
 requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'frontend must size-guard the legacy base64 relay fallback');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'PYTORCH_CUDA_ALLOC_CONF', 'ProPainter must run with the expandable-segments allocator to reduce CUDA OOMs');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'is_cuda_oom', 'ProPainter must retry at smaller processing sizes on CUDA OOM');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'is_cuda_oom', 'the locked core must retain CUDA OOM classification');
 
 requireText('src/components/eraser/Editor.tsx', 'runGpuRemoval', 'editor must call the AI removal bridge when configured');
 requireText('src/components/eraser/Editor.tsx', 'isGpuRemovalConfigured()', 'editor must choose AI proxy/worker vs browser fallback explicitly');
@@ -80,9 +81,10 @@ requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'worker must request a real
 requireText('gpu-worker/modal_app.py', 'max_containers=1', 'status polling depends on single-container state until durable storage is added');
 requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'ProPainter jobs must not run concurrently in one container');
 requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'ProPainter jobs need enough time for video inpainting');
+requireText('gpu-worker/modal_app.py', 'sam2_propainter_resilient.py', 'Modal must execute the resilient production entrypoint');
 
 // Worker command and API contract.
-requireText('gpu-worker/main.py', 'python /app/pipelines/sam2_propainter.py', 'worker must default to the checked-in pipeline script');
+requireText('gpu-worker/main.py', 'python /app/pipelines/sam2_propainter.py', 'worker must retain a safe core default outside Modal');
 requireText('gpu-worker/main.py', '@app.post("/v1/video-eraser/jobs")', 'frontend depends on this create-job endpoint');
 requireText('gpu-worker/main.py', '@app.get("/v1/video-eraser/jobs/{job_id}")', 'frontend polling depends on this status endpoint');
 requireText('gpu-worker/main.py', '@app.get("/v1/video-eraser/jobs/{job_id}/output")', 'frontend output playback depends on this endpoint');
@@ -91,16 +93,24 @@ requireText('gpu-worker/main.py', 'ERASER_PRESERVE_RESOLUTION', 'worker must pas
 requireText('gpu-worker/main.py', 'ERASER_PRESERVE_FPS', 'worker must pass source-FPS preservation through to the pipeline');
 requireText('gpu-worker/main.py', 'ERASER_PRESERVE_AUDIO', 'worker must pass audio preservation through to the pipeline');
 
-// ProPainter static-mask pipeline invariants.
+// Locked SAM2/ProPainter core invariants.
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'PROPAINTER_ROOT', 'pipeline must locate the ProPainter installation');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'inference_propainter.py', 'pipeline must call ProPainter inference, not the old smoke test');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'prepare_static_mask', 'static logo/watermark removal path must remain available');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'build_static_masks', 'static logo/watermark removal path must remain available');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'mask_dilation', 'mask dilation must be controlled by ProPainter call');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'mux_audio', 'final output must preserve original audio when possible');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'scale={out_w}:{out_h}:flags=lanczos', 'final output must be restored to source dimensions');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'fps={fps:.6f}', 'final output must be restored to source frame rate');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_OUTPUT_QUALITY', 'pipeline must honor source/higher output quality');
 forbidText('gpu-worker/pipelines/sam2_propainter.py', 'Smoke-test pipeline', 'do not regress to unchanged-video smoke test');
+
+// Production resilience invariants for the exact failures seen on mobile.
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'allow_empty=True', 'an empty SAM2 frame must not abort the entire track');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'propainter_attempts', 'ProPainter must retry with progressively smaller valid windows');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'validate_video_liveness', 'every candidate and final output must be checked for frozen video');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'Final ProPainter composite was invalid', 'a frozen final composite must be rebuilt from source frames');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'using tracked fallback', 'non-OOM ProPainter failures must also produce a moving fallback result');
+forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(480, "8", "1"', 'neighbor_length=1 creates a zero range step in upstream ProPainter');
 
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');
 requireText('gpu-worker/requirements.txt', 'numpy', 'mask preparation uses NumPy');
@@ -111,4 +121,4 @@ if (checks.length) {
   process.exit(1);
 }
 
-console.log('Eraser contract check passed. Trecut proxy, server-side eTreyser API key handling, GPU worker, quality controls, and frontend bridge are intact.');
+console.log('Eraser contract check passed. Proxy security, locked SAM2/ProPainter behavior, resilient fallbacks, liveness validation, quality controls, and frontend bridge are intact.');
