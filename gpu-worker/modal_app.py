@@ -1,4 +1,6 @@
+import os
 import subprocess
+
 import modal
 
 # Deploy with:
@@ -33,10 +35,48 @@ worker_image = (
         "python - <<'PY'\nfrom pathlib import Path\nimport site\nfor site_dir in site.getsitepackages():\n    path = Path(site_dir) / 'basicsr' / 'data' / 'degradations.py'\n    if path.exists():\n        text = path.read_text()\n        text = text.replace('from torchvision.transforms.functional_tensor import rgb_to_grayscale', 'from torchvision.transforms.functional import rgb_to_grayscale')\n        path.write_text(text)\n        print(f'Patched basicsr torchvision import: {path}')\nPY",
         "mkdir -p /opt/realesrgan_weights && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\nweights = {\n    'RealESRGAN_x4plus.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',\n    'RealESRGAN_x4plus_anime_6B.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth',\n    'GFPGANv1.4.pth': 'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth',\n}\nroot = Path('/opt/realesrgan_weights')\nfor name, url in weights.items():\n    out = root / name\n    if not out.exists() or out.stat().st_size < 1000000:\n        print(f'Downloading {name}: {url}')\n        urlretrieve(url, out)\n    print(f'Ready {name}: {out.stat().st_size} bytes')\nPY",
     )
+    # Some third-party requirements can replace the CUDA-enabled torch wheel.
+    # Reinstall the exact CUDA build last so the deployed worker cannot silently
+    # fall back to a CPU-only PyTorch package.
+    .pip_install(
+        "torch==2.5.1+cu121",
+        "torchvision==0.20.1+cu121",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .run_commands(
+        "python - <<'PY'\nimport torch\nif torch.version.cuda is None:\n    raise RuntimeError(f'CPU-only PyTorch wheel installed: torch={torch.__version__}')\nprint(f'CUDA PyTorch image verified: torch={torch.__version__} cuda_build={torch.version.cuda}')\nPY",
+    )
     .add_local_dir("gpu-worker", remote_path="/app")
 )
 
 app = modal.App("tvapp-video-eraser-gpu")
+
+
+def require_gpu_runtime() -> dict[str, str | bool]:
+    """Refuse to start a worker that cannot actually see its assigned GPU."""
+    import torch
+
+    cuda_available = bool(torch.cuda.is_available())
+    if not cuda_available:
+        raise RuntimeError(
+            "TVAPP GPU worker started without CUDA. Refusing CPU fallback. "
+            f"torch={torch.__version__} cuda_build={torch.version.cuda} "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        )
+
+    device_name = torch.cuda.get_device_name(0)
+    details = {
+        "cuda_available": True,
+        "device": device_name,
+        "torch": str(torch.__version__),
+        "cuda_build": str(torch.version.cuda),
+    }
+    print(
+        "TVAPP GPU runtime verified: "
+        f"device={device_name} torch={torch.__version__} cuda_build={torch.version.cuda}",
+        flush=True,
+    )
+    return details
 
 
 @app.function(
@@ -77,11 +117,20 @@ def download_models():
 @modal.concurrent(max_inputs=1)
 @modal.asgi_app()
 def fastapi_app():
-    import os
     import sys
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["ERASER_REQUIRE_CUDA"] = "true"
     os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_verified.py"
+    gpu_details = require_gpu_runtime()
+
     sys.path.insert(0, "/app")
     from main import app as fastapi_application
+
+    @fastapi_application.get("/gpu-health", include_in_schema=False)
+    async def gpu_health():
+        return {"ok": True, "worker": "tvapp-video-eraser-gpu", **gpu_details}
+
     return fastapi_application
 
 
@@ -96,6 +145,15 @@ def fastapi_app():
 @modal.asgi_app()
 def image_enhancer_app():
     import sys
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    gpu_details = require_gpu_runtime()
+
     sys.path.insert(0, "/app")
     from image_enhancer_app import app as fastapi_application
+
+    @fastapi_application.get("/gpu-health", include_in_schema=False)
+    async def gpu_health():
+        return {"ok": True, "worker": "tvapp-image-enhancer-gpu", **gpu_details}
+
     return fastapi_application
