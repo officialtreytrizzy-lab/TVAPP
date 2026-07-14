@@ -1,3 +1,4 @@
+import os
 import subprocess
 import modal
 
@@ -21,6 +22,7 @@ worker_image = (
     .run_commands(
         "rm -rf /opt/ProPainter && git clone --depth 1 https://github.com/sczhou/ProPainter.git /opt/ProPainter",
         "pip install -r /opt/ProPainter/requirements.txt",
+        "mkdir -p /opt/ProPainter/weights && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\nweights = {\n    'raft-things.pth': 'https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth',\n    'recurrent_flow_completion.pth': 'https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth',\n    'ProPainter.pth': 'https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth',\n}\nroot = Path('/opt/ProPainter/weights')\nfor name, url in weights.items():\n    out = root / name\n    if not out.exists() or out.stat().st_size < 1000000:\n        print(f'Downloading {name}: {url}')\n        urlretrieve(url, out)\n    print(f'Ready {name}: {out.stat().st_size} bytes')\nPY",
         "rm -rf /opt/sam2 && git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2",
         "pip install -e /opt/sam2",
         "mkdir -p /opt/sam2_checkpoints && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\ncheckpoint = Path('/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt')\nurl = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt'\nif not checkpoint.exists() or checkpoint.stat().st_size < 1000000:\n    print(f'Downloading SAM2 checkpoint: {url}')\n    urlretrieve(url, checkpoint)\nprint(f'SAM2 checkpoint ready: {checkpoint} ({checkpoint.stat().st_size} bytes)')\nPY",
@@ -33,10 +35,29 @@ worker_image = (
         "python - <<'PY'\nfrom pathlib import Path\nimport site\nfor site_dir in site.getsitepackages():\n    path = Path(site_dir) / 'basicsr' / 'data' / 'degradations.py'\n    if path.exists():\n        text = path.read_text()\n        text = text.replace('from torchvision.transforms.functional_tensor import rgb_to_grayscale', 'from torchvision.transforms.functional import rgb_to_grayscale')\n        path.write_text(text)\n        print(f'Patched basicsr torchvision import: {path}')\nPY",
         "mkdir -p /opt/realesrgan_weights && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\nweights = {\n    'RealESRGAN_x4plus.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth',\n    'RealESRGAN_x4plus_anime_6B.pth': 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth',\n    'GFPGANv1.4.pth': 'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth',\n}\nroot = Path('/opt/realesrgan_weights')\nfor name, url in weights.items():\n    out = root / name\n    if not out.exists() or out.stat().st_size < 1000000:\n        print(f'Downloading {name}: {url}')\n        urlretrieve(url, out)\n    print(f'Ready {name}: {out.stat().st_size} bytes')\nPY",
     )
+    .pip_install(
+        "torch==2.5.1+cu121",
+        "torchvision==0.20.1+cu121",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .run_commands(
+        "python - <<'PY'\nimport torch\nif torch.version.cuda is None:\n    raise RuntimeError(f'CPU-only PyTorch installed: {torch.__version__}')\nprint(f'CUDA build verified: torch={torch.__version__} cuda={torch.version.cuda}')\nPY",
+    )
     .add_local_dir("gpu-worker", remote_path="/app")
 )
 
 app = modal.App("tvapp-video-eraser-gpu")
+
+def require_gpu_runtime():
+    import torch
+    if not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA is unavailable: torch={torch.__version__} cuda_build={torch.version.cuda}")
+    return {
+        "cuda_available": True,
+        "device": torch.cuda.get_device_name(0),
+        "torch": str(torch.__version__),
+        "cuda_build": str(torch.version.cuda),
+    }
 
 
 @app.function(
@@ -74,12 +95,20 @@ def download_models():
     max_containers=1,
     volumes={"/models": wan_models},
 )
-@modal.concurrent(max_inputs=1)
+@modal.concurrent(max_inputs=4)
 @modal.asgi_app()
 def fastapi_app():
     import sys
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["ERASER_REQUIRE_CUDA"] = "true"
+    gpu_details = require_gpu_runtime()
     sys.path.insert(0, "/app")
     from main import app as fastapi_application
+
+    @fastapi_application.get("/gpu-health", include_in_schema=False)
+    async def gpu_health():
+        return {"ok": True, "worker": "tvapp-video-eraser-gpu", **gpu_details}
+
     return fastapi_application
 
 
@@ -90,7 +119,7 @@ def fastapi_app():
     scaledown_window=60 * 20,
     max_containers=1,
 )
-@modal.concurrent(max_inputs=1)
+@modal.concurrent(max_inputs=4)
 @modal.asgi_app()
 def image_enhancer_app():
     import sys
