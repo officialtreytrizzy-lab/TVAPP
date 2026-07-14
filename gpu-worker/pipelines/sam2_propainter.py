@@ -569,7 +569,7 @@ def is_resource_pressure_failure(message: str) -> bool:
     )
 
 
-def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
+def run_propainter_single(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
         raise RuntimeError(f"ProPainter is not installed at {PROPAINTER_ROOT}")
@@ -644,6 +644,148 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
             )
 
     raise last_error or RuntimeError("ProPainter failed without output")
+
+
+def video_frame_count(video_path: Path) -> int:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video to count frames: {video_path}")
+    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    if count <= 0:
+        raise RuntimeError("Could not determine video frame count")
+    return count
+
+
+def make_propainter_chunk(
+    source_mp4: Path,
+    source_masks: Path,
+    chunk_root: Path,
+    start_frame: int,
+    end_frame: int,
+) -> tuple[Path, Path]:
+    chunk_root.mkdir(parents=True, exist_ok=True)
+    chunk_video = chunk_root / "source.mp4"
+    chunk_masks = chunk_root / "masks"
+    chunk_masks.mkdir(parents=True, exist_ok=True)
+
+    # Frame-exact trim. Audio is restored once after all AI chunks are joined.
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_mp4),
+            "-vf",
+            f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "12",
+            "-pix_fmt",
+            "yuv420p",
+            str(chunk_video),
+        ]
+    )
+
+    for local_idx, source_idx in enumerate(range(start_frame, end_frame)):
+        source_mask = source_masks / f"{source_idx:05d}.png"
+        if not source_mask.exists():
+            raise RuntimeError(f"Tracked mask is missing for frame {source_idx}")
+        shutil.copy2(source_mask, chunk_masks / f"{local_idx:05d}.png")
+
+    return chunk_video, chunk_masks
+
+
+def concatenate_propainter_chunks(outputs: list[Path], destination: Path) -> Path:
+    if not outputs:
+        raise RuntimeError("No ProPainter chunk outputs were produced")
+    if len(outputs) == 1:
+        shutil.copy2(outputs[0], destination)
+        return destination
+
+    concat_file = destination.parent / "propainter_chunks.txt"
+    concat_file.write_text(
+        "".join(f"file '{path.as_posix()}'\n" for path in outputs),
+        encoding="utf-8",
+    )
+    try:
+        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(destination)])
+    except RuntimeError:
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "14",
+                "-pix_fmt",
+                "yuv420p",
+                str(destination),
+            ]
+        )
+    return destination
+
+
+def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
+    frame_count = video_frame_count(source_mp4)
+    max_frames = max(24, int(os.environ.get("ERASER_PROPAINTER_CHUNK_FRAMES", "120")))
+    if frame_count <= max_frames:
+        return run_propainter_single(source_mp4, mask_path, result_root, width, height, quality)
+
+    chunk_workspace = result_root.parent / "propainter_chunk_work"
+    if chunk_workspace.exists():
+        shutil.rmtree(chunk_workspace)
+    chunk_workspace.mkdir(parents=True, exist_ok=True)
+
+    outputs: list[Path] = []
+    chunk_total = (frame_count + max_frames - 1) // max_frames
+    print(
+        f"Long clip detected ({frame_count} frames); running ProPainter in {chunk_total} temporal GPU chunks of up to {max_frames} frames",
+        flush=True,
+    )
+
+    for chunk_index, start_frame in enumerate(range(0, frame_count, max_frames), start=1):
+        end_frame = min(frame_count, start_frame + max_frames)
+        chunk_root = chunk_workspace / f"chunk_{chunk_index:03d}"
+        chunk_video, chunk_masks = make_propainter_chunk(
+            source_mp4,
+            mask_path,
+            chunk_root,
+            start_frame,
+            end_frame,
+        )
+        print(
+            f"Running ProPainter chunk {chunk_index}/{chunk_total}: frames {start_frame}-{end_frame - 1}",
+            flush=True,
+        )
+        chunk_output = run_propainter_single(
+            chunk_video,
+            chunk_masks,
+            chunk_root / "results",
+            width,
+            height,
+            quality,
+        )
+        stable_output = chunk_root / "completed.mp4"
+        shutil.copy2(chunk_output, stable_output)
+        outputs.append(stable_output)
+
+    joined = result_root.parent / "propainter_chunked_joined.mp4"
+    return concatenate_propainter_chunks(outputs, joined)
 
 
 def masked_change_score(source_video: Path, candidate_video: Path, mask_dir: Path, width: int, height: int) -> float:
@@ -839,7 +981,7 @@ def main() -> None:
             inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
 
     except RuntimeError as exc:
-        if not is_cuda_oom(str(exc)):
+        if not is_resource_pressure_failure(str(exc)):
             raise
         print("ProPainter CUDA OOM detected; falling back to tracked OpenCV inpaint.", flush=True)
         inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
