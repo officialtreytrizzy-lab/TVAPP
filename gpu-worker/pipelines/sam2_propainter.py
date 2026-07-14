@@ -264,6 +264,15 @@ def tensor_to_mask(mask_logits, width: int, height: int) -> np.ndarray:
         mask_logits = mask_logits[0]
 
     mask = (mask_logits > 0).detach().to("cpu").numpy().astype(np.uint8) * 255
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    # A tracked object can briefly disappear, become occluded, or produce an
+    # empty SAM2 logit frame. That is a recoverable gap, not a reason to throw
+    # away every valid mask propagated before it.
+    if mask_bbox(mask) is None:
+        return np.zeros((height, width), dtype=np.uint8)
+
     return clean_mask(mask, width, height, 0.10)
 
 
@@ -341,24 +350,38 @@ def write_masks(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    masks[anchor] = clean_mask(anchor_mask, width, height, 0.10)
-    last: np.ndarray | None = None
-
-    for idx in range(frame_count):
-        mask = masks.get(idx)
-        if mask is None:
-            if last is not None:
-                mask = last
-            else:
-                future = [key for key in masks if key >= idx]
-                mask = masks[min(future)] if future else np.zeros((height, width), dtype=np.uint8)
-
+    # Normalize all usable SAM2 masks first. Empty predictions are retained as
+    # gaps and repaired from the nearest valid tracked frame below.
+    normalized: dict[int, np.ndarray] = {}
+    for idx, raw_mask in masks.items():
+        if not (0 <= idx < frame_count) or raw_mask is None:
+            continue
+        mask = raw_mask
         if mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-
         mask = (mask > 24).astype(np.uint8) * 255
+        if mask_bbox(mask) is not None:
+            normalized[idx] = mask
+
+    normalized[anchor] = clean_mask(anchor_mask, width, height, 0.10)
+    valid_indices = sorted(normalized)
+    if not valid_indices:
+        raise RuntimeError("SAM2 did not produce any usable tracked masks")
+
+    recovered = 0
+    for idx in range(frame_count):
+        mask = normalized.get(idx)
+        if mask is None:
+            # Use the closest valid SAM2 result. This repairs brief occlusions
+            # or empty logits without converting the whole video to a static mask.
+            nearest = min(valid_indices, key=lambda key: (abs(key - idx), key > idx))
+            mask = normalized[nearest]
+            recovered += 1
+
         cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
-        last = mask
+
+    if recovered:
+        print(f"Recovered {recovered} empty SAM2 frame masks from nearest valid tracked frames", flush=True)
 
 
 def build_sam2_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
