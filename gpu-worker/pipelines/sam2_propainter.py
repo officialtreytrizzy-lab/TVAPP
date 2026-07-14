@@ -33,7 +33,10 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
         env=env,
     )
     if completed.returncode != 0:
-        raise RuntimeError(completed.stdout[-6000:] or f"Command failed: {' '.join(cmd)}")
+        output = (completed.stdout or "")[-6000:]
+        killed_hint = " (process was killed, usually by memory pressure)" if completed.returncode in {-9, 137} else ""
+        detail = f"Command exited with return code {completed.returncode}{killed_hint}: {' '.join(cmd)}"
+        raise RuntimeError(f"{detail}\n{output}".rstrip())
     return completed.stdout
 
 
@@ -549,9 +552,21 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, wid
         ])
 
 
-def is_cuda_oom(message: str) -> bool:
+def is_resource_pressure_failure(message: str) -> bool:
     lowered = message.lower()
-    return "out of memory" in lowered or "outofmemoryerror" in lowered or "cuda oom" in lowered
+    return any(
+        marker in lowered
+        for marker in (
+            "out of memory",
+            "outofmemoryerror",
+            "cuda oom",
+            "return code -9",
+            "return code 137",
+            "process was killed",
+            "sigkill",
+            "cannot allocate memory",
+        )
+    )
 
 
 def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
@@ -561,12 +576,16 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
 
     env = dict(os.environ)
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+    env.setdefault("OMP_NUM_THREADS", "2")
+    env.setdefault("MKL_NUM_THREADS", "2")
 
     attempts: list[tuple[int, str, str, str, str]] = [
         (640, "12", "3", "8", "3"),
         (560, "10", "2", "8", "3"),
         (480, "8", "1", "6", "2"),
         (384, "6", "1", "4", "2"),
+        (320, "4", "1", "4", "1"),
+        (256, "4", "1", "4", "1"),
     ]
 
     last_error: RuntimeError | None = None
@@ -611,9 +630,18 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
             return find_propainter_output(result_root)
         except RuntimeError as exc:
             last_error = exc
-            if index == len(attempts) - 1 or not is_cuda_oom(str(exc)):
+            if index == len(attempts) - 1 or not is_resource_pressure_failure(str(exc)):
                 raise
-            print(f"ProPainter CUDA OOM at {proc_w}x{proc_h}; retrying smaller...", flush=True)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            print(
+                f"ProPainter resource-pressure failure at {proc_w}x{proc_h}; retrying with a smaller/shorter pass...",
+                flush=True,
+            )
 
     raise last_error or RuntimeError("ProPainter failed without output")
 
