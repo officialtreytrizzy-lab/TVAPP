@@ -92,6 +92,7 @@ requireText('gpu-worker/modal_app.py', 'max_containers=1', 'status polling depen
 requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'ProPainter jobs must not run concurrently in one container');
 requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'ProPainter jobs need enough time for video inpainting');
 requireText('gpu-worker/modal_app.py', 'sam2_propainter_verified.py', 'Modal must execute the exact-selection verified production entrypoint');
+requireText('gpu-worker/modal_app.py', 'sam2.1_hiera_small.pt', 'production tracking must use the stronger SAM2.1 small checkpoint');
 
 // Worker command and API contract.
 requireText('gpu-worker/main.py', 'python /app/pipelines/sam2_propainter.py', 'worker must retain a safe core default outside Modal');
@@ -122,7 +123,10 @@ requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'validate_video
 forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'force_visible_fill', 'the worker must never manufacture a Gaussian-blur blob');
 forbidText('gpu-worker/pipelines/sam2_propainter.py', 'force_visible_fill', 'the locked core must never manufacture a Gaussian-blur blob');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_MASK_DILATION_PX', 'mask growth must be tightly controlled');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'SAM2_PROMPT_MODE", "mask"', 'SAM2 must use the painted mask by default instead of a broad box prompt');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'SAM2_PROMPT_MODE\", \"hybrid\"', 'weak mask tracking must retry with a tight box-and-points prompt');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'calcOpticalFlowFarneback', 'empty SAM2 frames must be motion-propagated instead of copied in place');
+forbidText('gpu-worker/pipelines/sam2_propainter.py', 'nearest valid tracked frame', 'tracking gaps must never be filled with a stationary nearest-mask copy');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'composite_inpainted_region', 'only the repaired area may be composited over source frames');
 
 // Exact-selection acceptance invariants. A playable moving result is still a failure when the marked spot remains.
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_selection_changed', 'the selected frame must be checked directly, not inferred from unrelated sample frames');

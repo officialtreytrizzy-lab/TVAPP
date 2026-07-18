@@ -238,7 +238,7 @@ def verified_recovery(
     width: int,
     height: int,
     output_quality: str,
-) -> Path:
+) -> tuple[Path, Path]:
     recovery_masks = build_recovery_masks(
         tracked_masks,
         work_dir / "sam2_remove_masks_recovery",
@@ -259,7 +259,7 @@ def verified_recovery(
         pipeline.validate_video_liveness(source_video, candidate, "ProPainter recovery")
         validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
         validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
-        return candidate
+        return candidate, recovery_masks
     except RuntimeError as exc:
         if not ALLOW_OPENCV_FALLBACK:
             raise SelectionNotRemovedError(
@@ -268,7 +268,7 @@ def verified_recovery(
         candidate = pipeline.run_opencv_tracked_inpaint(source_video, recovery_masks, work_dir, fps)
         validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "Opt-in OpenCV fallback")
         validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "Opt-in OpenCV fallback")
-        return candidate
+        return candidate, recovery_masks
 
 
 def main() -> None:
@@ -307,6 +307,7 @@ def main() -> None:
     )
 
     used_fallback = False
+    active_masks = tracked_masks
     try:
         inpainted = pipeline.run_propainter(
             source_mp4,
@@ -344,7 +345,7 @@ def main() -> None:
             f"ProPainter failed selection or patch-quality verification; using quality-safe recovery: {exc}",
             flush=True,
         )
-        inpainted = verified_recovery(
+        inpainted, active_masks = verified_recovery(
             source_mp4,
             tracked_masks,
             work_dir,
@@ -356,8 +357,15 @@ def main() -> None:
             output_quality,
         )
 
-    locked_core.mux_audio(
+    composite_video = locked_core.composite_inpainted_region(
+        source_mp4,
         inpainted,
+        active_masks,
+        work_dir / "source_preserving_composite.mp4",
+        fps,
+    )
+    locked_core.mux_audio(
+        composite_video,
         source_mp4,
         output_video,
         width,
@@ -389,7 +397,7 @@ def main() -> None:
             f"Final ProPainter composite failed exact-selection verification; rebuilding: {exc}",
             flush=True,
         )
-        inpainted = verified_recovery(
+        inpainted, active_masks = verified_recovery(
             source_mp4,
             tracked_masks,
             work_dir,
@@ -400,8 +408,15 @@ def main() -> None:
             height,
             output_quality,
         )
-        locked_core.mux_audio(
+        composite_video = locked_core.composite_inpainted_region(
+            source_mp4,
             inpainted,
+            active_masks,
+            work_dir / "source_preserving_recovery_composite.mp4",
+            fps,
+        )
+        locked_core.mux_audio(
+            composite_video,
             source_mp4,
             output_video,
             width,

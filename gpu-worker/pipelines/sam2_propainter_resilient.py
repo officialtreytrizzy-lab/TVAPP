@@ -78,6 +78,7 @@ def sam2_direction(
     frame_count: int,
     width: int,
     height: int,
+    prompt_mode: str | None = None,
 ) -> dict[int, np.ndarray]:
     import torch
 
@@ -88,7 +89,7 @@ def sam2_direction(
         async_loading_frames=False,
     )
 
-    mode = os.environ.get("SAM2_PROMPT_MODE", "mask").lower()
+    mode = (prompt_mode or os.environ.get("SAM2_PROMPT_MODE", "hybrid")).lower()
     if mode == "mask":
         predictor.add_new_mask(
             inference_state=state,

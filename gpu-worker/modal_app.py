@@ -25,7 +25,7 @@ worker_image = (
         "pip install -r /opt/ProPainter/requirements.txt",
         "rm -rf /opt/sam2 && git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2",
         "pip install -e /opt/sam2",
-        "mkdir -p /opt/sam2_checkpoints && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\ncheckpoint = Path('/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt')\nurl = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt'\nif not checkpoint.exists() or checkpoint.stat().st_size < 1000000:\n    print(f'Downloading SAM2 checkpoint: {url}')\n    urlretrieve(url, checkpoint)\nprint(f'SAM2 checkpoint ready: {checkpoint} ({checkpoint.stat().st_size} bytes)')\nPY",
+        "mkdir -p /opt/sam2_checkpoints && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\ncheckpoint = Path('/opt/sam2_checkpoints/sam2.1_hiera_small.pt')\nurl = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt'\nif not checkpoint.exists() or checkpoint.stat().st_size < 1000000:\n    print(f'Downloading SAM2 checkpoint: {url}')\n    urlretrieve(url, checkpoint)\nprint(f'SAM2 checkpoint ready: {checkpoint} ({checkpoint.stat().st_size} bytes)')\nPY",
         "rm -rf /opt/Wan2.1 && git clone --depth 1 https://github.com/Wan-Video/Wan2.1.git /opt/Wan2.1",
         "python - <<'PY'\nfrom pathlib import Path\nsrc = Path('/opt/Wan2.1/requirements.txt')\nout = Path('/tmp/wan-requirements-no-flash.txt')\nskip = {'flash-attn', 'flash_attn'}\nlines = []\nfor line in src.read_text().splitlines():\n    stripped = line.strip()\n    normalized = stripped.split('==')[0].split('>=')[0].split('<=')[0].split('~=')[0].split('[')[0].replace('_', '-').lower()\n    if normalized in skip:\n        print(f'Skipping optional CUDA build dependency: {stripped}')\n        continue\n    lines.append(line)\nout.write_text('\\n'.join(lines) + '\\n')\nPY",
         "pip install -r /tmp/wan-requirements-no-flash.txt",
@@ -122,6 +122,8 @@ def fastapi_app():
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["ERASER_REQUIRE_CUDA"] = "true"
     os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_verified.py"
+    os.environ.setdefault("SAM2_PROMPT_MODE", "hybrid")
+    os.environ.setdefault("ERASER_ALLOW_OPENCV_FALLBACK", "false")
     gpu_details = require_gpu_runtime()
 
     sys.path.insert(0, "/app")
