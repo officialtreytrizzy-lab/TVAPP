@@ -11,8 +11,8 @@ import cv2
 import numpy as np
 
 PROPAINTER_ROOT = Path(os.environ.get("PROPAINTER_ROOT", "/opt/ProPainter"))
-SAM2_CHECKPOINT = os.environ.get("SAM2_CHECKPOINT", "/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt")
-SAM2_MODEL_CFG = os.environ.get("SAM2_MODEL_CFG", "configs/sam2.1/sam2.1_hiera_t.yaml")
+SAM2_CHECKPOINT = os.environ.get("SAM2_CHECKPOINT", "/opt/sam2_checkpoints/sam2.1_hiera_small.pt")
+SAM2_MODEL_CFG = os.environ.get("SAM2_MODEL_CFG", "configs/sam2.1/sam2.1_hiera_s.yaml")
 UNCHANGED_THRESHOLD = float(os.environ.get("ERASER_UNCHANGED_THRESHOLD", "2.25"))
 
 
@@ -229,27 +229,38 @@ def prompt_from_mask(mask: np.ndarray, width: int, height: int) -> tuple[np.ndar
         raise RuntimeError("Mask prompt is empty")
 
     x1, y1, x2, y2 = bbox
-    pad = max(4, int(max(x2 - x1 + 1, y2 - y1 + 1) * 0.25))
-    box = np.array(
-        [
-            max(0, x1 - pad),
-            max(0, y1 - pad),
-            min(width - 1, x2 + pad),
-            min(height - 1, y2 + pad),
-        ],
-        dtype=np.float32,
-    )
+    pad = max(2, int(max(x2 - x1 + 1, y2 - y1 + 1) * 0.08))
+    box = np.array([
+        max(0, x1 - pad),
+        max(0, y1 - pad),
+        min(width - 1, x2 + pad),
+        min(height - 1, y2 + pad),
+    ], dtype=np.float32)
 
-    moments = cv2.moments((mask > 0).astype(np.uint8))
+    binary = (mask > 0).astype(np.uint8)
+    moments = cv2.moments(binary)
+    candidates: list[tuple[float, float]] = []
     if moments["m00"] > 0:
-        cx = float(moments["m10"] / moments["m00"])
-        cy = float(moments["m01"] / moments["m00"])
-    else:
-        cx = float((box[0] + box[2]) / 2)
-        cy = float((box[1] + box[3]) / 2)
+        candidates.append((float(moments["m10"] / moments["m00"]), float(moments["m01"] / moments["m00"])))
 
-    points = np.array([[cx, cy]], dtype=np.float32)
-    labels = np.array([1], dtype=np.int32)
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    for _ in range(4):
+        _, peak, _, location = cv2.minMaxLoc(distance)
+        if peak <= 0:
+            break
+        px, py = location
+        candidates.append((float(px), float(py)))
+        cv2.circle(distance, (px, py), max(3, int(peak)), 0, -1)
+
+    deduped: list[tuple[float, float]] = []
+    for point in candidates:
+        if all((point[0] - prior[0]) ** 2 + (point[1] - prior[1]) ** 2 >= 16 for prior in deduped):
+            deduped.append(point)
+    if not deduped:
+        deduped.append((float((box[0] + box[2]) / 2), float((box[1] + box[3]) / 2)))
+
+    points = np.array(deduped[:5], dtype=np.float32)
+    labels = np.ones((len(points),), dtype=np.int32)
     return box, points, labels
 
 
@@ -283,6 +294,7 @@ def sam2_direction(
     frame_count: int,
     width: int,
     height: int,
+    prompt_mode: str | None = None,
 ) -> dict[int, np.ndarray]:
     import torch
 
@@ -293,7 +305,7 @@ def sam2_direction(
         async_loading_frames=False,
     )
 
-    mode = os.environ.get("SAM2_PROMPT_MODE", "mask").lower()
+    mode = (prompt_mode or os.environ.get("SAM2_PROMPT_MODE", "hybrid")).lower()
     if mode == "mask":
         predictor.add_new_mask(
             inference_state=state,
@@ -335,9 +347,108 @@ def sam2_direction(
     return masks
 
 
+def mask_area(mask: np.ndarray) -> int:
+    return int(np.count_nonzero(mask > 24))
+
+
+def is_probably_static_overlay(mask: np.ndarray, width: int, height: int) -> bool:
+    bbox = mask_bbox(mask)
+    if bbox is None:
+        return False
+    x1, y1, x2, y2 = bbox
+    area_ratio = mask_area(mask) / max(width * height, 1)
+    near_edge = x1 <= width * 0.12 or x2 >= width * 0.88 or y1 <= height * 0.12 or y2 >= height * 0.88
+    return near_edge and area_ratio <= 0.10
+
+
+def read_tracking_frame(frames_dir: Path, index: int, width: int, height: int) -> np.ndarray:
+    frame = cv2.imread(str(frames_dir / f"{index:05d}.jpg"), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError(f"Could not read SAM2 tracking frame {index}")
+    if frame.shape[1] != width or frame.shape[0] != height:
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    return frame
+
+
+def warp_mask_with_optical_flow(previous_frame: np.ndarray, current_frame: np.ndarray, previous_mask: np.ndarray) -> np.ndarray:
+    prev_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+    flow = cv2.calcOpticalFlowFarneback(curr_gray, prev_gray, None, 0.5, 4, 21, 4, 7, 1.5, 0)
+    height, width = previous_mask.shape[:2]
+    grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+    warped = cv2.remap(
+        previous_mask,
+        grid_x + flow[..., 0],
+        grid_y + flow[..., 1],
+        interpolation=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    warped = (warped > 24).astype(np.uint8) * 255
+    if mask_bbox(warped) is not None:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        warped = cv2.morphologyEx(warped, cv2.MORPH_CLOSE, kernel, iterations=1)
+    return warped
+
+
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    aa = a > 24
+    bb = b > 24
+    union = int(np.count_nonzero(aa | bb))
+    return float(np.count_nonzero(aa & bb) / union) if union else 0.0
+
+
+def choose_tracked_mask(sam2_mask: np.ndarray | None, flow_mask: np.ndarray) -> np.ndarray:
+    if sam2_mask is None or mask_bbox(sam2_mask) is None:
+        return flow_mask
+    if mask_bbox(flow_mask) is None:
+        return sam2_mask
+    area_ratio = mask_area(sam2_mask) / max(mask_area(flow_mask), 1)
+    if 0.20 <= area_ratio <= 5.0 and mask_iou(sam2_mask, flow_mask) >= 0.04:
+        return sam2_mask
+    return flow_mask
+
+
+def propagate_missing_masks(
+    normalized: dict[int, np.ndarray],
+    frames_dir: Path,
+    frame_count: int,
+    width: int,
+    height: int,
+    anchor: int,
+    anchor_mask: np.ndarray,
+) -> tuple[dict[int, np.ndarray], int]:
+    result: dict[int, np.ndarray] = {anchor: anchor_mask}
+    static_overlay = is_probably_static_overlay(anchor_mask, width, height)
+    recovered = 0
+
+    for direction in (1, -1):
+        previous_frame = read_tracking_frame(frames_dir, anchor, width, height)
+        previous_mask = anchor_mask
+        index = anchor + direction
+        while 0 <= index < frame_count:
+            current_frame = read_tracking_frame(frames_dir, index, width, height)
+            sam2_mask = normalized.get(index)
+            if static_overlay and (sam2_mask is None or mask_bbox(sam2_mask) is None):
+                chosen = anchor_mask.copy()
+                recovered += 1
+            else:
+                flow_mask = warp_mask_with_optical_flow(previous_frame, current_frame, previous_mask)
+                chosen = choose_tracked_mask(sam2_mask, flow_mask)
+                if sam2_mask is None or mask_bbox(sam2_mask) is None or chosen is flow_mask:
+                    recovered += 1
+            result[index] = chosen
+            previous_frame = current_frame
+            previous_mask = chosen
+            index += direction
+
+    return result, recovered
+
+
 def write_masks(
     masks: dict[int, np.ndarray],
     output_dir: Path,
+    frames_dir: Path,
     frame_count: int,
     width: int,
     height: int,
@@ -348,8 +459,6 @@ def write_masks(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Normalize all usable SAM2 masks first. Empty predictions are retained as
-    # gaps and repaired from the nearest valid tracked frame below.
     normalized: dict[int, np.ndarray] = {}
     for idx, raw_mask in masks.items():
         if not (0 <= idx < frame_count) or raw_mask is None:
@@ -361,25 +470,19 @@ def write_masks(
         if mask_bbox(mask) is not None:
             normalized[idx] = mask
 
-    normalized[anchor] = clean_mask(anchor_mask, width, height, 0.10)
-    valid_indices = sorted(normalized)
-    if not valid_indices:
-        raise RuntimeError("SAM2 did not produce any usable tracked masks")
+    anchor_mask = clean_mask(anchor_mask, width, height, 0.10)
+    normalized[anchor] = anchor_mask
+    tracked, recovered = propagate_missing_masks(normalized, frames_dir, frame_count, width, height, anchor, anchor_mask)
 
-    recovered = 0
     for idx in range(frame_count):
-        mask = normalized.get(idx)
-        if mask is None:
-            # Use the closest valid SAM2 result. This repairs brief occlusions
-            # or empty logits without converting the whole video to a static mask.
-            nearest = min(valid_indices, key=lambda key: (abs(key - idx), key > idx))
-            mask = normalized[nearest]
-            recovered += 1
+        cv2.imwrite(str(output_dir / f"{idx:05d}.png"), tracked.get(idx, np.zeros((height, width), dtype=np.uint8)))
 
-        cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
-
-    if recovered:
-        print(f"Recovered {recovered} empty SAM2 frame masks from nearest valid tracked frames", flush=True)
+    usable_sam2 = sum(1 for mask in normalized.values() if mask_bbox(mask) is not None)
+    print(
+        f"Tracking masks ready: sam2_usable={usable_sam2}/{frame_count} motion_recovered={recovered} "
+        f"static_overlay={is_probably_static_overlay(anchor_mask, width, height)}",
+        flush=True,
+    )
 
 
 def build_sam2_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
@@ -406,16 +509,30 @@ def build_sam2_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: 
 
     masks: dict[int, np.ndarray] = {}
     ctx = torch.autocast("cuda", dtype=torch.bfloat16) if device == "cuda" else nullcontext()
+    requested_mode = os.environ.get("SAM2_PROMPT_MODE", "hybrid").lower()
+    primary_mode = "mask" if requested_mode == "hybrid" else requested_mode
 
     with torch.inference_mode(), ctx:
-        masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, False, frame_count, width, height))
-        masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, True, frame_count, width, height))
+        masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, False, frame_count, width, height, primary_mode))
+        masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, True, frame_count, width, height, primary_mode))
+
+        usable = sum(1 for mask in masks.values() if mask_bbox(mask) is not None)
+        minimum_usable = max(3, int(round(frame_count * 0.55)))
+        if usable < minimum_usable and primary_mode != "box":
+            print(f"SAM2 mask prompt tracked only {usable}/{frame_count} frames; retrying tight box-and-points prompt", flush=True)
+            box_masks: dict[int, np.ndarray] = {}
+            box_masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, False, frame_count, width, height, "box"))
+            box_masks.update(sam2_direction(predictor, frames_dir, anchor, anchor_mask, True, frame_count, width, height, "box"))
+            for idx, box_mask in box_masks.items():
+                current = masks.get(idx)
+                if current is None or mask_bbox(current) is None:
+                    masks[idx] = box_mask
 
     del predictor
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    write_masks(masks, output_dir, frame_count, width, height, anchor, anchor_mask)
+    write_masks(masks, output_dir, frames_dir, frame_count, width, height, anchor, anchor_mask)
 
     print(f"SAM2 propagated masks for {frame_count} frames", flush=True)
     print("Using SAM2 mask sequence for ProPainter", flush=True)
@@ -491,6 +608,75 @@ def export_settings(quality: str, source_bitrate: int | None) -> tuple[str, str,
         ]
 
     return "medium", "14", ["-b:a", "192k"]
+
+
+def composite_inpainted_region(
+    source_video: Path,
+    candidate_video: Path,
+    mask_dir: Path,
+    output_video: Path,
+    fps: float,
+) -> Path:
+    source_cap = cv2.VideoCapture(str(source_video))
+    candidate_cap = cv2.VideoCapture(str(candidate_video))
+    if not source_cap.isOpened() or not candidate_cap.isOpened():
+        source_cap.release()
+        candidate_cap.release()
+        raise RuntimeError("Could not open videos for source-preserving composite")
+
+    width = int(source_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(source_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    composite_fps = fps if fps > 0 else source_cap.get(cv2.CAP_PROP_FPS) or 30.0
+    raw_output = output_video.with_suffix(".raw.mp4")
+    writer = cv2.VideoWriter(str(raw_output), cv2.VideoWriter_fourcc(*"mp4v"), composite_fps, (width, height))
+    if not writer.isOpened():
+        source_cap.release()
+        candidate_cap.release()
+        raise RuntimeError("Could not create source-preserving composite")
+
+    index = 0
+    written = 0
+    while True:
+        ok_source, source = source_cap.read()
+        ok_candidate, candidate = candidate_cap.read()
+        if not ok_source or not ok_candidate:
+            break
+        if candidate.shape[1] != width or candidate.shape[0] != height:
+            candidate = cv2.resize(candidate, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+        mask = cv2.imread(str(mask_dir / f"{index:05d}.png"), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            mask = np.zeros((height, width), dtype=np.uint8)
+        elif mask.shape[1] != width or mask.shape[0] != height:
+            mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+        binary = (mask > 24).astype(np.uint8) * 255
+        if mask_bbox(binary) is None:
+            output = source
+        else:
+            edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            outer = cv2.dilate(binary, edge_kernel, iterations=1)
+            alpha = cv2.GaussianBlur(outer, (0, 0), sigmaX=1.25, sigmaY=1.25).astype(np.float32) / 255.0
+            alpha[binary > 0] = 1.0
+            alpha = alpha[:, :, None]
+            output = np.clip(candidate.astype(np.float32) * alpha + source.astype(np.float32) * (1.0 - alpha), 0, 255).astype(np.uint8)
+
+        writer.write(output)
+        index += 1
+        written += 1
+
+    source_cap.release()
+    candidate_cap.release()
+    writer.release()
+    if written <= 0:
+        raise RuntimeError("Source-preserving composite wrote no frames")
+
+    run([
+        "ffmpeg", "-y", "-i", str(raw_output), "-an",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "12",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_video),
+    ])
+    print(f"Source-preserving mask composite wrote {written} frames", flush=True)
+    return output_video
 
 
 def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, width: int, height: int, fps: float, quality: str) -> None:
