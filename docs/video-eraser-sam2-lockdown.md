@@ -42,7 +42,7 @@ The expected good signals are:
 Redeploy Modal after worker changes:
 
 ```bash
-MODAL_PROFILE=tvapp-new modal deploy gpu-worker/modal_app.py
+MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
 ```
 
 The Modal image must install:
@@ -55,3 +55,4 @@ The Modal image must install:
 
 The user confirmed the video eraser works after the SAM2 deployment.
 This state should be treated as the baseline working implementation for future Video ETreyser changes.
+

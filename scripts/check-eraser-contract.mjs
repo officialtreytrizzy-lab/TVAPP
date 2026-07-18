@@ -5,6 +5,7 @@ const requiredFiles = [
   'src/components/eraser/Editor.tsx',
   'src/components/eraser/ProcessingPanel.tsx',
   'api/_lib/trecut-eraser-proxy.ts',
+  'api/v1/direct-upload.ts',
   'api/v1/trecut/eraser/[...path].ts',
   'api/v1/trecut/eraser/_handlers/jobs.ts',
   'api/v1/trecut/eraser/_handlers/job.ts',
@@ -16,6 +17,7 @@ const requiredFiles = [
   'gpu-worker/pipelines/sam2_propainter_resilient.py',
   'gpu-worker/pipelines/sam2_propainter_verified.py',
   'gpu-worker/requirements.txt',
+  'vercel.json',
 ];
 
 const checks = [];
@@ -65,6 +67,12 @@ requireText('api/v1/trecut/eraser/_handlers/output.ts', 'modalCompositeOutputFro
 
 // Large uploads must not flow through Vercel functions (~4.5MB FUNCTION_PAYLOAD_TOO_LARGE limit).
 requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'modalBaseUrl', 'upload-target must resolve the GPU worker from server env');
+requireText('vercel.json', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'Vercel must target the wthemif Modal worker');
+requireText('api/v1/direct-upload.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'licensed direct uploads must fall back to the wthemif worker');
+requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'eTreyser upload discovery must fall back to the wthemif worker');
+forbidText('vercel.json', 'californiatrey--tvapp-video-eraser-gpu', 'production must never route back to the old Modal account');
+forbidText('api/v1/direct-upload.ts', 'californiatrey--tvapp-video-eraser-gpu', 'direct uploads must never route back to the old Modal account');
+forbidText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'californiatrey--tvapp-video-eraser-gpu', 'upload discovery must never route back to the old Modal account');
 requireText('src/lib/eraser/gpu.ts', 'upload-target', 'frontend must discover the direct GPU upload URL to bypass the ~4.5MB Vercel payload limit');
 requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'frontend must size-guard the legacy base64 relay fallback');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'PYTORCH_CUDA_ALLOC_CONF', 'ProPainter must run with the expandable-segments allocator to reduce CUDA OOMs');

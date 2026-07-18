@@ -33,7 +33,10 @@ def run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = No
         env=env,
     )
     if completed.returncode != 0:
-        raise RuntimeError(completed.stdout[-6000:] or f"Command failed: {' '.join(cmd)}")
+        output = (completed.stdout or "")[-6000:]
+        killed_hint = " (process was killed, usually by memory pressure)" if completed.returncode in {-9, 137} else ""
+        detail = f"Command exited with return code {completed.returncode}{killed_hint}: {' '.join(cmd)}"
+        raise RuntimeError(f"{detail}\n{output}".rstrip())
     return completed.stdout
 
 
@@ -264,6 +267,15 @@ def tensor_to_mask(mask_logits, width: int, height: int) -> np.ndarray:
         mask_logits = mask_logits[0]
 
     mask = (mask_logits > 0).detach().to("cpu").numpy().astype(np.uint8) * 255
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    # A tracked object can briefly disappear, become occluded, or produce an
+    # empty SAM2 logit frame. That is a recoverable gap, not a reason to throw
+    # away every valid mask propagated before it.
+    if mask_bbox(mask) is None:
+        return np.zeros((height, width), dtype=np.uint8)
+
     return clean_mask(mask, width, height, 0.10)
 
 
@@ -341,24 +353,38 @@ def write_masks(
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    masks[anchor] = clean_mask(anchor_mask, width, height, 0.10)
-    last: np.ndarray | None = None
-
-    for idx in range(frame_count):
-        mask = masks.get(idx)
-        if mask is None:
-            if last is not None:
-                mask = last
-            else:
-                future = [key for key in masks if key >= idx]
-                mask = masks[min(future)] if future else np.zeros((height, width), dtype=np.uint8)
-
+    # Normalize all usable SAM2 masks first. Empty predictions are retained as
+    # gaps and repaired from the nearest valid tracked frame below.
+    normalized: dict[int, np.ndarray] = {}
+    for idx, raw_mask in masks.items():
+        if not (0 <= idx < frame_count) or raw_mask is None:
+            continue
+        mask = raw_mask
         if mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-
         mask = (mask > 24).astype(np.uint8) * 255
+        if mask_bbox(mask) is not None:
+            normalized[idx] = mask
+
+    normalized[anchor] = clean_mask(anchor_mask, width, height, 0.10)
+    valid_indices = sorted(normalized)
+    if not valid_indices:
+        raise RuntimeError("SAM2 did not produce any usable tracked masks")
+
+    recovered = 0
+    for idx in range(frame_count):
+        mask = normalized.get(idx)
+        if mask is None:
+            # Use the closest valid SAM2 result. This repairs brief occlusions
+            # or empty logits without converting the whole video to a static mask.
+            nearest = min(valid_indices, key=lambda key: (abs(key - idx), key > idx))
+            mask = normalized[nearest]
+            recovered += 1
+
         cv2.imwrite(str(output_dir / f"{idx:05d}.png"), mask)
-        last = mask
+
+    if recovered:
+        print(f"Recovered {recovered} empty SAM2 frame masks from nearest valid tracked frames", flush=True)
 
 
 def build_sam2_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: float, width: int, height: int) -> Path:
@@ -443,6 +469,10 @@ def even_dimension(value: int) -> int:
     return value if value % 2 == 0 else value - 1
 
 
+def is_cuda_oom(message: str) -> bool:
+    lowered = message.lower()
+    return "out of memory" in lowered or "outofmemoryerror" in lowered or "cuda oom" in lowered
+
 def find_propainter_output(result_root: Path) -> Path:
     candidates = list(result_root.rglob("inpaint_out.mp4"))
     if not candidates:
@@ -526,24 +556,40 @@ def mux_audio(inpainted_video: Path, source_video: Path, output_video: Path, wid
         ])
 
 
-def is_cuda_oom(message: str) -> bool:
+def is_resource_pressure_failure(message: str) -> bool:
     lowered = message.lower()
-    return "out of memory" in lowered or "outofmemoryerror" in lowered or "cuda oom" in lowered
+    return any(
+        marker in lowered
+        for marker in (
+            "out of memory",
+            "outofmemoryerror",
+            "cuda oom",
+            "return code -9",
+            "return code 137",
+            "process was killed",
+            "sigkill",
+            "cannot allocate memory",
+        )
+    )
 
 
-def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
+def run_propainter_single(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
     inference = PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
         raise RuntimeError(f"ProPainter is not installed at {PROPAINTER_ROOT}")
 
     env = dict(os.environ)
     env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True,max_split_size_mb:128")
+    env.setdefault("OMP_NUM_THREADS", "2")
+    env.setdefault("MKL_NUM_THREADS", "2")
 
     attempts: list[tuple[int, str, str, str, str]] = [
         (640, "12", "3", "8", "3"),
         (560, "10", "2", "8", "3"),
         (480, "8", "1", "6", "2"),
         (384, "6", "1", "4", "2"),
+        (320, "4", "1", "4", "1"),
+        (256, "4", "1", "4", "1"),
     ]
 
     last_error: RuntimeError | None = None
@@ -588,11 +634,162 @@ def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: 
             return find_propainter_output(result_root)
         except RuntimeError as exc:
             last_error = exc
-            if index == len(attempts) - 1 or not is_cuda_oom(str(exc)):
+            if index == len(attempts) - 1 or not is_resource_pressure_failure(str(exc)):
                 raise
-            print(f"ProPainter CUDA OOM at {proc_w}x{proc_h}; retrying smaller...", flush=True)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            print(
+                f"ProPainter resource-pressure failure at {proc_w}x{proc_h}; retrying with a smaller/shorter pass...",
+                flush=True,
+            )
 
     raise last_error or RuntimeError("ProPainter failed without output")
+
+
+def video_frame_count(video_path: Path) -> int:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video to count frames: {video_path}")
+    count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    cap.release()
+    if count <= 0:
+        raise RuntimeError("Could not determine video frame count")
+    return count
+
+
+def make_propainter_chunk(
+    source_mp4: Path,
+    source_masks: Path,
+    chunk_root: Path,
+    start_frame: int,
+    end_frame: int,
+) -> tuple[Path, Path]:
+    chunk_root.mkdir(parents=True, exist_ok=True)
+    chunk_video = chunk_root / "source.mp4"
+    chunk_masks = chunk_root / "masks"
+    chunk_masks.mkdir(parents=True, exist_ok=True)
+
+    # Frame-exact trim. Audio is restored once after all AI chunks are joined.
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_mp4),
+            "-vf",
+            f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "12",
+            "-pix_fmt",
+            "yuv420p",
+            str(chunk_video),
+        ]
+    )
+
+    for local_idx, source_idx in enumerate(range(start_frame, end_frame)):
+        source_mask = source_masks / f"{source_idx:05d}.png"
+        if not source_mask.exists():
+            raise RuntimeError(f"Tracked mask is missing for frame {source_idx}")
+        shutil.copy2(source_mask, chunk_masks / f"{local_idx:05d}.png")
+
+    return chunk_video, chunk_masks
+
+
+def concatenate_propainter_chunks(outputs: list[Path], destination: Path) -> Path:
+    if not outputs:
+        raise RuntimeError("No ProPainter chunk outputs were produced")
+    if len(outputs) == 1:
+        shutil.copy2(outputs[0], destination)
+        return destination
+
+    concat_file = destination.parent / "propainter_chunks.txt"
+    concat_file.write_text(
+        "".join(f"file '{path.as_posix()}'\n" for path in outputs),
+        encoding="utf-8",
+    )
+    try:
+        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(destination)])
+    except RuntimeError:
+        run(
+            [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_file),
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "14",
+                "-pix_fmt",
+                "yuv420p",
+                str(destination),
+            ]
+        )
+    return destination
+
+
+def run_propainter(source_mp4: Path, mask_path: Path, result_root: Path, width: int, height: int, quality: str) -> Path:
+    frame_count = video_frame_count(source_mp4)
+    max_frames = max(24, int(os.environ.get("ERASER_PROPAINTER_CHUNK_FRAMES", "120")))
+    if frame_count <= max_frames:
+        return run_propainter_single(source_mp4, mask_path, result_root, width, height, quality)
+
+    chunk_workspace = result_root.parent / "propainter_chunk_work"
+    if chunk_workspace.exists():
+        shutil.rmtree(chunk_workspace)
+    chunk_workspace.mkdir(parents=True, exist_ok=True)
+
+    outputs: list[Path] = []
+    chunk_total = (frame_count + max_frames - 1) // max_frames
+    print(
+        f"Long clip detected ({frame_count} frames); running ProPainter in {chunk_total} temporal GPU chunks of up to {max_frames} frames",
+        flush=True,
+    )
+
+    for chunk_index, start_frame in enumerate(range(0, frame_count, max_frames), start=1):
+        end_frame = min(frame_count, start_frame + max_frames)
+        chunk_root = chunk_workspace / f"chunk_{chunk_index:03d}"
+        chunk_video, chunk_masks = make_propainter_chunk(
+            source_mp4,
+            mask_path,
+            chunk_root,
+            start_frame,
+            end_frame,
+        )
+        print(
+            f"Running ProPainter chunk {chunk_index}/{chunk_total}: frames {start_frame}-{end_frame - 1}",
+            flush=True,
+        )
+        chunk_output = run_propainter_single(
+            chunk_video,
+            chunk_masks,
+            chunk_root / "results",
+            width,
+            height,
+            quality,
+        )
+        stable_output = chunk_root / "completed.mp4"
+        shutil.copy2(chunk_output, stable_output)
+        outputs.append(stable_output)
+
+    joined = result_root.parent / "propainter_chunked_joined.mp4"
+    return concatenate_propainter_chunks(outputs, joined)
 
 
 def masked_change_score(source_video: Path, candidate_video: Path, mask_dir: Path, width: int, height: int) -> float:
@@ -788,7 +985,7 @@ def main() -> None:
             inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
 
     except RuntimeError as exc:
-        if not is_cuda_oom(str(exc)):
+        if not is_resource_pressure_failure(str(exc)):
             raise
         print("ProPainter CUDA OOM detected; falling back to tracked OpenCV inpaint.", flush=True)
         inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
@@ -801,3 +998,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

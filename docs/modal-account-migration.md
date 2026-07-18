@@ -29,17 +29,17 @@ Run these commands from the repo root on the computer that should deploy to the 
 
 ```bash
 python -m pip install --upgrade modal
-modal token new --profile tvapp-new --activate
+modal token new --profile wthemif --activate
 modal profile current
 modal token info
 ```
 
-Stop if `modal profile current` does not show `tvapp-new`.
+Stop if `modal profile current` does not show `wthemif`.
 
 ### 2. Deploy the worker into the new Modal account
 
 ```bash
-MODAL_PROFILE=tvapp-new modal deploy gpu-worker/modal_app.py
+MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
 ```
 
 Modal will print the new web URL. It should look like this:
@@ -55,7 +55,7 @@ Copy that exact URL.
 The new Modal account starts with a fresh `tvapp-wan-models` volume. Run:
 
 ```bash
-MODAL_PROFILE=tvapp-new modal run gpu-worker/modal_app.py::download_models
+MODAL_PROFILE=wthemif modal run gpu-worker/modal_app.py::download_models
 ```
 
 This downloads `Wan-AI/Wan2.1-VACE-1.3B` into `/models/Wan2.1-VACE-1.3B` inside the Modal volume.
@@ -98,3 +98,4 @@ A `404` for a fake job ID is acceptable. A DNS, auth, or connection error means 
 - Keep the old Modal app live until the new worker URL is confirmed from Vercel health and one real job test.
 - Do not set Modal token values in `VITE_` variables. Anything beginning with `VITE_` may become browser-visible.
 - The browser/API only needs the deployed worker URL, not the Modal token.
+

@@ -5,13 +5,13 @@ import modal
 
 # Deploy with:
 #   pip install modal
-#   modal token new --profile tvapp-new --activate
-#   MODAL_PROFILE=tvapp-new modal deploy gpu-worker/modal_app.py
+#   modal token new --profile wthemif --activate
+#   MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
 #
 # The deployed URL becomes VITE_ERASER_GPU_WORKER_URL in Vercel.
 # Wan model weights live in the Modal volume mounted at /models.
 # Download/update weights with:
-#   MODAL_PROFILE=tvapp-new modal run gpu-worker/modal_app.py::download_models
+#   MODAL_PROFILE=wthemif modal run gpu-worker/modal_app.py::download_models
 
 wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
 
@@ -157,3 +157,4 @@ def image_enhancer_app():
         return {"ok": True, "worker": "tvapp-image-enhancer-gpu", **gpu_details}
 
     return fastapi_application
+
