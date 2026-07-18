@@ -16,7 +16,7 @@ export default async function handler(req: any, res: any) {
 
   try {
     requireApiKey(req, 'video_removal:write');
-    const base = modalBaseUrl() || 'https://californiatrey--tvapp-video-eraser-gpu-fastapi-app.modal.run';
+    const base = modalBaseUrl() || 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run';
     if (!base) return error(res, 503, 'GPU worker is not configured.', 'worker_not_configured');
     json(res, 200, {
       worker_base: base,

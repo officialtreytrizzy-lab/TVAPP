@@ -442,14 +442,14 @@ async def ai_remix_debug(request: Request):
 
 
 @app.post("/v1/video-eraser/jobs")
-async def create_job(background_tasks: BackgroundTasks, video: UploadFile = File(...), mask: UploadFile = File(...), job_id: str = Form(default=""), selected_time: str = Form(default="0"), selected_frame_index: str = Form(default="0"), fps: str = Form(default="30"), duration: str = Form(default="0"), width: str = Form(default="0"), height: str = Form(default="0"), pipeline: str = Form(default="sam2-propainter"), quality: str = Form(default="source"), preserve_resolution: str = Form(default="true"), preserve_fps: str = Form(default="true"), preserve_audio: str = Form(default="true")):
+async def create_job(video: UploadFile = File(...), mask: UploadFile = File(...), job_id: str = Form(default=""), selected_time: str = Form(default="0"), selected_frame_index: str = Form(default="0"), fps: str = Form(default="30"), duration: str = Form(default="0"), width: str = Form(default="0"), height: str = Form(default="0"), pipeline: str = Form(default="sam2-propainter"), quality: str = Form(default="source"), preserve_resolution: str = Form(default="true"), preserve_fps: str = Form(default="true"), preserve_audio: str = Form(default="true")):
     remote_job_id = job_id.strip() or str(uuid.uuid4())
     job_dir = WORK_DIR / remote_job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     save_upload(video, job_dir / "input_video")
     save_upload(mask, job_dir / "mask.png")
     state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued source-quality ProPainter job")
-    background_tasks.add_task(process_job, remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, quality)
+    Thread(target=process_job, args=(remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, quality), daemon=True).start()
     payload = dump_job_payload(state)
     payload["statusUrl"] = payload["status_url"] = f"/v1/video-eraser/jobs/{remote_job_id}"
     payload["outputUrl"] = payload["output_url"] = f"/v1/video-eraser/jobs/{remote_job_id}/output"

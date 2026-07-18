@@ -19,6 +19,9 @@ concurrency:
   group: tvapp-modal-gpu-production
   cancel-in-progress: false
 
+env:
+  MODAL_EXPECTED_WORKSPACE: wthemif
+
 jobs:
   modal-auth:
     if: github.event_name != 'pull_request' || github.head_ref == 'ops/modal-gpu-deploy'
@@ -28,18 +31,19 @@ jobs:
       - name: Install Modal CLI quietly
         run: python -m pip install --quiet --upgrade modal
 
-      - name: Validate Modal token
+      - name: Validate wthemif Modal token
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: |
           test -n "$MODAL_TOKEN_ID" || (echo "Missing repository secret MODAL_TOKEN_ID" && exit 1)
           test -n "$MODAL_TOKEN_SECRET" || (echo "Missing repository secret MODAL_TOKEN_SECRET" && exit 1)
-          set +e
           output="$(modal token info 2>&1)"
-          code=$?
           printf '%s\n' "$output" | tail -n 20
-          exit $code
+          printf '%s\n' "$output" | grep -Eq "^Workspace: ${MODAL_EXPECTED_WORKSPACE}( |$)" || {
+            echo "Refusing deployment: Modal token is not connected to ${MODAL_EXPECTED_WORKSPACE}."
+            exit 1
+          }
 
   deploy:
     needs: modal-auth
@@ -62,7 +66,18 @@ jobs:
       - name: Install Modal CLI
         run: python -m pip install --quiet --upgrade modal
 
-      - name: Deploy A10G worker
+      - name: Confirm wthemif deployment workspace
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          output="$(modal token info 2>&1)"
+          printf '%s\n' "$output" | grep -Eq "^Workspace: ${MODAL_EXPECTED_WORKSPACE}( |$)" || {
+            echo "Refusing deployment: expected ${MODAL_EXPECTED_WORKSPACE} Modal workspace."
+            exit 1
+          }
+
+      - name: Deploy A10G worker to wthemif
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

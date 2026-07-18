@@ -1,7 +1,7 @@
 import { error, handleOptions, json, methodNotAllowed } from '../../../../_lib/http.js';
 import { modalBaseUrl } from '../../../../_lib/modal.js';
 
-const DEFAULT_WORKER_BASE = 'https://californiatrey--tvapp-video-eraser-gpu-fastapi-app.modal.run';
+const DEFAULT_WORKER_BASE = 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run';
 
 /**
  * First-party discovery of the GPU worker's direct upload endpoint.

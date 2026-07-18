@@ -40,7 +40,7 @@ The new Modal ASGI app exposes:
 Redeploy the Modal worker:
 
 ```bash
-MODAL_PROFILE=tvapp-new modal deploy gpu-worker/modal_app.py
+MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
 ```
 
 Modal should show an additional web endpoint for `image_enhancer_app`.
@@ -78,3 +78,4 @@ Wire this backend into the TVAPP frontend as an AI Image Enhancer tool card with
 - Face Enhance toggle
 - before/after preview
 - download enhanced result
+
