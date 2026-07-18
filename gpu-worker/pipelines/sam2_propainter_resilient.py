@@ -88,7 +88,7 @@ def sam2_direction(
         async_loading_frames=False,
     )
 
-    mode = os.environ.get("SAM2_PROMPT_MODE", "box").lower()
+    mode = os.environ.get("SAM2_PROMPT_MODE", "mask").lower()
     if mode == "mask":
         predictor.add_new_mask(
             inference_state=state,
@@ -140,13 +140,13 @@ def sam2_direction(
 
 
 def propainter_attempts() -> list[tuple[int, str, str, str, str]]:
-    # Upstream uses neighbor_stride = neighbor_length // 2. neighbor_length=1
-    # therefore crashes with range() arg 3 must not be zero.
+    # Quality-first on A10G, then progressively reduce resolution only when
+    # memory pressure requires it. Keep ProPainter's own dilation subtle.
     return [
-        (640, "12", "6", "8", "3"),
-        (560, "10", "4", "8", "3"),
-        (480, "8", "4", "6", "2"),
-        (384, "6", "2", "4", "2"),
+        (960, "12", "6", "8", "1"),
+        (768, "10", "4", "8", "1"),
+        (640, "8", "4", "6", "1"),
+        (560, "6", "2", "4", "1"),
     ]
 
 
@@ -331,16 +331,6 @@ def run_propainter(
     raise RuntimeError("ProPainter failed all resilient attempts:\n" + "\n---\n".join(errors[-2:]))
 
 
-def force_visible_fill(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    k = max(31, min(91, (max(frame.shape[:2]) // 20) | 1))
-    if k % 2 == 0:
-        k += 1
-    blurred = cv2.GaussianBlur(frame, (k, k), 0)
-    out = frame.copy()
-    out[mask > 24] = blurred[mask > 24]
-    return out
-
-
 def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path, fps: float) -> Path:
     fallback_dir = work_dir / "opencv_tracked_inpaint"
     if fallback_dir.exists():
@@ -382,20 +372,20 @@ def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path,
         elif mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
 
-        mask = resilient_clean_mask(mask, width, height, 0.12, allow_empty=True)
+        mask = (mask > 24).astype(np.uint8) * 255
         if core.mask_bbox(mask) is not None:
-            radius = max(5, min(14, int(max(width, height) * 0.012)))
+            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+            radius = max(3, min(7, int(max(width, height) * 0.006)))
             telea = cv2.inpaint(frame, mask, radius, cv2.INPAINT_TELEA)
             ns = cv2.inpaint(frame, mask, radius, cv2.INPAINT_NS)
             telea_score = float(cv2.absdiff(frame, telea)[mask > 24].mean())
             ns_score = float(cv2.absdiff(frame, ns)[mask > 24].mean())
-            candidate = telea if telea_score >= ns_score else ns
-            score = max(telea_score, ns_score)
-
-            if score < core.UNCHANGED_THRESHOLD:
-                candidate = force_visible_fill(candidate, mask)
-                score = float(cv2.absdiff(frame, candidate)[mask > 24].mean())
-
+            valid = [(telea_score, telea), (ns_score, ns)]
+            valid = [item for item in valid if item[0] >= core.UNCHANGED_THRESHOLD]
+            if not valid:
+                raise RuntimeError("Tracked OpenCV fallback could not remove the selected region cleanly")
+            score, candidate = min(valid, key=lambda item: item[0])
             frame = candidate
             changes.append(score)
 
@@ -469,21 +459,19 @@ def main() -> None:
     resilient_clean_mask(core.read_mask_alpha(input_mask, width, height), width, height, 0.18)
     tracked_masks = core.build_tracked_masks(source_mp4, input_mask, mask_dir, fps, width, height)
 
+    allow_opencv_fallback = os.environ.get("ERASER_ALLOW_OPENCV_FALLBACK", "false").lower() == "true"
     used_fallback = False
     try:
         inpainted = run_propainter(source_mp4, tracked_masks, result_root, width, height, output_quality)
         change_score = core.masked_change_score(source_mp4, inpainted, tracked_masks, width, height)
         print(f"ProPainter masked-region change score={change_score:.3f}", flush=True)
-        if change_score < core.UNCHANGED_THRESHOLD:
-            raise RuntimeError(
-                f"ProPainter did not materially change the selected region (score={change_score:.3f})"
-            )
     except RuntimeError as exc:
+        if not allow_opencv_fallback:
+            raise RuntimeError(
+                "ProPainter failed and the low-quality OpenCV patch fallback is disabled"
+            ) from exc
         used_fallback = True
-        print(
-            f"ProPainter could not produce a reliable moving result; using tracked fallback: {exc}",
-            flush=True,
-        )
+        print(f"ProPainter failed; using explicitly enabled tracked fallback: {exc}", flush=True)
         inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
 
     core.mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
