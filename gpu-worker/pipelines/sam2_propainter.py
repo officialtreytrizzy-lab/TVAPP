@@ -169,35 +169,30 @@ def read_mask_alpha(mask_path: Path, width: int, height: int) -> np.ndarray:
 
 
 def clean_mask(mask: np.ndarray, width: int, height: int, pad_ratio: float = 0.18) -> np.ndarray:
+    """Normalize a mask without expanding it into a visible repair patch."""
     if mask.shape[1] != width or mask.shape[0] != height:
         mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
 
     mask = (mask > 24).astype(np.uint8) * 255
-    bbox = mask_bbox(mask)
-    if bbox is None:
+    if mask_bbox(mask) is None:
         raise RuntimeError("Painted mask is empty")
 
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-    mask = cv2.dilate(mask, dilate_kernel, iterations=1)
 
     count, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
     if count > 1:
         largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
         mask = (labels == largest).astype(np.uint8) * 255
 
-    x1, y1, x2, y2 = mask_bbox(mask) or bbox
-    pad = max(3, int(max(x2 - x1 + 1, y2 - y1 + 1) * pad_ratio))
-    x1 = max(0, x1 - pad)
-    y1 = max(0, y1 - pad)
-    x2 = min(width - 1, x2 + pad)
-    y2 = min(height - 1, y2 + pad)
+    configured = clean_int(os.environ.get("ERASER_MASK_DILATION_PX"), 2, 0, 8)
+    dilation_px = min(8, configured + (1 if pad_ratio >= 0.24 else 0))
+    if dilation_px > 0:
+        kernel_size = dilation_px * 2 + 1
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.dilate(mask, dilate_kernel, iterations=1)
 
-    expanded = np.zeros_like(mask)
-    expanded[y1 : y2 + 1, x1 : x2 + 1] = mask[y1 : y2 + 1, x1 : x2 + 1]
-    expanded = cv2.dilate(expanded, dilate_kernel, iterations=1)
-    return expanded
+    return mask
 
 
 def extract_frames(video_path: Path, frames_dir: Path) -> tuple[int, int, int]:
@@ -298,7 +293,7 @@ def sam2_direction(
         async_loading_frames=False,
     )
 
-    mode = os.environ.get("SAM2_PROMPT_MODE", "box").lower()
+    mode = os.environ.get("SAM2_PROMPT_MODE", "mask").lower()
     if mode == "mask":
         predictor.add_new_mask(
             inference_state=state,
@@ -457,7 +452,7 @@ def build_tracked_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fp
 
 
 def processing_size(width: int, height: int, quality: str, max_side_cap: int | None = None) -> tuple[int, int]:
-    default_max_side = 720 if quality == "higher" else 640
+    default_max_side = 1080 if quality == "higher" else 960
     max_side = int(os.environ.get("ERASER_PROPAINTER_MAX_SIDE", str(default_max_side)))
     if max_side_cap:
         max_side = min(max_side, max_side_cap)
@@ -839,17 +834,6 @@ def masked_change_score(source_video: Path, candidate_video: Path, mask_dir: Pat
     return sum(scores) / len(scores) if scores else 0.0
 
 
-def force_visible_fill(frame: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    k = max(31, min(91, (max(frame.shape[:2]) // 20) | 1))
-    if k % 2 == 0:
-        k += 1
-
-    blurred = cv2.GaussianBlur(frame, (k, k), 0)
-    out = frame.copy()
-    out[mask > 24] = blurred[mask > 24]
-    return out
-
-
 def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path, fps: float) -> Path:
     fallback_dir = work_dir / "opencv_tracked_inpaint"
 
@@ -888,24 +872,23 @@ def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path,
         elif mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
 
-        mask = clean_mask(mask, width, height, 0.12)
-
+        mask = (mask > 24).astype(np.uint8) * 255
         if mask_bbox(mask) is not None:
-            radius = max(5, min(14, int(max(width, height) * 0.012)))
+            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+            radius = max(3, min(7, int(max(width, height) * 0.006)))
 
             telea = cv2.inpaint(frame, mask, radius, cv2.INPAINT_TELEA)
             ns = cv2.inpaint(frame, mask, radius, cv2.INPAINT_NS)
 
             telea_score = float(cv2.absdiff(frame, telea)[mask > 24].mean())
             ns_score = float(cv2.absdiff(frame, ns)[mask > 24].mean())
+            valid = [(telea_score, telea), (ns_score, ns)]
+            valid = [item for item in valid if item[0] >= UNCHANGED_THRESHOLD]
+            if not valid:
+                raise RuntimeError("OpenCV fallback could not remove the selected region cleanly")
 
-            candidate = telea if telea_score >= ns_score else ns
-            score = max(telea_score, ns_score)
-
-            if score < UNCHANGED_THRESHOLD:
-                candidate = force_visible_fill(candidate, mask)
-                score = float(cv2.absdiff(frame, candidate)[mask > 24].mean())
-
+            score, candidate = min(valid, key=lambda item: item[0])
             frame = candidate
             changes.append(score)
 

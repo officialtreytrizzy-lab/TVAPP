@@ -114,19 +114,23 @@ requireText('gpu-worker/pipelines/sam2_propainter.py', 'fps={fps:.6f}', 'final o
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_OUTPUT_QUALITY', 'pipeline must honor source/higher output quality');
 forbidText('gpu-worker/pipelines/sam2_propainter.py', 'Smoke-test pipeline', 'do not regress to unchanged-video smoke test');
 
-// Production resilience invariants for the exact failures seen on mobile.
+// Production resilience and quality invariants.
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'allow_empty=True', 'an empty SAM2 frame must not abort the entire track');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'propainter_attempts', 'ProPainter must retry with progressively smaller valid windows');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(960, "12", "6"', 'the A10G worker must attempt a high-resolution ProPainter pass first');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'ERASER_ALLOW_OPENCV_FALLBACK', 'low-quality fallback must be explicitly opt-in');
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'validate_video_liveness', 'every candidate and final output must be checked for frozen video');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'Final ProPainter composite was invalid', 'a frozen final composite must be rebuilt from source frames');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'using tracked fallback', 'non-OOM ProPainter failures must also produce a moving fallback result');
-forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(480, "8", "1"', 'neighbor_length=1 creates a zero range step in upstream ProPainter');
+forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'force_visible_fill', 'the worker must never manufacture a Gaussian-blur blob');
+forbidText('gpu-worker/pipelines/sam2_propainter.py', 'force_visible_fill', 'the locked core must never manufacture a Gaussian-blur blob');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_MASK_DILATION_PX', 'mask growth must be tightly controlled');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'SAM2_PROMPT_MODE", "mask"', 'SAM2 must use the painted mask by default instead of a broad box prompt');
 
 // Exact-selection acceptance invariants. A playable moving result is still a failure when the marked spot remains.
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_selection_changed', 'the selected frame must be checked directly, not inferred from unrelated sample frames');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'SelectionNotRemovedError', 'unchanged selections must fail instead of being reported as complete');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'build_stronger_masks', 'the fallback must expand tracked masks when normal inpainting misses the selected edges');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'Final verified fallback output', 'the final muxed MP4 must pass exact-selection verification');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'build_recovery_masks', 'a missed selection must receive a tight second ProPainter pass');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_patch_quality', 'a broad rectangular repair must be rejected before delivery');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'refusing to return a blurred patch', 'failed AI recovery must not be reported as a low-quality success');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'Final quality-safe recovery output', 'the final muxed MP4 must pass exact-selection verification');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'ERASER_ANCHOR_MIN_CHANGED_RATIO', 'selection-change sensitivity must remain configurable');
 
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');

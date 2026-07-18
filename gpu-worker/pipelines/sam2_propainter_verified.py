@@ -19,10 +19,15 @@ import numpy as np
 import sam2_propainter as locked_core
 import sam2_propainter_resilient as pipeline
 
-ANCHOR_MIN_MEAN_CHANGE = float(os.environ.get("ERASER_ANCHOR_MIN_MEAN_CHANGE", "4.0"))
-ANCHOR_CHANGED_PIXEL_THRESHOLD = float(os.environ.get("ERASER_ANCHOR_PIXEL_THRESHOLD", "8.0"))
-ANCHOR_MIN_CHANGED_RATIO = float(os.environ.get("ERASER_ANCHOR_MIN_CHANGED_RATIO", "0.20"))
-STRONG_MASK_RADIUS_RATIO = float(os.environ.get("ERASER_STRONG_MASK_RADIUS_RATIO", "0.012"))
+ANCHOR_MIN_MEAN_CHANGE = float(os.environ.get("ERASER_ANCHOR_MIN_MEAN_CHANGE", "3.0"))
+ANCHOR_CHANGED_PIXEL_THRESHOLD = float(os.environ.get("ERASER_ANCHOR_PIXEL_THRESHOLD", "7.0"))
+ANCHOR_MIN_CHANGED_RATIO = float(os.environ.get("ERASER_ANCHOR_MIN_CHANGED_RATIO", "0.12"))
+RECOVERY_MASK_DILATION_PX = int(os.environ.get("ERASER_RECOVERY_MASK_DILATION_PX", "3"))
+ALLOW_OPENCV_FALLBACK = os.environ.get("ERASER_ALLOW_OPENCV_FALLBACK", "false").lower() == "true"
+PATCH_DELTA_THRESHOLD = float(os.environ.get("ERASER_PATCH_DELTA_THRESHOLD", "10.0"))
+PATCH_MAX_SPILL_MEAN = float(os.environ.get("ERASER_PATCH_MAX_SPILL_MEAN", "6.0"))
+PATCH_MAX_SPILL_RATIO = float(os.environ.get("ERASER_PATCH_MAX_SPILL_RATIO", "0.12"))
+PATCH_MAX_EXTENT_RATIO = float(os.environ.get("ERASER_PATCH_MAX_EXTENT_RATIO", "5.0"))
 
 
 class SelectionNotRemovedError(RuntimeError):
@@ -46,15 +51,11 @@ def read_frame(path: Path, frame_index: int) -> np.ndarray:
 
 def verification_mask(input_mask: Path, width: int, height: int) -> np.ndarray:
     raw = locked_core.read_mask_alpha(input_mask, width, height)
-    mask = pipeline.resilient_clean_mask(raw, width, height, 0.18)
-
-    # Include the immediate boundary of the user's painted selection. This stops
-    # a renderer from changing only a couple of center pixels while leaving the
-    # visible selected spot untouched around its edges.
-    radius = max(2, min(12, int(round(max(width, height) * 0.004))))
-    kernel_size = radius * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    return cv2.dilate(mask, kernel, iterations=1)
+    mask = (raw > 24).astype(np.uint8) * 255
+    if locked_core.mask_bbox(mask) is None:
+        raise RuntimeError("Selection verification mask is empty")
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
 
 def selection_change_metrics(
@@ -116,7 +117,77 @@ def validate_selection_changed(
     return stats
 
 
-def build_stronger_masks(
+def patch_quality_metrics(
+    source_video: Path,
+    candidate_video: Path,
+    mask: np.ndarray,
+    frame_index: int,
+) -> dict[str, float]:
+    """Measure change leaking beyond the selected object into a patch-shaped area."""
+    source = read_frame(source_video, frame_index)
+    candidate = read_frame(candidate_video, frame_index)
+    height, width = source.shape[:2]
+    if candidate.shape[1] != width or candidate.shape[0] != height:
+        candidate = cv2.resize(candidate, (width, height), interpolation=cv2.INTER_LINEAR)
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+
+    binary = (mask > 24).astype(np.uint8)
+    selected_pixels = int(np.count_nonzero(binary))
+    if selected_pixels <= 0:
+        raise RuntimeError("Patch quality mask is empty")
+
+    delta = cv2.absdiff(source, candidate).astype(np.float32).mean(axis=2)
+    guard_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    outer_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (49, 49))
+    guard = cv2.dilate(binary, guard_kernel, iterations=1) > 0
+    outer = cv2.dilate(binary, outer_kernel, iterations=1) > 0
+    spill_ring = outer & ~guard
+
+    spill_mean = float(delta[spill_ring].mean()) if np.any(spill_ring) else 0.0
+    spill_ratio = float(np.mean(delta[spill_ring] >= PATCH_DELTA_THRESHOLD)) if np.any(spill_ring) else 0.0
+
+    changed = (delta >= PATCH_DELTA_THRESHOLD).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(changed, connectivity=8)
+    touching_area = 0
+    for component in range(1, count):
+        component_pixels = labels == component
+        if np.any(component_pixels & guard):
+            touching_area += int(stats[component, cv2.CC_STAT_AREA])
+    extent_ratio = float(touching_area / max(selected_pixels, 1))
+
+    return {
+        "spill_mean": spill_mean,
+        "spill_ratio": spill_ratio,
+        "extent_ratio": extent_ratio,
+        "selected_pixels": float(selected_pixels),
+    }
+
+
+def validate_patch_quality(
+    source_video: Path,
+    candidate_video: Path,
+    mask: np.ndarray,
+    frame_index: int,
+    label: str,
+) -> dict[str, float]:
+    stats = patch_quality_metrics(source_video, candidate_video, mask, frame_index)
+    print(f"{label} patch-quality verification: {json.dumps(stats, sort_keys=True)}", flush=True)
+    broad_spill = (
+        stats["spill_mean"] > PATCH_MAX_SPILL_MEAN
+        and stats["spill_ratio"] > PATCH_MAX_SPILL_RATIO
+    )
+    if broad_spill:
+        raise SelectionNotRemovedError(
+            f"{label} created a visible patch outside the selection: "
+            f"spill_mean={stats['spill_mean']:.3f}, "
+            f"spill_ratio={stats['spill_ratio']:.3f}, "
+            f"extent_ratio={stats['extent_ratio']:.3f}"
+        )
+    return stats
+
+
+def build_recovery_masks(
     source_dir: Path,
     output_dir: Path,
     anchor_index: int,
@@ -124,14 +195,14 @@ def build_stronger_masks(
     width: int,
     height: int,
 ) -> Path:
+    """Create a tight second-pass mask for ProPainter, never a blur patch."""
     if output_dir.exists():
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    radius = max(5, min(28, int(round(max(width, height) * STRONG_MASK_RADIUS_RATIO))))
+    radius = max(1, min(6, RECOVERY_MASK_DILATION_PX))
     kernel_size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-
     mask_files = sorted(source_dir.glob("*.png"))
     if not mask_files:
         raise RuntimeError(f"No tracked masks were found under {source_dir}")
@@ -142,29 +213,22 @@ def build_stronger_masks(
             mask = np.zeros((height, width), dtype=np.uint8)
         elif mask.shape[1] != width or mask.shape[0] != height:
             mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
-
         mask = (mask > 24).astype(np.uint8) * 255
         try:
             idx = int(path.stem)
         except ValueError:
             idx = -1
-
         if idx == anchor_index:
             mask = cv2.bitwise_or(mask, anchor_mask)
         if locked_core.mask_bbox(mask) is not None:
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
             mask = cv2.dilate(mask, kernel, iterations=1)
-
         cv2.imwrite(str(output_dir / path.name), mask)
 
-    print(
-        f"Built stronger tracked masks with radius={radius}px for selected-region recovery",
-        flush=True,
-    )
+    print(f"Built tight ProPainter recovery masks with radius={radius}px", flush=True)
     return output_dir
 
 
-def verified_fallback(
+def verified_recovery(
     source_video: Path,
     tracked_masks: Path,
     work_dir: Path,
@@ -173,49 +237,38 @@ def verified_fallback(
     anchor_mask: np.ndarray,
     width: int,
     height: int,
+    output_quality: str,
 ) -> Path:
-    first_error: RuntimeError | None = None
-    try:
-        candidate = pipeline.run_opencv_tracked_inpaint(source_video, tracked_masks, work_dir, fps)
-        validate_selection_changed(
-            source_video,
-            candidate,
-            anchor_mask,
-            anchor_index,
-            "Tracked fallback",
-        )
-        return candidate
-    except RuntimeError as exc:
-        first_error = exc
-        print(
-            f"Normal tracked fallback did not remove the painted selection; expanding masks: {exc}",
-            flush=True,
-        )
-
-    stronger_dir = work_dir / "sam2_remove_masks_strong"
-    build_stronger_masks(
+    recovery_masks = build_recovery_masks(
         tracked_masks,
-        stronger_dir,
+        work_dir / "sam2_remove_masks_recovery",
         anchor_index,
         anchor_mask,
         width,
         height,
     )
-    candidate = pipeline.run_opencv_tracked_inpaint(source_video, stronger_dir, work_dir, fps)
     try:
-        validate_selection_changed(
+        candidate = pipeline.run_propainter(
             source_video,
-            candidate,
-            anchor_mask,
-            anchor_index,
-            "Strong tracked fallback",
+            recovery_masks,
+            work_dir / "propainter_recovery_results",
+            width,
+            height,
+            output_quality,
         )
+        pipeline.validate_video_liveness(source_video, candidate, "ProPainter recovery")
+        validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
+        validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
+        return candidate
     except RuntimeError as exc:
-        raise SelectionNotRemovedError(
-            "eTreyser refused to return another unchanged result. "
-            f"Normal fallback: {first_error}; strong fallback: {exc}"
-        ) from exc
-    return candidate
+        if not ALLOW_OPENCV_FALLBACK:
+            raise SelectionNotRemovedError(
+                "Quality-safe ProPainter recovery failed; refusing to return a blurred patch"
+            ) from exc
+        candidate = pipeline.run_opencv_tracked_inpaint(source_video, recovery_masks, work_dir, fps)
+        validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "Opt-in OpenCV fallback")
+        validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "Opt-in OpenCV fallback")
+        return candidate
 
 
 def main() -> None:
@@ -271,11 +324,14 @@ def main() -> None:
             height,
         )
         print(f"ProPainter masked-region change score={change_score:.3f}", flush=True)
-        if change_score < locked_core.UNCHANGED_THRESHOLD:
-            raise SelectionNotRemovedError(
-                f"ProPainter did not materially change tracked regions (score={change_score:.3f})"
-            )
         validate_selection_changed(
+            source_mp4,
+            inpainted,
+            anchor_mask,
+            anchor_index,
+            "ProPainter",
+        )
+        validate_patch_quality(
             source_mp4,
             inpainted,
             anchor_mask,
@@ -285,10 +341,10 @@ def main() -> None:
     except RuntimeError as exc:
         used_fallback = True
         print(
-            f"ProPainter did not remove the exact painted selection; using verified fallback: {exc}",
+            f"ProPainter failed selection or patch-quality verification; using quality-safe recovery: {exc}",
             flush=True,
         )
-        inpainted = verified_fallback(
+        inpainted = verified_recovery(
             source_mp4,
             tracked_masks,
             work_dir,
@@ -297,6 +353,7 @@ def main() -> None:
             anchor_mask,
             width,
             height,
+            output_quality,
         )
 
     locked_core.mux_audio(
@@ -318,6 +375,13 @@ def main() -> None:
             anchor_index,
             "Final eraser output",
         )
+        validate_patch_quality(
+            source_mp4,
+            output_video,
+            anchor_mask,
+            anchor_index,
+            "Final eraser output",
+        )
     except RuntimeError as exc:
         if used_fallback:
             raise
@@ -325,7 +389,7 @@ def main() -> None:
             f"Final ProPainter composite failed exact-selection verification; rebuilding: {exc}",
             flush=True,
         )
-        inpainted = verified_fallback(
+        inpainted = verified_recovery(
             source_mp4,
             tracked_masks,
             work_dir,
@@ -334,6 +398,7 @@ def main() -> None:
             anchor_mask,
             width,
             height,
+            output_quality,
         )
         locked_core.mux_audio(
             inpainted,
@@ -344,13 +409,20 @@ def main() -> None:
             fps,
             output_quality,
         )
-        pipeline.validate_video_liveness(source_mp4, output_video, "Final verified fallback output")
+        pipeline.validate_video_liveness(source_mp4, output_video, "Final quality-safe recovery output")
         validate_selection_changed(
             source_mp4,
             output_video,
             anchor_mask,
             anchor_index,
-            "Final verified fallback output",
+            "Final quality-safe recovery output",
+        )
+        validate_patch_quality(
+            source_mp4,
+            output_video,
+            anchor_mask,
+            anchor_index,
+            "Final quality-safe recovery output",
         )
 
     if not output_video.exists() or output_video.stat().st_size <= 0:
