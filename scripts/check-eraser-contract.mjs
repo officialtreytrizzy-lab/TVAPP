@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from 'node:fs';
 
 const requiredFiles = [
   'src/lib/eraser/gpu.ts',
+  'src/lib/eraser/api.ts',
+  'src/components/AppLayout.tsx',
   'src/components/eraser/Editor.tsx',
   'src/components/eraser/ProcessingPanel.tsx',
   'api/_lib/trecut-eraser-proxy.ts',
@@ -66,6 +68,21 @@ requireText('src/components/eraser/ProcessingPanel.tsx', "audio_preserving_expor
 requireText('src/components/eraser/Editor.tsx', 'const out: PipelineOutput = await runGpuRemoval', 'editor must execute the GPU pipeline directly');
 forbidText('src/components/eraser/Editor.tsx', 'runBrowserFallback', 'production must not silently switch to another algorithm');
 forbidText('src/components/eraser/Editor.tsx', 'runPipeline({', 'production must not execute browser fallback processing');
+
+
+// Device-authenticated three-job recent library.
+requireText('src/lib/eraser/api.ts', "DEVICE_CREDENTIAL_KEY = 'etreyser.device.credential.v1'", 'the device must possess a stable private library credential');
+requireText('src/lib/eraser/api.ts', 'MAX_RECENT_COMPLETED_JOBS = 3', 'the device library must retain exactly three completed jobs');
+requireText('src/lib/eraser/api.ts', 'device_id: currentDeviceId()', 'new eraser jobs must be scoped to the current device');
+requireText('src/lib/eraser/api.ts', 'navigator.storage.persist()', 'the browser should request durable device storage when available');
+requireText('src/lib/eraser/api.ts', 'pruneCompletedJobsForCurrentDevice', 'saving a fourth completed job must evict the oldest');
+requireText('src/lib/eraser/api.ts', 'deleteOutput(job.final_output_key)', 'eviction must remove the saved IndexedDB video, not only metadata');
+requireText('src/lib/eraser/api.ts', 'listRecentCompletedJobs', 'the library must expose only recent completed jobs');
+requireText('src/components/eraser/Editor.tsx', 'eraserApi.uploadOutput(jobId, outputBlob, out.mimeType)', 'GPU outputs must be persisted to the device library');
+requireText('src/components/eraser/Editor.tsx', 'await eraserApi.complete({', 'GPU completion must finalize local device metadata');
+requireText('src/components/AppLayout.tsx', 'Recent eraser jobs', 'the user interface must expose the recent completed-job library');
+requireText('src/components/AppLayout.tsx', 'Unlocked by this device', 'the library must explain its possession-based device access');
+requireText('src/components/AppLayout.tsx', 'eraserApi.listRecentCompletedJobs()', 'the drawer must not show failed or unfinished jobs');
 
 requireText('api/_lib/modal.ts', "'optical-flow-vace-diffusion'", 'licensed API calls must use the exact production pipeline');
 requireText('api/_lib/trecut-eraser-proxy.ts', 'TRECUT_ETREYSER_API_KEY', 'proxy must read the API key server-side');

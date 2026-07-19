@@ -213,11 +213,44 @@ export default function Editor() {
         onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
       });
 
-      outputRef.current = out;
-      setFinalUrl(out.finalUrl);
+      let savedLibraryUrl = '';
+      let librarySaveError = '';
+      try {
+        const outputResponse = await fetch(out.localUrl || out.finalUrl);
+        if (!outputResponse.ok) throw new Error(`Could not read completed video (HTTP ${outputResponse.status}).`);
+        const outputBlob = await outputResponse.blob();
+        if (!outputBlob.size) throw new Error('Completed video was empty.');
+        savedLibraryUrl = await eraserApi.uploadOutput(jobId, outputBlob, out.mimeType);
+      } catch (saveError) {
+        librarySaveError = (saveError as Error).message;
+        await eraserApi.progress({
+          jobId,
+          statusMessage: 'Video completed, but this device could not save it to Recent Jobs.',
+          log: `device library save failed: ${librarySaveError}`,
+        }).catch(() => undefined);
+      }
+
+      await eraserApi.complete({
+        jobId,
+        previewUrl: savedLibraryUrl || undefined,
+        finalOutputUrl: savedLibraryUrl || undefined,
+        outputMime: out.mimeType,
+        audioPreserved: out.hasAudio,
+      });
+
+      const completedOutput: PipelineOutput = {
+        ...out,
+        finalUrl: savedLibraryUrl || out.finalUrl,
+      };
+      outputRef.current = completedOutput;
+      setFinalUrl(completedOutput.finalUrl);
       setPhase('completed');
       setProgress(100);
-      setStatusMessage(`Done with frame extraction, optical-flow tracking, diffusion inpainting, and audio-preserving export (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).`);
+      setStatusMessage(
+        librarySaveError
+          ? `Done, but Recent Jobs could not save this output on the device: ${librarySaveError}`
+          : `Done and saved to this device's Recent Jobs library (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).`,
+      );
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === '__CANCELLED__') {
@@ -257,6 +290,8 @@ export default function Editor() {
 
   const reset = () => {
     if (meta) URL.revokeObjectURL(meta.url);
+    const sessionOutputUrl = outputRef.current?.localUrl;
+    if (sessionOutputUrl?.startsWith('blob:') && sessionOutputUrl !== finalUrl) URL.revokeObjectURL(sessionOutputUrl);
     if (finalUrl?.startsWith('blob:')) URL.revokeObjectURL(finalUrl);
     setMeta(null); setJobId(null); setFinalUrl(null); setError(null);
     setPhase('awaiting_mask'); setProgress(18); setProcessing(false); setHasMask(false);

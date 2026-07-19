@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import Editor from './eraser/Editor';
-import { eraserApi, type LocalJob } from '@/lib/eraser/api';
-import { Wand2, MousePointerClick, Scan, Film, Sparkles, Github, Mail, History, X, Play, HardDrive, Clapperboard, Code2 } from 'lucide-react';
+import { ERASER_LIBRARY_EVENT, eraserApi, type DeviceIdentity, type LocalJob } from '@/lib/eraser/api';
+import { Wand2, MousePointerClick, Scan, Film, Sparkles, Github, Mail, History, X, Play, Download, Trash2, Smartphone, Clapperboard, Code2 } from 'lucide-react';
 
 const HERO = 'https://d64gsuwffb70l.cloudfront.net/6a407d389662950bf1dfa607_1782611760246_970a59e4.jpg';
 const STEPS = [
@@ -16,31 +16,92 @@ interface ReopenState {
   url: string;
 }
 
-function HistoryDrawer({ jobs, onClose, onReopen }: { jobs: LocalJob[]; onClose: () => void; onReopen: (j: LocalJob) => void }) {
+function HistoryDrawer({
+  jobs,
+  device,
+  onClose,
+  onReopen,
+  onDownload,
+  onDelete,
+}: {
+  jobs: LocalJob[];
+  device: DeviceIdentity;
+  onClose: () => void;
+  onReopen: (job: LocalJob) => void;
+  onDownload: (job: LocalJob) => void;
+  onDelete: (job: LocalJob) => void;
+}) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={onClose}>
-      <div className="h-full w-full max-w-md overflow-y-auto overscroll-contain bg-slate-900 p-5 pt-safe pb-safe ring-1 ring-slate-800" onClick={(e) => e.stopPropagation()}>
+      <div className="h-full w-full max-w-md overflow-y-auto overscroll-contain bg-slate-900 p-5 pt-safe pb-safe ring-1 ring-slate-800" onClick={(event) => event.stopPropagation()}>
         <div className="mb-4 flex items-center justify-between">
-          <h3 className="flex items-center gap-2 text-lg font-bold text-white"><History className="h-5 w-5 text-violet-400" /> Local jobs</h3>
-          <button onClick={onClose} className="text-slate-400 hover:text-white"><X className="h-5 w-5" /></button>
+          <h3 className="flex items-center gap-2 text-lg font-bold text-white">
+            <History className="h-5 w-5 text-violet-400" /> Recent eraser jobs
+          </h3>
+          <button onClick={onClose} className="rounded-lg p-1 text-slate-400 hover:bg-slate-800 hover:text-white" aria-label="Close Recent Jobs">
+            <X className="h-5 w-5" />
+          </button>
         </div>
-        {jobs.length === 0 && <p className="text-sm text-slate-400">No jobs yet. Upload a video to get started.</p>}
+
+        <div className="mb-5 rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3">
+          <div className="flex items-start gap-2 text-sm text-emerald-200">
+            <Smartphone className="mt-0.5 h-4 w-4 shrink-0" />
+            <div>
+              <p className="font-medium">Unlocked by this device</p>
+              <p className="mt-1 text-xs text-emerald-200/70">
+                Device ID {device.shortId}. The browser-held credential is the key; no account or password is used.
+              </p>
+            </div>
+          </div>
+        </div>
+
+        <p className="mb-4 text-xs leading-5 text-slate-400">
+          The three newest completed eraser videos are stored privately on this device. Saving a fourth automatically removes the oldest.
+        </p>
+
+        {jobs.length === 0 && (
+          <div className="rounded-xl border border-dashed border-slate-700 p-6 text-center">
+            <History className="mx-auto h-7 w-7 text-slate-600" />
+            <p className="mt-3 text-sm font-medium text-slate-300">No completed jobs saved yet</p>
+            <p className="mt-1 text-xs text-slate-500">A successful eraser export will appear here automatically.</p>
+          </div>
+        )}
+
         <ul className="space-y-3">
-          {jobs.map((j) => (
-            <li key={j.id} className="rounded-xl bg-slate-800/70 p-4 ring-1 ring-slate-700">
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate font-medium text-white">{j.original_filename || 'video'}</span>
-                <span className={`rounded-full px-2 py-0.5 text-xs ${j.phase === 'completed' ? 'bg-emerald-500/20 text-emerald-300' : j.phase === 'failed' ? 'bg-red-500/20 text-red-300' : 'bg-slate-700 text-slate-300'}`}>{j.phase}</span>
+          {jobs.map((job, index) => (
+            <li key={job.id} className="rounded-xl bg-slate-800/70 p-4 ring-1 ring-slate-700">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate font-medium text-white">{job.original_filename || 'Cleaned video'}</p>
+                  <p className="mt-1 text-xs text-slate-400">
+                    {job.width}×{job.height} · {Math.round(job.fps)} fps · {job.duration.toFixed(1)}s
+                  </p>
+                </div>
+                <span className="shrink-0 rounded-full bg-violet-500/15 px-2 py-1 text-[11px] font-medium text-violet-200">
+                  #{index + 1}
+                </span>
               </div>
-              <p className="mt-1 font-mono text-xs text-slate-500">{j.job_id.slice(0, 8)} · {new Date(j.created_at).toLocaleString()}</p>
-              {j.phase === 'completed' && (j.final_output_key || j.final_output_url) && (
-                <button onClick={() => onReopen(j)} className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500">
-                  <Play className="h-3.5 w-3.5" /> Reopen preview
+              <p className="mt-2 text-xs text-slate-500">
+                Completed {new Date(job.completed_at || job.updated_at).toLocaleString()}
+              </p>
+              <div className="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2">
+                <button onClick={() => onReopen(job)} className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-500">
+                  <Play className="h-3.5 w-3.5" /> Preview
                 </button>
-              )}
+                <button onClick={() => onDownload(job)} className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-700 px-3 py-2 text-xs font-medium text-slate-100 hover:bg-slate-600">
+                  <Download className="h-3.5 w-3.5" /> Download
+                </button>
+                <button onClick={() => onDelete(job)} className="inline-flex items-center justify-center rounded-lg bg-red-500/10 px-3 py-2 text-red-300 hover:bg-red-500/20" aria-label={`Remove ${job.original_filename || 'job'} from Recent Jobs`}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
             </li>
           ))}
         </ul>
+
+        <p className="mt-5 text-[11px] leading-4 text-slate-500">
+          Clearing this site's browser data, using private browsing, or switching devices creates a different library.
+        </p>
       </div>
     </div>
   );
@@ -50,19 +111,24 @@ export default function AppLayout() {
   const [year] = useState(new Date().getFullYear());
   const [showHistory, setShowHistory] = useState(false);
   const [jobs, setJobs] = useState<LocalJob[]>([]);
+  const [device] = useState<DeviceIdentity>(() => eraserApi.getDeviceIdentity());
   const [reopen, setReopen] = useState<ReopenState | null>(null);
   const [reopenError, setReopenError] = useState<string | null>(null);
 
   const loadJobs = useCallback(async () => {
-    const rows = await eraserApi.listJobs();
+    const rows = await eraserApi.listRecentCompletedJobs();
     setJobs(rows);
   }, []);
 
   useEffect(() => {
     loadJobs();
-    const onFocus = () => loadJobs();
-    window.addEventListener('focus', onFocus);
-    return () => window.removeEventListener('focus', onFocus);
+    const refresh = () => loadJobs();
+    window.addEventListener('focus', refresh);
+    window.addEventListener(ERASER_LIBRARY_EVENT, refresh);
+    return () => {
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener(ERASER_LIBRARY_EVENT, refresh);
+    };
   }, [loadJobs]);
 
   const scrollToEditor = () => document.getElementById('editor')?.scrollIntoView({ behavior: 'smooth' });
@@ -78,6 +144,36 @@ export default function AppLayout() {
     } catch (e) {
       setReopenError((e as Error).message);
     }
+  };
+
+
+  const downloadJob = async (job: LocalJob) => {
+    setReopenError(null);
+    try {
+      const url = await eraserApi.resolveOutputUrl(job);
+      if (!url) throw new Error('This saved video is no longer available on the device.');
+      const extension = /mp4/i.test(job.output_mime || '') ? 'mp4' : 'webm';
+      const baseName = (job.original_filename || 'video').replace(/\.[^.]+$/, '');
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `${baseName}-erased.${extension}`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    } catch (error) {
+      setReopenError((error as Error).message);
+    }
+  };
+
+  const deleteJob = async (job: LocalJob) => {
+    if (!window.confirm(`Remove ${job.original_filename || 'this video'} from this device's Recent Jobs?`)) return;
+    if (reopen?.job.id === job.id) {
+      URL.revokeObjectURL(reopen.url);
+      setReopen(null);
+    }
+    await eraserApi.deleteJob(job.job_id);
+    await loadJobs();
   };
 
   return (
@@ -96,10 +192,10 @@ export default function AppLayout() {
               <Clapperboard className="h-4 w-4" /> <span className="hidden sm:inline">OpenCut</span>
             </a>
             <button onClick={() => { loadJobs(); setShowHistory(true); }} className="flex items-center gap-1.5 rounded-lg bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">
-              <History className="h-4 w-4" /> <span className="hidden sm:inline">Local jobs</span>
+              <History className="h-4 w-4" /> <span className="hidden sm:inline">Recent jobs</span>
             </button>
             <span className="hidden items-center gap-1.5 rounded-lg bg-emerald-500/10 px-3 py-2 text-xs font-medium text-emerald-300 ring-1 ring-emerald-500/20 sm:flex">
-              <HardDrive className="h-3.5 w-3.5" /> One-folder mode
+              <Smartphone className="h-3.5 w-3.5" /> Device library
             </span>
           </div>
         </div>
@@ -169,7 +265,16 @@ export default function AppLayout() {
         <div className="border-t border-slate-800 px-4 py-5 pb-safe text-center text-xs text-slate-500">© {year} Video ETreyser. Only edit videos you own or have permission to edit.</div>
       </footer>
 
-      {showHistory && <HistoryDrawer jobs={jobs} onClose={() => setShowHistory(false)} onReopen={reopenJob} />}
+      {showHistory && (
+        <HistoryDrawer
+          jobs={jobs}
+          device={device}
+          onClose={() => setShowHistory(false)}
+          onReopen={reopenJob}
+          onDownload={downloadJob}
+          onDelete={deleteJob}
+        />
+      )}
     </div>
   );
 }
