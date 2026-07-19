@@ -16,7 +16,7 @@ export default async function handler(req: any, res: any) {
 
   try {
     requireApiKey(req, 'video_removal:write');
-    const base = modalBaseUrl() || 'https://californiatrey--tvapp-video-eraser-gpu-fastapi-app.modal.run';
+    const base = modalBaseUrl() || 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run';
     if (!base) return error(res, 503, 'GPU worker is not configured.', 'worker_not_configured');
     json(res, 200, {
       worker_base: base,
@@ -26,8 +26,10 @@ export default async function handler(req: any, res: any) {
       ai_remix_upload_url: `${base}/v1/ai-remix/jobs`,
       aiRemixUploadUrl: `${base}/v1/ai-remix/jobs`,
       video_removal_upload_url: `${base}/v1/video-eraser/jobs`,
+      chunked_upload_url: `${base}/v1/video-eraser/uploads`,
+      chunkedUploadUrl: `${base}/v1/video-eraser/uploads`,
       video_transitions_mix_upload_url: `${base}/v1/video-transitions/mix/jobs`,
-      note: 'POST multipart form-data directly to these URLs for large files; poll {worker_base}/v1/.../jobs/{jobId} and fetch .../output when phase=completed.',
+      note: 'Use chunked_upload_url for retryable mobile uploads. Legacy multipart endpoints remain available for compatible clients.',
     });
   } catch (e) {
     const err = e as any;

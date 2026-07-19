@@ -3,13 +3,22 @@
 // in localStorage and final output videos in IndexedDB so `npm run dev` works
 // as one self-contained repo.
 
-const JOBS_KEY = 'eraserai.local.jobs.v1';
+const JOBS_KEY = 'eraserai.local.jobs.v2';
+const LEGACY_JOBS_KEY = 'eraserai.local.jobs.v1';
+const DEVICE_CREDENTIAL_KEY = 'etreyser.device.credential.v1';
 const DB_NAME = 'eraserai-local-output-db';
 const DB_VERSION = 1;
 const OUTPUT_STORE = 'outputs';
+const MAX_RECENT_COMPLETED_JOBS = 3;
+export const ERASER_LIBRARY_EVENT = 'etreyser:library-updated';
 
 const ACTIVE_PROCESSING = new Set([
   'segmenting',
+  'frame_extraction',
+  'optical_flow_tracking',
+  'diffusion_inpainting',
+  'audio_preserving_export',
+  'validation',
   'tracking_mask',
   'smoothing_masks',
   'inpainting',
@@ -18,10 +27,25 @@ const ACTIVE_PROCESSING = new Set([
   'generating_preview',
 ]);
 
+export interface DeviceIdentity {
+  deviceId: string;
+  createdAt: string;
+  shortId: string;
+}
+
+interface StoredDeviceCredential {
+  deviceId: string;
+  deviceSecret: string;
+  createdAt: string;
+}
+
+let cachedDeviceCredential: StoredDeviceCredential | null = null;
+
 export interface LocalJob {
   id: string;
   job_id: string;
   user_id: string | null;
+  device_id: string;
   file_type: string;
   duration: number;
   fps: number;
@@ -92,6 +116,58 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function randomToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+}
+
+function getOrCreateDeviceCredential(): StoredDeviceCredential {
+  if (cachedDeviceCredential) return cachedDeviceCredential;
+  const fallback: StoredDeviceCredential = {
+    deviceId: `device-${randomToken().slice(0, 24)}`,
+    deviceSecret: randomToken(),
+    createdAt: nowIso(),
+  };
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const raw = window.localStorage.getItem(DEVICE_CREDENTIAL_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<StoredDeviceCredential>;
+      if (parsed.deviceId && parsed.deviceSecret && parsed.createdAt) {
+        cachedDeviceCredential = parsed as StoredDeviceCredential;
+        return cachedDeviceCredential;
+      }
+    }
+    window.localStorage.setItem(DEVICE_CREDENTIAL_KEY, JSON.stringify(fallback));
+    cachedDeviceCredential = fallback;
+  } catch {
+    // Storage can be unavailable in hardened/private contexts. The in-memory
+    // fallback still lets the current session work, but cannot survive reloads.
+  }
+  cachedDeviceCredential = fallback;
+  return cachedDeviceCredential;
+}
+
+export function getDeviceIdentity(): DeviceIdentity {
+  const credential = getOrCreateDeviceCredential();
+  return {
+    deviceId: credential.deviceId,
+    createdAt: credential.createdAt,
+    shortId: credential.deviceId.replace(/^device-/, '').slice(0, 8).toUpperCase(),
+  };
+}
+
+function currentDeviceId(): string {
+  return getOrCreateDeviceCredential().deviceId;
+}
+
+function notifyLibraryUpdated(): void {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent(ERASER_LIBRARY_EVENT));
+}
+
 function uuid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -102,9 +178,19 @@ function uuid(): string {
 function readJobs(): LocalJob[] {
   if (typeof window === 'undefined') return [];
   try {
-    const raw = window.localStorage.getItem(JOBS_KEY);
+    const raw = window.localStorage.getItem(JOBS_KEY) ?? window.localStorage.getItem(LEGACY_JOBS_KEY);
     const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    const deviceId = currentDeviceId();
+    const normalized = parsed.map((job) => ({
+      ...job,
+      device_id: String(job?.device_id || job?.user_id || deviceId),
+      user_id: String(job?.user_id || job?.device_id || deviceId),
+    })) as LocalJob[];
+    if (!window.localStorage.getItem(JOBS_KEY) && normalized.length) {
+      window.localStorage.setItem(JOBS_KEY, JSON.stringify(normalized));
+    }
+    return normalized;
   } catch {
     return [];
   }
@@ -202,13 +288,54 @@ async function getOutput(key: string): Promise<{ blob: Blob; mimeType: string } 
   return result;
 }
 
+
+async function deleteOutput(key: string | null): Promise<void> {
+  if (!key) return;
+  const db = await openOutputDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(OUTPUT_STORE, 'readwrite');
+    tx.objectStore(OUTPUT_STORE).delete(key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error('Could not delete the saved video.'));
+  });
+  db.close();
+}
+
+async function requestPersistentDeviceStorage(): Promise<void> {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.storage?.persist) {
+      await navigator.storage.persist();
+    }
+  } catch {
+    // Optional browser capability. IndexedDB remains usable without it.
+  }
+}
+
+function completedSortTime(job: LocalJob): number {
+  return Date.parse(job.completed_at || job.updated_at || job.created_at) || 0;
+}
+
+async function pruneCompletedJobsForCurrentDevice(): Promise<void> {
+  const deviceId = currentDeviceId();
+  const jobs = readJobs();
+  const completed = jobs
+    .filter((job) => job.device_id === deviceId && job.phase === 'completed')
+    .sort((a, b) => completedSortTime(b) - completedSortTime(a));
+  const expired = completed.slice(MAX_RECENT_COMPLETED_JOBS);
+  if (!expired.length) return;
+  const expiredIds = new Set(expired.map((job) => job.id));
+  await Promise.all(expired.map((job) => deleteOutput(job.final_output_key).catch(() => undefined)));
+  writeJobs(jobs.filter((job) => !expiredIds.has(job.id)));
+}
+
 export const eraserApi = {
   createJob: async (p: CreateJobPayload) => {
     const timestamp = nowIso();
     const job: LocalJob = {
       id: uuid(),
       job_id: uuid(),
-      user_id: null,
+      user_id: currentDeviceId(),
+      device_id: currentDeviceId(),
       file_type: p.fileType || 'video/mp4',
       duration: p.duration,
       fps: p.fps,
@@ -310,6 +437,9 @@ export const eraserApi = {
       appendLog(cur, `complete mime=${cur.output_mime ?? 'unknown'} audio=${cur.audio_preserved === false ? 'no' : 'yes'}`);
       return cur;
     });
+    await requestPersistentDeviceStorage();
+    await pruneCompletedJobsForCurrentDevice();
+    notifyLibraryUpdated();
     return publicJob(updated);
   },
 
@@ -343,7 +473,7 @@ export const eraserApi = {
     if (!job) throw new Error(`Job not found: ${String(jobId || '').trim() || 'missing jobId'}`);
 
     const ext = /mp4/i.test(mimeType) ? 'mp4' : 'webm';
-    const key = `${job.job_id}-${Date.now()}.${ext}`;
+    const key = `${currentDeviceId()}/${job.job_id}-${Date.now()}.${ext}`;
     await putOutput(key, blob, mimeType);
 
     const objectUrl = URL.createObjectURL(blob);
@@ -359,8 +489,22 @@ export const eraserApi = {
   },
 
   listJobs: async (): Promise<LocalJob[]> => {
-    return readJobs().sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    const deviceId = currentDeviceId();
+    return readJobs()
+      .filter((job) => job.device_id === deviceId)
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   },
+
+  listRecentCompletedJobs: async (): Promise<LocalJob[]> => {
+    await pruneCompletedJobsForCurrentDevice();
+    const deviceId = currentDeviceId();
+    return readJobs()
+      .filter((job) => job.device_id === deviceId && job.phase === 'completed' && !!job.final_output_key)
+      .sort((a, b) => completedSortTime(b) - completedSortTime(a))
+      .slice(0, MAX_RECENT_COMPLETED_JOBS);
+  },
+
+  getDeviceIdentity: (): DeviceIdentity => getDeviceIdentity(),
 
   resolveOutputUrl: async (job: Pick<LocalJob, 'final_output_key' | 'final_output_url'>): Promise<string | null> => {
     if (job.final_output_key) {
@@ -370,7 +514,22 @@ export const eraserApi = {
     return job.final_output_url ?? null;
   },
 
+  deleteJob: async (jobId: string): Promise<void> => {
+    const deviceId = currentDeviceId();
+    const jobs = readJobs();
+    const job = jobs.find((row) => (row.job_id === jobId || row.id === jobId) && row.device_id === deviceId);
+    if (!job) return;
+    await deleteOutput(job.final_output_key).catch(() => undefined);
+    writeJobs(jobs.filter((row) => row.id !== job.id));
+    notifyLibraryUpdated();
+  },
+
   clearLocalJobs: async (): Promise<void> => {
-    writeJobs([]);
+    const deviceId = currentDeviceId();
+    const jobs = readJobs();
+    const owned = jobs.filter((job) => job.device_id === deviceId);
+    await Promise.all(owned.map((job) => deleteOutput(job.final_output_key).catch(() => undefined)));
+    writeJobs(jobs.filter((job) => job.device_id !== deviceId));
+    notifyLibraryUpdated();
   },
 };

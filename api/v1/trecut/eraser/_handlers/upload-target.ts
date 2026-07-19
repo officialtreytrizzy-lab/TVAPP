@@ -1,7 +1,7 @@
-import { error, handleOptions, json, methodNotAllowed } from '../../../_lib/http.js';
-import { modalBaseUrl } from '../../../_lib/modal.js';
+import { error, handleOptions, json, methodNotAllowed } from '../../../../_lib/http.js';
+import { modalBaseUrl } from '../../../../_lib/modal.js';
 
-const DEFAULT_WORKER_BASE = 'https://californiatrey--tvapp-video-eraser-gpu-fastapi-app.modal.run';
+const DEFAULT_WORKER_BASE = 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run';
 
 /**
  * First-party discovery of the GPU worker's direct upload endpoint.
@@ -24,6 +24,8 @@ export default async function handler(req: any, res: any) {
       worker_base: base,
       workerBase: base,
       upload_url: `${base}/v1/video-eraser/jobs`,
+      chunked_upload_url: `${base}/v1/video-eraser/uploads`,
+      chunkedUploadUrl: `${base}/v1/video-eraser/uploads`,
       uploadUrl: `${base}/v1/video-eraser/jobs`,
       status_path_prefix: '/v1/video-eraser/jobs',
       health_url: `${base}/health`,

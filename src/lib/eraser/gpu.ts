@@ -1,4 +1,4 @@
-import type { PipelineOutput } from './pipeline';
+﻿import type { PipelineOutput } from './pipeline';
 
 export type EraserOutputQuality = 'source' | 'higher';
 
@@ -62,7 +62,7 @@ const ERASER_API_PROXY_URL = String(import.meta.env.VITE_TRECUT_ERASER_PROXY_URL
 const PROXY_EXPLICITLY_DISABLED = envFlag('VITE_TRECUT_ERASER_DISABLE_PROXY');
 const USE_ERASER_API_PROXY = !PROXY_EXPLICITLY_DISABLED && ERASER_API_PROXY_URL.length > 0;
 const POLL_MS = 1400;
-const MAX_POLLS = 900; // about 21 minutes
+const MAX_POLLS = 2100; // about 49 minutes, aligned with the long-running diffusion worker
 // Vercel serverless functions reject request bodies over ~4.5MB with
 // FUNCTION_PAYLOAD_TOO_LARGE. Base64 inflates the video by ~33%, so only tiny
 // clips can use the JSON relay; everything else must upload directly to the
@@ -74,9 +74,9 @@ export function isGpuRemovalConfigured(): boolean {
 }
 
 export function gpuRemovalLabel(): string {
-  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser GPU proxy';
-  if (DIRECT_WORKER_URL) return 'GPU AI worker';
-  return 'browser fallback';
+  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser GPU · Optical-flow diffusion';
+  if (DIRECT_WORKER_URL) return 'GPU optical-flow diffusion worker';
+  return 'GPU pipeline unavailable';
 }
 
 export function gpuRemovalDiagnostics() {
@@ -97,12 +97,6 @@ function sleep(ms: number): Promise<void> {
 }
 
 function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
-  // The mask canvas paints WHITE on a transparent background, so the exported
-  // RGBA PNG is (255,255,255,255) where the user painted and (0,0,0,0) where
-  // they did not. That reads as "remove here" under every decode path the GPU
-  // worker might use: by alpha (255 vs 0), by grayscale (255 vs 0), or by color
-  // (white vs black). Do NOT flatten to opaque — the worker reads the alpha
-  // channel, and an all-opaque mask would mark the whole frame for removal.
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
       if (!blob) reject(new Error('Could not export mask PNG.'));
@@ -160,6 +154,11 @@ function getStatusUrl(payload: WorkerJobResponse, baseUrl: string, pathPrefix: s
 
 function normalizePhase(payload: WorkerJobResponse): string {
   const raw = String(payload.phase || payload.status || '').toLowerCase();
+  if (raw.includes('frame_extraction')) return 'frame_extraction';
+  if (raw.includes('optical_flow_tracking')) return 'optical_flow_tracking';
+  if (raw.includes('diffusion_inpainting')) return 'diffusion_inpainting';
+  if (raw.includes('audio_preserving_export')) return 'audio_preserving_export';
+  if (raw.includes('validation')) return 'validation';
   if (raw.includes('segment')) return 'segmenting';
   if (raw.includes('track') || raw.includes('mask')) return 'tracking_mask';
   if (raw.includes('paint') || raw.includes('fill')) return 'inpainting';
@@ -214,23 +213,41 @@ function buildRemovalForm(input: GpuRemovalInput, maskBlob: Blob): FormData {
   form.append('duration', String(duration));
   form.append('width', String(width));
   form.append('height', String(height));
-  form.append('pipeline', 'sam2-propainter');
+  form.append('pipeline', 'optical-flow-vace-diffusion');
   form.append('mask_semantics', 'alpha_gt_0_remove');
   form.append('quality', outputQuality);
   form.append('preserve_resolution', 'true');
   form.append('preserve_fps', 'true');
   form.append('preserve_audio', 'true');
-  // NOTE: intentionally NOT sending output_mode/return_mode/result_mode/
-  // output_kind/composite_output/patch_only/return_patch. Those were added on
-  // 2026-07-05 and coincided with the eraser producing a passthrough (nothing
-  // removed). The last-known-good build (2026-07-04) sent only the fields
-  // above, so we keep the request identical to that.
+  form.append('output_mode', 'composite');
+  form.append('return_mode', 'composite');
+  form.append('result_mode', 'full_video');
+  form.append('output_kind', 'full_video');
+  form.append('composite_output', 'true');
+  form.append('full_frame_output', 'true');
+  form.append('full_video_output', 'true');
+  form.append('patch_only', 'false');
+  form.append('return_patch', 'false');
   return form;
 }
 
 interface ProxyUploadTarget {
   workerBase: string;
   uploadUrl: string;
+  chunkedUploadUrl: string;
+}
+
+interface ChunkUploadSession {
+  upload_id?: string;
+  uploadId?: string;
+  chunk_size?: number;
+  chunkSize?: number;
+  expected_chunks?: number;
+  expectedChunks?: number;
+  chunk_upload_url_template?: string;
+  chunkUploadUrlTemplate?: string;
+  complete_url?: string;
+  completeUrl?: string;
 }
 
 async function fetchProxyUploadTarget(): Promise<ProxyUploadTarget | null> {
@@ -241,10 +258,125 @@ async function fetchProxyUploadTarget(): Promise<ProxyUploadTarget | null> {
     const workerBase = String(payload.worker_base || payload.workerBase || '').replace(/\/$/, '');
     if (!workerBase) return null;
     const uploadUrl = String(payload.upload_url || payload.uploadUrl || `${workerBase}/v1/video-eraser/jobs`);
-    return { workerBase, uploadUrl };
+    const chunkedUploadUrl = String(
+      payload.chunked_upload_url || payload.chunkedUploadUrl || `${workerBase}/v1/video-eraser/uploads`,
+    );
+    return { workerBase, uploadUrl, chunkedUploadUrl };
   } catch {
     return null;
   }
+}
+
+async function responseError(res: Response, fallback: string): Promise<Error> {
+  const text = await res.text().catch(() => '');
+  let message = text || fallback;
+  try {
+    const payload = JSON.parse(text);
+    message = payload?.detail || payload?.error?.message || payload?.error || message;
+  } catch { /* keep raw response */ }
+  return new Error(typeof message === 'string' ? message : JSON.stringify(message));
+}
+
+async function sha256Hex(blob: Blob): Promise<string> {
+  if (!globalThis.crypto?.subtle) return '';
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+  return Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, '0')).join('');
+}
+
+async function uploadChunkWithRetry(url: string, chunk: Blob, chunkIndex: number): Promise<void> {
+  const chunkHash = await sha256Hex(chunk);
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          ...(chunkHash ? { 'X-Chunk-SHA256': chunkHash } : {}),
+        },
+        body: chunk,
+      });
+      if (!res.ok) throw await responseError(res, `Chunk ${chunkIndex + 1} upload failed with HTTP ${res.status}.`);
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (attempt < 4) await sleep(600 * (2 ** (attempt - 1)));
+    }
+  }
+  throw new Error(`Video upload stopped at chunk ${chunkIndex + 1}: ${lastError?.message || 'network error'}`);
+}
+
+async function runChunkedWorkerUpload(
+  target: ProxyUploadTarget,
+  input: GpuRemovalInput,
+  maskBlob: Blob,
+): Promise<WorkerJobResponse> {
+  const { file, jobId, cancelRef, onPhase } = input;
+  const sessionRes = await fetch(target.chunkedUploadUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      job_id: jobId,
+      filename: file.name || 'video.mp4',
+      size: file.size,
+      mime_type: file.type || 'video/mp4',
+      chunk_size: 2 * 1024 * 1024,
+    }),
+  });
+  if (!sessionRes.ok) throw await responseError(sessionRes, `Could not start chunked upload (HTTP ${sessionRes.status}).`);
+  const session = (await sessionRes.json()) as ChunkUploadSession;
+  const uploadId = String(session.upload_id || session.uploadId || '');
+  const chunkSize = Number(session.chunk_size || session.chunkSize || 2 * 1024 * 1024);
+  const expectedChunks = Number(session.expected_chunks || session.expectedChunks || Math.ceil(file.size / chunkSize));
+  const template = String(
+    session.chunk_upload_url_template || session.chunkUploadUrlTemplate
+      || `${target.chunkedUploadUrl}/${encodeURIComponent(uploadId)}/chunks/{index}`,
+  );
+  const completeUrl = String(
+    session.complete_url || session.completeUrl
+      || `${target.chunkedUploadUrl}/${encodeURIComponent(uploadId)}/complete`,
+  );
+  if (!uploadId || !Number.isFinite(chunkSize) || chunkSize <= 0) {
+    throw new Error('eTreyser returned an invalid chunk-upload session.');
+  }
+
+  let uploadedBytes = 0;
+  for (let index = 0; index < expectedChunks; index++) {
+    if (cancelRef.cancelled) throw new Error('__CANCELLED__');
+    const start = index * chunkSize;
+    const chunk = file.slice(start, Math.min(start + chunkSize, file.size));
+    const chunkUrl = template.replace('{index}', String(index));
+    await uploadChunkWithRetry(chunkUrl, chunk, index);
+    uploadedBytes += chunk.size;
+    const uploadProgress = 18 + Math.round((uploadedBytes / Math.max(file.size, 1)) * 4);
+    onPhase?.(
+      'segmenting',
+      Math.min(22, uploadProgress),
+      `Uploading video securely (${index + 1}/${expectedChunks})...`,
+    );
+  }
+
+  const maskBase64 = await blobToDataUrl(maskBlob);
+  const completeRes = await fetch(completeUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      job_id: jobId,
+      mask_base64: maskBase64,
+      selected_time: input.selectedTime,
+      selected_frame_index: input.selectedFrameIndex,
+      fps: input.fps,
+      duration: input.duration,
+      width: input.width,
+      height: input.height,
+      pipeline: 'optical-flow-vace-diffusion',
+      quality: input.outputQuality || 'source',
+      preserve_resolution: true,
+      preserve_fps: true,
+      preserve_audio: true,
+    }),
+  });
+  return parseWorkerResponse(completeRes);
 }
 
 async function materializeOutput(outputUrl: string, input: GpuRemovalInput): Promise<PipelineOutput> {
@@ -351,29 +483,28 @@ async function runApiProxyRemoval(input: GpuRemovalInput): Promise<PipelineOutpu
   onPhase?.('segmenting', 18, 'Connecting to eTreyser GPU worker...');
   const maskBlob = await canvasToPngBlob(maskCanvas);
 
-  // Upload the video/mask multipart straight to the GPU worker, exactly like
-  // the last-known-good 2026-07-04 build. Prefer the worker URL baked into the
-  // client env (VITE_ERASER_GPU_WORKER_URL) — that is the worker that actually
-  // removed the object — and only fall back to server-side discovery if the
-  // client env is not set. This bypasses Vercel's ~4.5MB function payload limit.
-  let workerBase = RAW_DIRECT_WORKER_URL;
-  if (!workerBase) {
-    const target = await fetchProxyUploadTarget();
-    if (target) workerBase = target.workerBase;
-  }
-  if (workerBase) {
-    onPhase?.('segmenting', 22, 'Sending video and mask to eTreyser GPU worker...');
-    const createRes = await fetch(`${workerBase}/v1/video-eraser/jobs`, {
-      method: 'POST',
-      body: buildRemovalForm(input, maskBlob),
-    });
-    const initialPayload = await parseWorkerResponse(createRes);
+  // Preferred route: split the video into small checksummed requests. iOS Safari
+  // can abort a single large multipart body while Modal is parsing it, which
+  // previously surfaced as a 400 at 22%. Chunk retries make mobile uploads
+  // resumable without passing the video through Vercel's body-size limit.
+  const target = await fetchProxyUploadTarget();
+  if (target) {
+    onPhase?.('segmenting', 18, 'Starting reliable chunked upload...');
+    const initialPayload = target.chunkedUploadUrl
+      ? await runChunkedWorkerUpload(target, input, maskBlob)
+      : await (async () => {
+        const createRes = await fetch(target.uploadUrl, {
+          method: 'POST',
+          body: buildRemovalForm(input, maskBlob),
+        });
+        return parseWorkerResponse(createRes);
+      })();
     return waitForRemovalOutput({
       initialPayload,
-      baseUrl: workerBase,
+      baseUrl: target.workerBase,
       statusPathPrefix: '/v1/video-eraser/jobs',
       input,
-      onCancel: (remoteJobId) => requestWorkerCancel(workerBase, remoteJobId),
+      onCancel: (remoteJobId) => requestWorkerCancel(target.workerBase, remoteJobId),
     });
   }
 
@@ -414,7 +545,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
       duration,
       width,
       height,
-      pipeline: 'sam2-propainter',
+      pipeline: 'optical-flow-vace-diffusion',
       mask_semantics: 'alpha_gt_0_remove',
       preserve_resolution: true,
       preserve_fps: true,
@@ -437,7 +568,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
         duration,
         width,
         height,
-        pipeline: 'sam2-propainter',
+        pipeline: 'optical-flow-vace-diffusion',
         mask_semantics: 'alpha_gt_0_remove',
       },
     }),

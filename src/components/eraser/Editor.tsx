@@ -6,7 +6,7 @@ import Controls from './Controls';
 import ProcessingPanel from './ProcessingPanel';
 import { probeVideo } from '@/lib/eraser/frames';
 import { eraserApi } from '@/lib/eraser/api';
-import { runPipeline, type PipelineOutput } from '@/lib/eraser/pipeline';
+import type { PipelineOutput } from '@/lib/eraser/pipeline';
 import { gpuRemovalLabel, isGpuRemovalConfigured, runGpuRemoval, type EraserOutputQuality } from '@/lib/eraser/gpu';
 import { RotateCcw, ShieldCheck } from 'lucide-react';
 
@@ -15,6 +15,8 @@ const MAX_DURATION = 30;
 // Phases where the backend job is actively crunching — Process must be blocked + set_mask skipped.
 const ACTIVE_PROCESSING = new Set([
   'segmenting', 'tracking_mask', 'smoothing_masks', 'inpainting',
+  'frame_extraction', 'optical_flow_tracking', 'diffusion_inpainting',
+  'audio_preserving_export', 'validation',
   'rebuilding_video', 'attaching_audio', 'generating_preview',
 ]);
 // Phases where it's safe to (re)start processing.
@@ -25,9 +27,6 @@ function isIdempotencyError(msg: string): boolean {
   return /Mask can only be set|already processing|mask already accepted/i.test(msg || '');
 }
 
-function isGpuConfigurationOrAvailabilityError(msg: string): boolean {
-  return /not configured|disabled or not configured|failed to fetch|networkerror|load failed|http (404|502|503|504)|worker unavailable|job_not_found|etreyser_first_party_job_failed/i.test(msg || '');
-}
 
 interface Meta { duration: number; width: number; height: number; fps: number; url: string; filename: string; }
 
@@ -44,10 +43,11 @@ export default function Editor() {
   const sourceFileRef = useRef<File | null>(null);
   // Synchronous lock — fires before setProcessing(true) renders, blocking double-tap/mobile dupes.
   const processingLockRef = useRef(false);
+  const maskAnchorTimeRef = useRef<number | null>(null);
 
   const [current, setCurrent] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [brushSize, setBrushSize] = useState(28);
+  const [brushSize, setBrushSize] = useState(20);
   const [erasing, setErasing] = useState(false);
   const [maskVisible, setMaskVisible] = useState(true);
   const [hasMask, setHasMask] = useState(false);
@@ -112,11 +112,41 @@ export default function Editor() {
     };
   }, [meta]);
 
-  const seek = (t: number) => { const v = videoRef.current; if (v) { v.currentTime = t; setCurrent(t); } };
+  const seek = (t: number) => {
+    const v = videoRef.current;
+    if (!v || !meta) return;
+    const safeTime = Math.max(0, Math.min(meta.duration, t));
+    const anchorTime = maskAnchorTimeRef.current;
+    if (anchorTime !== null && Math.abs(safeTime - anchorTime) > 0.5 / Math.max(meta.fps, 1)) {
+      maskRef.current?.clear();
+      maskAnchorTimeRef.current = null;
+      setHasMask(false);
+      setStatusMessage('Frame changed. Mark the object again on this exact frame.');
+    }
+    v.currentTime = safeTime;
+    setCurrent(safeTime);
+  };
   const togglePlay = () => { const v = videoRef.current; if (!v) return; if (v.paused) v.play(); else v.pause(); };
-  const step = (dir: 1 | -1) => { if (!meta) return; const v = videoRef.current; if (!v) return; v.pause(); const dt = 1 / meta.fps; v.currentTime = Math.max(0, Math.min(meta.duration, v.currentTime + dir * dt)); };
+  const step = (dir: 1 | -1) => {
+    if (!meta) return;
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause();
+    seek(v.currentTime + dir * (1 / meta.fps));
+  };
 
   const refreshHasMask = () => setHasMask(maskRef.current?.hasMask() ?? false);
+
+  const freezeMaskFrame = () => {
+    const v = videoRef.current;
+    if (!v || !meta) return;
+    v.pause();
+    const exactTime = Math.max(0, Math.min(meta.duration, v.currentTime));
+    if (maskAnchorTimeRef.current === null) maskAnchorTimeRef.current = exactTime;
+    v.currentTime = maskAnchorTimeRef.current;
+    setCurrent(maskAnchorTimeRef.current);
+    setStatusMessage(`Mask locked to frame ${Math.round(maskAnchorTimeRef.current * meta.fps)}.`);
+  };
 
   const process = async (isRefine = false) => {
     if (!jobId || !meta || !videoRef.current || !maskRef.current) return;
@@ -144,7 +174,8 @@ export default function Editor() {
         }
       } catch { /* non-fatal: fall through to normal flow */ }
 
-      const selectedFrameIndex = Math.round(current * meta.fps);
+      const selectedTime = Math.max(0, Math.min(meta.duration, maskAnchorTimeRef.current ?? videoRef.current.currentTime));
+      const selectedFrameIndex = Math.max(0, Math.round(selectedTime * meta.fps));
       const payload = { jobId, selectedFrameIndex, maskWidth: meta.width, maskHeight: meta.height };
       let maskRes: MaskResponse;
       if (isRefine) maskRes = await eraserApi.refineMask(payload);
@@ -159,48 +190,67 @@ export default function Editor() {
       setPhase('mask_ready');
       setProgress(20);
 
-      const runBrowserFallback = () => runPipeline({
-        jobId, video: videoRef.current!, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
-        selectedTime: current, maskCanvas, cancelRef: cancelRef.current,
+      const useGpu = isGpuRemovalConfigured() && !!sourceFileRef.current;
+      if (!useGpu) {
+        throw new Error(
+          'The required frame-extraction, optical-flow, diffusion-inpainting GPU pipeline is not configured.',
+        );
+      }
+
+      const out: PipelineOutput = await runGpuRemoval({
+        jobId,
+        file: sourceFileRef.current!,
+        sourceUrl: meta.url,
+        fps: meta.fps,
+        duration: meta.duration,
+        width: meta.width,
+        height: meta.height,
+        selectedTime,
+        selectedFrameIndex,
+        maskCanvas,
+        outputQuality,
+        cancelRef: cancelRef.current,
         onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
       });
 
-      const useGpu = isGpuRemovalConfigured() && !!sourceFileRef.current;
-      let completedWithGpu = false;
-      let out: PipelineOutput;
-      if (useGpu) {
-        try {
-          out = await runGpuRemoval({
-            jobId,
-            file: sourceFileRef.current!,
-            sourceUrl: meta.url,
-            fps: meta.fps,
-            duration: meta.duration,
-            width: meta.width,
-            height: meta.height,
-            selectedTime: current,
-            selectedFrameIndex,
-            maskCanvas,
-            outputQuality,
-            cancelRef: cancelRef.current,
-            onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
-          });
-          completedWithGpu = true;
-        } catch (gpuError) {
-          const gpuMessage = (gpuError as Error).message || '';
-          if (gpuMessage === '__CANCELLED__' || !isGpuConfigurationOrAvailabilityError(gpuMessage)) throw gpuError;
-          setStatusMessage(`GPU worker unavailable (${gpuMessage}). Falling back to browser processing...`);
-          out = await runBrowserFallback();
-        }
-      } else {
-        out = await runBrowserFallback();
+      let savedLibraryUrl = '';
+      let librarySaveError = '';
+      try {
+        const outputResponse = await fetch(out.localUrl || out.finalUrl);
+        if (!outputResponse.ok) throw new Error(`Could not read completed video (HTTP ${outputResponse.status}).`);
+        const outputBlob = await outputResponse.blob();
+        if (!outputBlob.size) throw new Error('Completed video was empty.');
+        savedLibraryUrl = await eraserApi.uploadOutput(jobId, outputBlob, out.mimeType);
+      } catch (saveError) {
+        librarySaveError = (saveError as Error).message;
+        await eraserApi.progress({
+          jobId,
+          statusMessage: 'Video completed, but this device could not save it to Recent Jobs.',
+          log: `device library save failed: ${librarySaveError}`,
+        }).catch(() => undefined);
       }
 
-      outputRef.current = out;
-      setFinalUrl(out.finalUrl);
+      await eraserApi.complete({
+        jobId,
+        previewUrl: savedLibraryUrl || undefined,
+        finalOutputUrl: savedLibraryUrl || undefined,
+        outputMime: out.mimeType,
+        audioPreserved: out.hasAudio,
+      });
+
+      const completedOutput: PipelineOutput = {
+        ...out,
+        finalUrl: savedLibraryUrl || out.finalUrl,
+      };
+      outputRef.current = completedOutput;
+      setFinalUrl(completedOutput.finalUrl);
       setPhase('completed');
       setProgress(100);
-      setStatusMessage(completedWithGpu ? `Done with GPU AI removal (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).` : 'Done with browser fallback.');
+      setStatusMessage(
+        librarySaveError
+          ? `Done, but Recent Jobs could not save this output on the device: ${librarySaveError}`
+          : `Done and saved to this device's Recent Jobs library (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).`,
+      );
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === '__CANCELLED__') {
@@ -240,16 +290,20 @@ export default function Editor() {
 
   const reset = () => {
     if (meta) URL.revokeObjectURL(meta.url);
+    const sessionOutputUrl = outputRef.current?.localUrl;
+    if (sessionOutputUrl?.startsWith('blob:') && sessionOutputUrl !== finalUrl) URL.revokeObjectURL(sessionOutputUrl);
     if (finalUrl?.startsWith('blob:')) URL.revokeObjectURL(finalUrl);
     setMeta(null); setJobId(null); setFinalUrl(null); setError(null);
     setPhase('awaiting_mask'); setProgress(18); setProcessing(false); setHasMask(false);
     sourceFileRef.current = null;
     outputRef.current = null;
+    maskAnchorTimeRef.current = null;
   };
 
   const addKeyframe = () => {
     setStatusMessage('Drew a correction mask? Click Process again to re-run with this keyframe.');
     maskRef.current?.clear();
+    maskAnchorTimeRef.current = null;
     setHasMask(false);
   };
 
@@ -280,7 +334,7 @@ export default function Editor() {
               ref={maskRef}
               frameW={meta.width} frameH={meta.height} videoEl={videoRef.current}
               brushSize={brushSize} erasing={erasing} maskVisible={maskVisible}
-              onStrokeEnd={refreshHasMask} disabled={!editing}
+              onStrokeStart={freezeMaskFrame} onStrokeEnd={refreshHasMask} disabled={!editing}
             />
           </div>
         </div>
@@ -307,7 +361,7 @@ export default function Editor() {
           maskVisible={maskVisible} toggleMask={() => setMaskVisible((v) => !v)}
           onUndo={() => { maskRef.current?.undo(); refreshHasMask(); }}
           onRedo={() => { maskRef.current?.redo(); refreshHasMask(); }}
-          onClear={() => { maskRef.current?.clear(); refreshHasMask(); }}
+          onClear={() => { maskRef.current?.clear(); maskAnchorTimeRef.current = null; refreshHasMask(); }}
           disabled={!editing}
         />
         <ProcessingPanel
@@ -319,7 +373,7 @@ export default function Editor() {
         />
 
         {phase === 'completed' && (
-          <button onClick={() => { setPhase('awaiting_mask'); setFinalUrl(null); setProgress(20); maskRef.current?.clear(); setHasMask(false); }}
+          <button onClick={() => { setPhase('awaiting_mask'); setFinalUrl(null); setProgress(20); maskRef.current?.clear(); maskAnchorTimeRef.current = null; setHasMask(false); }}
             className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-800 px-4 py-2.5 text-sm font-medium text-amber-300 hover:bg-slate-700">
             Refine with another keyframe
           </button>
