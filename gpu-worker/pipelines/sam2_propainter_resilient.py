@@ -178,13 +178,41 @@ def video_duration(path: Path) -> float:
     return float(frames / fps) if fps > 0 else 0.0
 
 
-def temporal_motion_score(path: Path, sample_count: int = 10) -> float:
+def tracking_mask_for_motion(
+    mask_dir: Path | None,
+    frame_index: int,
+    source_width: int,
+    source_height: int,
+) -> np.ndarray | None:
+    if mask_dir is None or not mask_dir.is_dir():
+        return None
+    mask = cv2.imread(str(mask_dir / f"{frame_index:05d}.png"), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return None
+    if mask.shape[1] != source_width or mask.shape[0] != source_height:
+        mask = cv2.resize(mask, (source_width, source_height), interpolation=cv2.INTER_NEAREST)
+    mask = (mask > 24).astype(np.uint8) * 255
+    if core.mask_bbox(mask) is None:
+        return None
+    # Ignore a narrow guard ring around the replacement so inpainting-edge
+    # changes are not mistaken for scene motion.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    return cv2.dilate(mask, kernel, iterations=1)
+
+
+def temporal_motion_score(
+    path: Path,
+    sample_count: int = 10,
+    mask_dir: Path | None = None,
+) -> float:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return 0.0
 
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if frame_count < 2:
+    source_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    source_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if frame_count < 2 or source_width <= 0 or source_height <= 0:
         cap.release()
         return 0.0
 
@@ -211,13 +239,34 @@ def temporal_motion_score(path: Path, sample_count: int = 10) -> float:
         frame_b = cv2.resize(frame_b, (160, 90), interpolation=cv2.INTER_AREA)
         gray_a = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
         gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
-        scores.append(float(cv2.absdiff(gray_a, gray_b).mean()))
+        delta = cv2.absdiff(gray_a, gray_b)
+
+        mask_a = tracking_mask_for_motion(mask_dir, idx, source_width, source_height)
+        mask_b = tracking_mask_for_motion(mask_dir, idx + gap, source_width, source_height)
+        if mask_a is not None or mask_b is not None:
+            if mask_a is None:
+                mask_a = np.zeros((source_height, source_width), dtype=np.uint8)
+            if mask_b is None:
+                mask_b = np.zeros((source_height, source_width), dtype=np.uint8)
+            excluded = cv2.bitwise_or(mask_a, mask_b)
+            excluded = cv2.resize(excluded, (160, 90), interpolation=cv2.INTER_NEAREST) > 24
+            valid = ~excluded
+            if int(np.count_nonzero(valid)) >= int(valid.size * 0.20):
+                scores.append(float(delta[valid].mean()))
+                continue
+
+        scores.append(float(delta.mean()))
 
     cap.release()
     return float(sum(scores) / len(scores)) if scores else 0.0
 
 
-def validate_video_liveness(source_video: Path, candidate_video: Path, label: str) -> dict[str, float]:
+def validate_video_liveness(
+    source_video: Path,
+    candidate_video: Path,
+    label: str,
+    mask_dir: Path | None = None,
+) -> dict[str, float]:
     if not candidate_video.exists() or candidate_video.stat().st_size <= 0:
         raise RuntimeError(f"{label} is missing or empty")
 
@@ -241,9 +290,12 @@ def validate_video_liveness(source_video: Path, candidate_video: Path, label: st
             f"{label} lost too many frames: source={source_frames} output={candidate_frames}"
         )
 
-    source_motion = temporal_motion_score(source_video)
-    candidate_motion = temporal_motion_score(candidate_video)
-    frozen_limit = max(0.05, source_motion * FROZEN_OUTPUT_MOTION_RATIO)
+    # Measure liveness outside the tracked removal region. A correct eraser
+    # result may become nearly static when the selected object was the only
+    # moving element in the shot; that is valid, not a frozen render.
+    source_motion = temporal_motion_score(source_video, mask_dir=mask_dir)
+    candidate_motion = temporal_motion_score(candidate_video, mask_dir=mask_dir)
+    frozen_limit = max(0.02 if mask_dir is not None else 0.05, source_motion * FROZEN_OUTPUT_MOTION_RATIO)
     if source_motion >= FROZEN_SOURCE_MOTION_THRESHOLD and candidate_motion <= frozen_limit:
         raise FrozenVideoError(
             f"{label} appears frozen: source_motion={source_motion:.4f} "
@@ -257,6 +309,7 @@ def validate_video_liveness(source_video: Path, candidate_video: Path, label: st
         "candidate_duration": candidate_duration,
         "source_motion": source_motion,
         "candidate_motion": candidate_motion,
+        "motion_scope": "outside_tracked_mask" if mask_dir is not None else "full_frame",
     }
     print(f"{label} liveness validated: {json.dumps(stats, sort_keys=True)}", flush=True)
     return stats
@@ -317,7 +370,7 @@ def run_propainter(
             )
             core.run(cmd, cwd=core.PROPAINTER_ROOT, env=env)
             candidate = core.find_propainter_output(result_root)
-            validate_video_liveness(source_mp4, candidate, f"ProPainter attempt {index + 1}")
+            validate_video_liveness(source_mp4, candidate, f"ProPainter attempt {index + 1}", mask_path)
             return candidate
         except RuntimeError as exc:
             message = str(exc)
@@ -425,11 +478,11 @@ def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path,
             "make_zero",
             str(normalized_output),
         ])
-        validate_video_liveness(source_mp4, normalized_output, "Tracked fallback")
+        validate_video_liveness(source_mp4, normalized_output, "Tracked fallback", mask_dir)
         return normalized_output
     except Exception as exc:
         print(f"Tracked fallback normalization failed; validating raw MP4: {exc}", flush=True)
-        validate_video_liveness(source_mp4, raw_output, "Raw tracked fallback")
+        validate_video_liveness(source_mp4, raw_output, "Raw tracked fallback", mask_dir)
         return raw_output
 
 
@@ -478,7 +531,7 @@ def main() -> None:
     core.mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
 
     try:
-        validate_video_liveness(source_mp4, output_video, "Final eraser output")
+        validate_video_liveness(source_mp4, output_video, "Final eraser output", tracked_masks)
     except RuntimeError as exc:
         if used_fallback:
             raise
@@ -488,7 +541,7 @@ def main() -> None:
         )
         inpainted = run_opencv_tracked_inpaint(source_mp4, tracked_masks, work_dir, fps)
         core.mux_audio(inpainted, source_mp4, output_video, width, height, fps, output_quality)
-        validate_video_liveness(source_mp4, output_video, "Final fallback output")
+        validate_video_liveness(source_mp4, output_video, "Final fallback output", tracked_masks)
 
     if not output_video.exists() or output_video.stat().st_size <= 0:
         raise RuntimeError("Eraser pipeline did not create output video")

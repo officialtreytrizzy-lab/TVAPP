@@ -256,7 +256,7 @@ def verified_recovery(
             height,
             output_quality,
         )
-        pipeline.validate_video_liveness(source_video, candidate, "ProPainter recovery")
+        pipeline.validate_video_liveness(source_video, candidate, "ProPainter recovery", recovery_masks)
         validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
         validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
         return candidate, recovery_masks
@@ -375,7 +375,7 @@ def main() -> None:
     )
 
     try:
-        pipeline.validate_video_liveness(source_mp4, output_video, "Final eraser output")
+        pipeline.validate_video_liveness(source_mp4, output_video, "Final eraser output", active_masks)
         validate_selection_changed(
             source_mp4,
             output_video,
@@ -424,7 +424,7 @@ def main() -> None:
             fps,
             output_quality,
         )
-        pipeline.validate_video_liveness(source_mp4, output_video, "Final quality-safe recovery output")
+        pipeline.validate_video_liveness(source_mp4, output_video, "Final quality-safe recovery output", active_masks)
         validate_selection_changed(
             source_mp4,
             output_video,
