@@ -120,7 +120,8 @@ requireText(pipeline, 'def reacquire_from_anchor(', 'tracking must recover after
 requireText(pipeline, 'def build_vace_mask_video(', 'tracked masks must be converted into a temporal diffusion condition');
 requireText(pipeline, 'semantics=white_generate_black_preserve', 'VACE mask semantics must be explicit');
 requireText(pipeline, 'def build_vace_condition_video(', 'white mask regions must be neutralized in the diffusion condition video');
-requireText(pipeline, 'generated_regions_gray=127', 'VACE missing regions must use the documented neutral-gray value');
+requireText(pipeline, 'condition_mode = \"structural_prior\"', 'production diffusion must support the high-resolution structural prior');
+requireText(pipeline, 'preserve_generated_prior=True', 'the production path must feed the structural prior into diffusion');
 requireText(pipeline, '"--task"', 'stage 3 must invoke a named Wan task');
 requireText(pipeline, '"vace-1.3B"', 'stage 3 must execute Wan VACE diffusion');
 requireText(pipeline, '"--src_video"', 'diffusion must receive the source video');
@@ -131,6 +132,10 @@ requireText(pipeline, 'def crop_source_for_fixed_roi(', 'fixed-mark source video
 requireText(pipeline, 'def crop_masks_for_fixed_roi(', 'tracked masks must map exactly into the fixed repair ROI');
 requireText(pipeline, 'def source_preserving_composite(', 'only repaired mask pixels may replace source pixels');
 requireText(pipeline, 'def harmonize_composite_frame(', 'final patches must receive adaptive color and texture harmonization');
+requireText(pipeline, 'def structural_prior_frame(', 'a full-resolution deterministic prior must protect diffusion from hallucinated fills');
+requireText(pipeline, 'def build_structural_prior_video(', 'the structural prior must cover the complete timeline');
+requireText(pipeline, 'def quality_gated_composite_frame(', 'diffusion must compete against the structural prior before export');
+requireText(pipeline, 'diffusion_score + required_margin < prior_score', 'diffusion may replace the prior only after a material quality win');
 requireText(pipeline, 'def nearest_background_texture(', 'missing patch grain must be sampled from real nearby source texture');
 requireText(pipeline, 'def transfer_local_texture(', 'smooth diffusion repairs must receive only the missing local texture energy');
 requireText(pipeline, 'patch_mask = binary[crop_y1:crop_y2, crop_x1:crop_x2].copy()', 'gradient cloning must never mutate the authoritative matte');
@@ -150,12 +155,13 @@ requireText(pipeline, 'emit_stage("diffusion_inpainting"', 'diffusion stage must
 requireText(pipeline, '"audio_preserving_export"', 'export stage must be machine-readable');
 requireText(pipeline, 'build_semantic_composite_masks', 'SAM2 may refine the composite matte without replacing optical-flow tracking');
 forbidText(pipeline, 'ProPainter', 'the exact production pipeline must not execute ProPainter');
-forbidText(pipeline, 'cv2.inpaint', 'the diffusion stage must not secretly fall back to local OpenCV inpaint');
+requireText(pipeline, 'cv2.inpaint(source_frame, binary, radius, cv2.INPAINT_NS)', 'the explicit structural prior must use full-resolution Navier-Stokes reconstruction');
 
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_moving_mask_tracking', 'regression test must cover moving optical-flow tracking');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_fixed_screen_selection', 'regression test must cover fixed inset marks');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_fixed_roi_geometry', 'regression test must prove fixed marks gain effective diffusion resolution');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_vace_condition_mask', 'regression test must verify gray generated regions and retained black-mask pixels');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_structural_prior_quality_gate', 'regression test must reject a visibly worse diffusion candidate');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_full_pipeline_with_stubbed_diffusion', 'regression test must exercise the complete four-stage path and audio export');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_vace_frame_contract', 'regression test must cover VACE frame-count constraints');
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'frame extraction and optical flow require OpenCV');

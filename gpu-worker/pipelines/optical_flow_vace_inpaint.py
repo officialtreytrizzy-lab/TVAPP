@@ -753,6 +753,7 @@ def build_vace_condition_video(
     normalized_source: Path,
     mask_video: Path,
     destination: Path,
+    preserve_generated_prior: bool = False,
 ) -> Path:
     source_cap = cv2.VideoCapture(str(normalized_source))
     mask_cap = cv2.VideoCapture(str(mask_video))
@@ -790,7 +791,8 @@ def build_vace_condition_video(
             mask_frame = cv2.resize(mask_frame, (width, height), interpolation=cv2.INTER_NEAREST)
         mask_gray = cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY)
         conditioned = source_frame.copy()
-        conditioned[mask_gray >= 128] = 127
+        if not preserve_generated_prior:
+            conditioned[mask_gray >= 128] = 127
         writer.write(conditioned)
         frame_count += 1
 
@@ -820,8 +822,9 @@ def build_vace_condition_video(
             str(destination),
         ]
     )
+    condition_mode = "structural_prior" if preserve_generated_prior else "gray_127"
     print(
-        f"VACE condition video complete: frames={frame_count}, generated_regions_gray=127",
+        f"VACE condition video complete: frames={frame_count}, generated_regions={condition_mode}",
         flush=True,
     )
     return destination
@@ -1165,6 +1168,89 @@ def robust_mad(values: np.ndarray) -> float:
     return float(np.median(np.abs(flattened - median)) * 1.4826)
 
 
+def structural_prior_frame(
+    source_frame: np.ndarray,
+    binary_mask: np.ndarray,
+) -> tuple[np.ndarray, dict[str, float | str]]:
+    """Build a full-resolution deterministic background prior for diffusion.
+
+    This is not the final renderer. It supplies geometry and low-frequency
+    structure that diffusion may refine. The later quality gate keeps this
+    prior whenever the diffusion candidate is less natural.
+    """
+    binary = (binary_mask > 24).astype(np.uint8) * 255
+    bbox = mask_bbox(binary)
+    if bbox is None:
+        return source_frame.copy(), {"method": "none", "radius": 0.0}
+    x1, y1, x2, y2 = bbox
+    minimum_side = max(1, min(x2 - x1 + 1, y2 - y1 + 1))
+    radius = float(max(3, min(18, int(round(minimum_side * 0.18)))))
+    prior = cv2.inpaint(source_frame, binary, radius, cv2.INPAINT_NS)
+    return prior, {
+        "method": "navier_stokes_structural_prior",
+        "radius": radius,
+        "mask_pixels": float(np.count_nonzero(binary)),
+    }
+
+
+def build_structural_prior_video(
+    source_video: Path,
+    composite_masks_dir: Path,
+    destination: Path,
+    source_fps: float,
+    source_width: int,
+    source_height: int,
+    frame_count: int,
+) -> Path:
+    source_cap = cv2.VideoCapture(str(source_video))
+    if not source_cap.isOpened():
+        raise RuntimeError(f"Could not open source for structural prior: {source_video}")
+    writer = cv2.VideoWriter(
+        str(destination),
+        cv2.VideoWriter_fourcc(*"FFV1"),
+        source_fps,
+        (source_width, source_height),
+    )
+    if not writer.isOpened():
+        source_cap.release()
+        raise RuntimeError("Could not create lossless structural-prior video")
+
+    samples: list[dict[str, float | int | str]] = []
+    written = 0
+    for frame_index in range(frame_count):
+        ok, frame = source_cap.read()
+        if not ok:
+            writer.release()
+            source_cap.release()
+            raise RuntimeError(f"Source ended while building structural prior at frame {frame_index}")
+        mask = cv2.imread(
+            str(composite_masks_dir / f"{frame_index:06d}.png"),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if mask is None:
+            writer.release()
+            source_cap.release()
+            raise RuntimeError(f"Composite mask missing for structural prior at frame {frame_index}")
+        if mask.shape[1] != source_width or mask.shape[0] != source_height:
+            mask = cv2.resize(mask, (source_width, source_height), interpolation=cv2.INTER_NEAREST)
+        prior, metrics = structural_prior_frame(frame, mask)
+        writer.write(prior)
+        if frame_index == 0 or frame_index % max(1, int(round(source_fps * 2.0))) == 0:
+            samples.append({"frame": frame_index, **metrics})
+        written += 1
+
+    writer.release()
+    source_cap.release()
+    if written != frame_count:
+        raise RuntimeError(f"Structural-prior frame mismatch: expected={frame_count}, actual={written}")
+    print(
+        "High-resolution structural prior complete: "
+        f"frames={written}, samples={json.dumps(samples, separators=(',', ':'))}",
+        flush=True,
+    )
+    return destination
+
+
 def nearest_background_texture(
     source_frame: np.ndarray,
     binary_mask: np.ndarray,
@@ -1400,9 +1486,73 @@ def harmonize_composite_frame(
     return composited, state, metrics
 
 
+def quality_gated_composite_frame(
+    source_frame: np.ndarray,
+    diffusion_frame: np.ndarray,
+    structural_prior: np.ndarray,
+    binary_mask: np.ndarray,
+    previous_state: dict[str, object] | None = None,
+) -> tuple[np.ndarray, dict[str, object], dict[str, float | str]]:
+    """Allow diffusion to win only when it materially improves the prior."""
+    previous_state = previous_state or {}
+    diffusion_previous = previous_state.get("diffusion")
+    prior_previous = previous_state.get("prior")
+    diffusion_result, diffusion_state, diffusion_metrics = harmonize_composite_frame(
+        source_frame,
+        diffusion_frame,
+        binary_mask,
+        diffusion_previous if isinstance(diffusion_previous, dict) else None,
+    )
+    prior_result, prior_state, prior_metrics = harmonize_composite_frame(
+        source_frame,
+        structural_prior,
+        binary_mask,
+        prior_previous if isinstance(prior_previous, dict) else None,
+    )
+    diffusion_score = float(diffusion_metrics.get("blend_score", float("inf")))
+    prior_score = float(prior_metrics.get("blend_score", float("inf")))
+
+    # Diffusion must beat the deterministic prior by a meaningful margin. This
+    # prevents hallucinated texture from replacing an already natural repair.
+    required_margin = max(0.25, prior_score * 0.12)
+    selected_family = (
+        "diffusion"
+        if diffusion_score + required_margin < prior_score
+        else "structural_prior"
+    )
+    previous_family = str(previous_state.get("selected_family", ""))
+    if previous_family == "structural_prior" and prior_score <= diffusion_score + 0.15:
+        selected_family = "structural_prior"
+    elif previous_family == "diffusion" and diffusion_score + required_margin * 0.55 < prior_score:
+        selected_family = "diffusion"
+
+    selected = diffusion_result if selected_family == "diffusion" else prior_result
+    state: dict[str, object] = {
+        "diffusion": diffusion_state,
+        "prior": prior_state,
+        "selected_family": selected_family,
+    }
+    metrics: dict[str, float | str] = {
+        "selected_family": selected_family,
+        "diffusion_score": diffusion_score,
+        "prior_score": prior_score,
+        "score_margin": prior_score - diffusion_score,
+        "diffusion_blend": str(diffusion_metrics.get("blend_mode", "none")),
+        "prior_blend": str(prior_metrics.get("blend_mode", "none")),
+        "diffusion_texture_ratio": float(diffusion_metrics.get("texture_ratio", 0.0)),
+        "prior_texture_ratio": float(prior_metrics.get("texture_ratio", 0.0)),
+        "diffusion_boundary_delta": float(diffusion_metrics.get("boundary_delta", 0.0)),
+        "prior_boundary_delta": float(prior_metrics.get("boundary_delta", 0.0)),
+        "prior_texture_transfer_gain": float(prior_metrics.get("texture_transfer_gain", 0.0)),
+        "mask_pixels": float(prior_metrics.get("mask_pixels", 0.0)),
+    }
+    return selected, state, metrics
+
+
 def source_preserving_composite(
     source_video: Path,
     repair_video: Path,
+    structural_prior_video: Path,
     composite_masks_dir: Path,
     destination: Path,
     source_fps: float,
@@ -1412,10 +1562,12 @@ def source_preserving_composite(
 ) -> Path:
     source_cap = cv2.VideoCapture(str(source_video))
     repair_cap = cv2.VideoCapture(str(repair_video))
-    if not source_cap.isOpened() or not repair_cap.isOpened():
+    prior_cap = cv2.VideoCapture(str(structural_prior_video))
+    if not source_cap.isOpened() or not repair_cap.isOpened() or not prior_cap.isOpened():
         source_cap.release()
         repair_cap.release()
-        raise RuntimeError("Could not open source and diffusion repair for export")
+        prior_cap.release()
+        raise RuntimeError("Could not open source, diffusion repair and structural prior for export")
 
     raw_output = destination.with_suffix(".raw.mkv")
     writer = cv2.VideoWriter(
@@ -1427,13 +1579,15 @@ def source_preserving_composite(
     if not writer.isOpened():
         source_cap.release()
         repair_cap.release()
+        prior_cap.release()
         raise RuntimeError("Could not create lossless source-preserving composite")
 
     frame_index = 0
     last_repair: np.ndarray | None = None
     previous_source: np.ndarray | None = None
-    harmonizer_state: dict[str, np.ndarray | float | str] | None = None
+    quality_gate_state: dict[str, object] | None = None
     metric_samples: list[dict[str, float | int | str]] = []
+    selection_counts = {"diffusion": 0, "structural_prior": 0}
     while True:
         ok_source, source_frame = source_cap.read()
         if not ok_source:
@@ -1446,8 +1600,16 @@ def source_preserving_composite(
         else:
             source_cap.release()
             repair_cap.release()
+            prior_cap.release()
             writer.release()
             raise RuntimeError(f"Diffusion repair ended before source frame {frame_index}")
+        ok_prior, prior_frame = prior_cap.read()
+        if not ok_prior:
+            source_cap.release()
+            repair_cap.release()
+            prior_cap.release()
+            writer.release()
+            raise RuntimeError(f"Structural prior ended before source frame {frame_index}")
 
         if repair_roi is not None:
             roi_x, roi_y, roi_width, roi_height = repair_roi
@@ -1457,15 +1619,32 @@ def source_preserving_composite(
                     (roi_width, roi_height),
                     interpolation=cv2.INTER_LANCZOS4,
                 )
+            if prior_frame.shape[1] != roi_width or prior_frame.shape[0] != roi_height:
+                prior_frame = cv2.resize(
+                    prior_frame,
+                    (roi_width, roi_height),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
             repair_canvas = source_frame.copy()
+            prior_canvas = source_frame.copy()
             repair_canvas[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width] = repair_frame
+            prior_canvas[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width] = prior_frame
             repair_frame = repair_canvas
-        elif repair_frame.shape[1] != source_width or repair_frame.shape[0] != source_height:
-            repair_frame = cv2.resize(
-                repair_frame,
-                (source_width, source_height),
-                interpolation=cv2.INTER_LANCZOS4,
-            )
+            prior_frame = prior_canvas
+        else:
+            if repair_frame.shape[1] != source_width or repair_frame.shape[0] != source_height:
+                repair_frame = cv2.resize(
+                    repair_frame,
+                    (source_width, source_height),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
+            if prior_frame.shape[1] != source_width or prior_frame.shape[0] != source_height:
+                prior_frame = cv2.resize(
+                    prior_frame,
+                    (source_width, source_height),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
+
         mask = cv2.imread(
             str(composite_masks_dir / f"{frame_index:06d}.png"),
             cv2.IMREAD_GRAYSCALE,
@@ -1473,19 +1652,25 @@ def source_preserving_composite(
         if mask is None:
             source_cap.release()
             repair_cap.release()
+            prior_cap.release()
             writer.release()
             raise RuntimeError(f"Composite mask is missing during export at frame {frame_index}")
         if mask.shape[1] != source_width or mask.shape[0] != source_height:
             mask = cv2.resize(mask, (source_width, source_height), interpolation=cv2.INTER_NEAREST)
         binary = (mask > 24).astype(np.uint8) * 255
+
         if previous_source is not None and is_scene_cut(previous_source, source_frame):
-            harmonizer_state = None
-        composited, harmonizer_state, metrics = harmonize_composite_frame(
+            quality_gate_state = None
+        composited, quality_gate_state, metrics = quality_gated_composite_frame(
             source_frame,
             repair_frame,
+            prior_frame,
             binary,
-            harmonizer_state,
+            quality_gate_state,
         )
+        selected_family = str(metrics.get("selected_family", "structural_prior"))
+        if selected_family in selection_counts:
+            selection_counts[selected_family] += 1
         if frame_index == 0 or frame_index % max(1, int(round(source_fps * 2.0))) == 0:
             metric_samples.append({"frame": frame_index, **metrics})
         writer.write(composited)
@@ -1494,12 +1679,14 @@ def source_preserving_composite(
 
     source_cap.release()
     repair_cap.release()
+    prior_cap.release()
     writer.release()
     if frame_index <= 0:
         raise RuntimeError("Source-preserving composite wrote no frames")
     print(
-        "Adaptive patch harmonizer complete: "
-        f"frames={frame_index}, samples={json.dumps(metric_samples, separators=(',', ':'))}",
+        "Diffusion quality gate complete: "
+        f"frames={frame_index}, selections={selection_counts}, "
+        f"samples={json.dumps(metric_samples, separators=(',', ':'))}",
         flush=True,
     )
     return raw_output
@@ -1713,6 +1900,8 @@ def main() -> None:
     composite_masks = work_dir / "sam2_composite_masks"
     fixed_roi_source = work_dir / "fixed_roi_source.mkv"
     fixed_roi_masks = work_dir / "fixed_roi_masks"
+    structural_prior_full = work_dir / "structural_prior_full.mkv"
+    structural_prior_roi = work_dir / "structural_prior_roi.mkv"
     vace_source = work_dir / "vace_source.mp4"
     vace_mask = work_dir / "vace_mask.mp4"
     vace_condition = work_dir / "vace_condition.mp4"
@@ -1759,6 +1948,15 @@ def main() -> None:
         anchor_index,
         is_fixed_screen_selection(anchor_tracking_mask, tracking_width, tracking_height),
     )
+    build_structural_prior_video(
+        source_mp4,
+        composite_masks,
+        structural_prior_full,
+        source_fps,
+        source_width,
+        source_height,
+        source_frame_count,
+    )
 
     emit_stage("diffusion_inpainting", 50, "Running Wan VACE diffusion inpainting")
     source_anchor_mask = cv2.resize(
@@ -1772,6 +1970,7 @@ def main() -> None:
         else None
     )
     diffusion_source = source_mp4
+    diffusion_prior = structural_prior_full
     diffusion_masks = tracked_masks
     diffusion_width = source_width
     diffusion_height = source_height
@@ -1779,6 +1978,7 @@ def main() -> None:
     mask_geometry_height = tracking_height
     if repair_roi is not None:
         crop_source_for_fixed_roi(source_mp4, fixed_roi_source, repair_roi)
+        crop_source_for_fixed_roi(structural_prior_full, structural_prior_roi, repair_roi)
         crop_masks_for_fixed_roi(
             tracked_masks,
             fixed_roi_masks,
@@ -1790,6 +1990,7 @@ def main() -> None:
             repair_roi,
         )
         diffusion_source = fixed_roi_source
+        diffusion_prior = structural_prior_roi
         diffusion_masks = fixed_roi_masks
         diffusion_width = repair_roi[2]
         diffusion_height = repair_roi[3]
@@ -1804,7 +2005,7 @@ def main() -> None:
 
     target_width, target_height, size_name = vace_dimensions(diffusion_width, diffusion_height)
     scaled_width, scaled_height, pad_x, pad_y = build_vace_source(
-        diffusion_source,
+        diffusion_prior,
         vace_source,
         diffusion_width,
         diffusion_height,
@@ -1821,7 +2022,12 @@ def main() -> None:
         target_width,
         target_height,
     )
-    build_vace_condition_video(vace_source, vace_mask, vace_condition)
+    build_vace_condition_video(
+        vace_source,
+        vace_mask,
+        vace_condition,
+        preserve_generated_prior=True,
+    )
     run_diffusion_inpainting(vace_condition, vace_mask, diffusion_output, size_name)
 
     emit_stage(
@@ -1844,6 +2050,7 @@ def main() -> None:
     raw_composite = source_preserving_composite(
         source_mp4,
         source_geometry_repair,
+        diffusion_prior,
         composite_masks,
         silent_composite,
         source_fps,

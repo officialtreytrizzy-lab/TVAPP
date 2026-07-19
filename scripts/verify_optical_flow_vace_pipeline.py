@@ -278,6 +278,73 @@ def verify_patch_harmonizer() -> None:
         raise AssertionError("Patch harmonizer did not restore high-frequency texture toward the source")
 
 
+def verify_structural_prior_quality_gate() -> None:
+    yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH]
+    pristine = np.zeros((HEIGHT, WIDTH, 3), dtype=np.float32)
+    pristine[:, :, 0] = 30 + xx * 0.21 + 5.0 * np.sin(xx / 5.0)
+    pristine[:, :, 1] = 44 + yy * 0.24 + 4.0 * np.cos(yy / 4.0)
+    pristine[:, :, 2] = 68 + xx * 0.08 + yy * 0.11
+    checker = ((((xx // 4) + (yy // 4)) % 2) * 3.0 - 1.5)[:, :, None]
+    pristine = np.clip(pristine + checker, 0, 255).astype(np.uint8)
+
+    mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    cv2.rectangle(mask, (270, 136), (309, 173), 255, -1)
+    source = pristine.copy()
+    cv2.rectangle(source, (272, 138), (307, 171), (20, 20, 20), -1)
+    cv2.putText(source, "ET", (276, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (30, 30, 235), 2, cv2.LINE_AA)
+
+    prior, prior_build_metrics = pipeline.structural_prior_frame(source, mask)
+    inside = mask > 24
+    outside = ~inside
+    marked_error = float(np.abs(source.astype(np.float32) - pristine.astype(np.float32))[inside].mean())
+    prior_error = float(np.abs(prior.astype(np.float32) - pristine.astype(np.float32))[inside].mean())
+    if prior_error >= marked_error * 0.15:
+        raise AssertionError(
+            f"Structural prior did not reconstruct the known clean background: "
+            f"marked={marked_error:.3f}, prior={prior_error:.3f}, metrics={prior_build_metrics}"
+        )
+
+    bad_diffusion = cv2.GaussianBlur(pristine, (0, 0), 2.4).astype(np.int16)
+    bad_diffusion += np.asarray([28, -17, 34], dtype=np.int16).reshape(1, 1, 3)
+    bad_diffusion = np.clip(bad_diffusion, 0, 255).astype(np.uint8)
+    rng = np.random.default_rng(20260719)
+    artifact = rng.normal(0.0, 18.0, bad_diffusion.shape).astype(np.float32)
+    bad_diffusion = np.clip(bad_diffusion.astype(np.float32) + artifact, 0, 255).astype(np.uint8)
+
+    selected, state, metrics = pipeline.quality_gated_composite_frame(
+        source,
+        bad_diffusion,
+        prior,
+        mask,
+    )
+    if metrics.get("selected_family") != "structural_prior":
+        raise AssertionError(f"Quality gate accepted a visibly worse diffusion patch: {metrics}")
+    if state.get("selected_family") != "structural_prior":
+        raise AssertionError(f"Quality-gate state disagrees with the selected prior: {state}")
+    if not np.array_equal(selected[outside], source[outside]):
+        raise AssertionError("Quality gate changed source pixels outside the matte")
+    selected_error = float(np.abs(selected.astype(np.float32) - pristine.astype(np.float32))[inside].mean())
+    if selected_error > prior_error * 1.45:
+        raise AssertionError(
+            f"Quality-gated prior was degraded during blending: prior={prior_error:.3f}, selected={selected_error:.3f}"
+        )
+
+    perfect_diffusion = pristine.copy()
+    selected_good, _good_state, good_metrics = pipeline.quality_gated_composite_frame(
+        source,
+        perfect_diffusion,
+        prior,
+        mask,
+    )
+    if good_metrics.get("selected_family") != "diffusion":
+        raise AssertionError(f"Quality gate blocked a materially superior diffusion repair: {good_metrics}")
+    good_error = float(np.abs(selected_good.astype(np.float32) - pristine.astype(np.float32))[inside].mean())
+    if good_error >= selected_error:
+        raise AssertionError(
+            f"Superior diffusion candidate did not improve the final repair: good={good_error:.3f}, prior={selected_error:.3f}"
+        )
+
+
 def verify_full_pipeline_with_stubbed_diffusion(root: Path) -> None:
     job_dir = root / "full_pipeline"
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -394,6 +461,10 @@ def verify_full_pipeline_with_stubbed_diffusion(root: Path) -> None:
     ]
     if "High-resolution fixed-mark ROI enabled" not in stage_log:
         raise AssertionError(f"Full pipeline did not use the fixed-mark ROI path:\n{stage_log}")
+    if "High-resolution structural prior complete" not in stage_log:
+        raise AssertionError(f"Full pipeline did not build the structural prior:\n{stage_log}")
+    if "Diffusion quality gate complete" not in stage_log:
+        raise AssertionError(f"Full pipeline did not execute the diffusion quality gate:\n{stage_log}")
     positions = [stage_log.find(f'"name":"{stage}"') for stage in expected_stages]
     if any(position < 0 for position in positions) or positions != sorted(positions):
         raise AssertionError(f"Pipeline stages were missing or out of order: {positions}\n{stage_log}")
@@ -443,6 +514,7 @@ def main() -> None:
         verify_vace_condition_mask(root)
         verify_sam2_flow_envelope()
         verify_patch_harmonizer()
+        verify_structural_prior_quality_gate()
         verify_full_pipeline_with_stubbed_diffusion(root)
         verify_vace_frame_contract()
         print(
