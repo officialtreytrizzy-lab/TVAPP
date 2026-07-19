@@ -39,8 +39,9 @@ worker_image = (
         index_url="https://download.pytorch.org/whl/cu121",
     )
     .run_commands(
+        "pip install einops==0.8.1",
         "pip install --no-deps 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl'",
-        "python - <<'PY'\nimport flash_attn\nimport torch\nif torch.version.cuda is None:\n    raise RuntimeError(f'CPU-only PyTorch wheel installed: torch={torch.__version__}')\nif flash_attn.__version__ != '2.7.4.post1':\n    raise RuntimeError(f'Unexpected Flash Attention build: {flash_attn.__version__}')\nprint(f'CUDA image verified: torch={torch.__version__} cuda_build={torch.version.cuda} flash_attn={flash_attn.__version__}')\nPY",
+        "python - <<'PY'\nimport einops\nimport flash_attn\nimport torch\nif torch.version.cuda is None:\n    raise RuntimeError(f'CPU-only PyTorch wheel installed: torch={torch.__version__}')\nif einops.__version__ != '0.8.1':\n    raise RuntimeError(f'Unexpected einops build: {einops.__version__}')\nif flash_attn.__version__ != '2.7.4.post1':\n    raise RuntimeError(f'Unexpected Flash Attention build: {flash_attn.__version__}')\nprint(f'CUDA image verified: torch={torch.__version__} cuda_build={torch.version.cuda} einops={einops.__version__} flash_attn={flash_attn.__version__}')\nPY",
     )
     .add_local_dir("gpu-worker", remote_path="/app")
 )
@@ -50,6 +51,7 @@ app = modal.App("tvapp-video-eraser-gpu")
 
 def require_gpu_runtime() -> dict[str, str | bool]:
     """Refuse to start a worker that cannot actually see its assigned GPU."""
+    import einops
     import flash_attn
     import torch
 
@@ -67,12 +69,13 @@ def require_gpu_runtime() -> dict[str, str | bool]:
         "device": device_name,
         "torch": str(torch.__version__),
         "cuda_build": str(torch.version.cuda),
+        "einops": str(einops.__version__),
         "flash_attn": str(flash_attn.__version__),
     }
     print(
         "TVAPP GPU runtime verified: "
         f"device={device_name} torch={torch.__version__} cuda_build={torch.version.cuda} "
-        f"flash_attn={flash_attn.__version__}",
+        f"einops={einops.__version__} flash_attn={flash_attn.__version__}",
         flush=True,
     )
     return details

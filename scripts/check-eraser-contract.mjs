@@ -87,6 +87,7 @@ requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'one d
 requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'diffusion jobs need a long worker timeout');
 requireText('gpu-worker/modal_app.py', 'python /app/pipelines/optical_flow_vace_inpaint.py', 'Modal must execute the exact four-stage pipeline');
 requireText('gpu-worker/modal_app.py', 'flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl', 'Modal image must include the verified Flash Attention CUDA wheel');
+requireText('gpu-worker/modal_app.py', 'pip install einops==0.8.1', 'Wan VACE must receive its explicit tensor-rearrangement dependency');
 requireText('gpu-worker/modal_app.py', 'import flash_attn', 'worker startup must verify Flash Attention imports');
 forbidText('gpu-worker/modal_app.py', '/opt/ProPainter', 'production image must not install the retired ProPainter stack');
 forbidText('gpu-worker/modal_app.py', '/opt/sam2', 'production image must not install the retired SAM2 stack');
