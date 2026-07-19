@@ -122,6 +122,8 @@ requireText(pipeline, 'def run_diffusion_inpainting(', 'long clips must be proce
 requireText(pipeline, 'def source_preserving_composite(', 'only repaired mask pixels may replace source pixels');
 requireText(pipeline, 'def mux_original_audio(', 'stage 4 must restore the original soundtrack');
 requireText(pipeline, '"1:a?"', 'audio export must map original audio when present');
+requireText(pipeline, 'Original audio stream copied without re-encoding', 'compatible source audio must be stream-copied');
+requireText(pipeline, 'Original audio packet hash preserved', 'copied audio must be validated bit-for-bit');
 requireText(pipeline, 'def validate_output(', 'final dimensions, frames, audio and selected-region change must be verified');
 requireText(pipeline, 'emit_stage("frame_extraction"', 'stage order must be machine-readable');
 requireText(pipeline, 'emit_stage("optical_flow_tracking"', 'optical-flow stage must be machine-readable');

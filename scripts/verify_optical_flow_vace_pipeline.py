@@ -313,6 +313,14 @@ def verify_full_pipeline_with_stubbed_diffusion(root: Path) -> None:
         raise AssertionError(f"Full pipeline changed FPS: {output_fps}")
     if not pipeline.has_audio(output_video):
         raise AssertionError("Full pipeline did not preserve source audio")
+    source_audio_hash = pipeline.audio_stream_hash(input_video)
+    output_audio_hash = pipeline.audio_stream_hash(output_video)
+    if source_audio_hash != output_audio_hash:
+        raise AssertionError(
+            "Full pipeline changed the compatible source audio packet stream: "
+            f"source={source_audio_hash}, output={output_audio_hash}"
+        )
+
 
 def verify_vace_frame_contract() -> None:
     for raw_frames in (1, 5, 6, 17, 64, 65, 73, 80, 81, 120):

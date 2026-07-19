@@ -1160,44 +1160,98 @@ def has_audio(path: Path) -> bool:
     return completed.returncode == 0 and "audio" in (completed.stdout or "")
 
 
+def audio_stream_hash(path: Path) -> str | None:
+    if not has_audio(path):
+        return None
+    output = run(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-i",
+            str(path),
+            "-map",
+            "0:a:0",
+            "-c",
+            "copy",
+            "-f",
+            "hash",
+            "-hash",
+            "sha256",
+            "-",
+        ]
+    )
+    for line in output.splitlines():
+        normalized = line.strip()
+        if normalized.startswith("SHA256="):
+            return normalized
+    raise RuntimeError(f"Could not hash the source audio stream: {path}")
+
+
 def mux_original_audio(
     composite_video: Path,
     source_video: Path,
     output_video: Path,
     quality: str,
-) -> None:
+) -> bool:
     crf = "10" if quality == "higher" else "14"
     preset = "slow" if quality == "higher" else "medium"
-    run(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(composite_video),
-            "-i",
-            str(source_video),
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            preset,
-            "-crf",
-            crf,
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "256k" if quality == "higher" else "192k",
-            "-movflags",
-            "+faststart",
-            "-shortest",
-            str(output_video),
-        ]
-    )
+    source_has_audio = has_audio(source_video)
+    common = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(composite_video),
+        "-i",
+        str(source_video),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        crf,
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    try:
+        run(
+            common
+            + [
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                str(output_video),
+            ]
+        )
+        if source_has_audio:
+            print("Original audio stream copied without re-encoding", flush=True)
+        return source_has_audio
+    except RuntimeError as copy_error:
+        if not source_has_audio:
+            raise
+        print(
+            "Original audio codec is not MP4-copy-compatible; using high-bitrate AAC fallback: "
+            f"{copy_error}",
+            flush=True,
+        )
+        run(
+            common
+            + [
+                "-c:a",
+                "aac",
+                "-b:a",
+                "256k" if quality == "higher" else "192k",
+                "-movflags",
+                "+faststart",
+                str(output_video),
+            ]
+        )
+        return False
 
 
 def validate_output(
@@ -1208,6 +1262,7 @@ def validate_output(
     expected_width: int,
     expected_height: int,
     expected_frames: int,
+    audio_copied_bit_exactly: bool,
 ) -> None:
     output_fps, output_width, output_height, output_frames = read_video_meta(output_video)
     if output_width != expected_width or output_height != expected_height:
@@ -1219,8 +1274,18 @@ def validate_output(
         raise RuntimeError(
             f"Final frame count changed: expected={expected_frames}, actual={output_frames}"
         )
-    if has_audio(source_video) and not has_audio(output_video):
+    source_has_audio = has_audio(source_video)
+    if source_has_audio and not has_audio(output_video):
         raise RuntimeError("Original audio was not preserved")
+    if source_has_audio and audio_copied_bit_exactly:
+        source_audio_hash = audio_stream_hash(source_video)
+        output_audio_hash = audio_stream_hash(output_video)
+        if source_audio_hash != output_audio_hash:
+            raise RuntimeError(
+                "Original audio packet stream changed during export: "
+                f"source={source_audio_hash}, output={output_audio_hash}"
+            )
+        print(f"Original audio packet hash preserved: {source_audio_hash}", flush=True)
 
     source_cap = cv2.VideoCapture(str(source_video))
     output_cap = cv2.VideoCapture(str(output_video))
@@ -1358,7 +1423,12 @@ def main() -> None:
         source_width,
         source_height,
     )
-    mux_original_audio(raw_composite, source_mp4, output_video, quality)
+    audio_copied_bit_exactly = mux_original_audio(
+        raw_composite,
+        source_mp4,
+        output_video,
+        quality,
+    )
 
     emit_stage("validation", 97, "Validating the final removal and media streams")
     validate_output(
@@ -1369,6 +1439,7 @@ def main() -> None:
         source_width,
         source_height,
         source_frame_count,
+        audio_copied_bit_exactly,
     )
 
 

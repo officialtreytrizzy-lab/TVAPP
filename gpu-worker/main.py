@@ -28,7 +28,7 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.7.3"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
