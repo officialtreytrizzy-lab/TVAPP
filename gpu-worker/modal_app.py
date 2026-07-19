@@ -21,11 +21,6 @@ worker_image = (
     .pip_install("torch", "torchvision", index_url="https://download.pytorch.org/whl/cu121")
     .pip_install_from_requirements("gpu-worker/requirements.txt")
     .run_commands(
-        "rm -rf /opt/ProPainter && git clone --depth 1 https://github.com/sczhou/ProPainter.git /opt/ProPainter",
-        "pip install -r /opt/ProPainter/requirements.txt",
-        "rm -rf /opt/sam2 && git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2",
-        "pip install -e /opt/sam2",
-        "mkdir -p /opt/sam2_checkpoints && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\ncheckpoint = Path('/opt/sam2_checkpoints/sam2.1_hiera_small.pt')\nurl = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt'\nif not checkpoint.exists() or checkpoint.stat().st_size < 1000000:\n    print(f'Downloading SAM2 checkpoint: {url}')\n    urlretrieve(url, checkpoint)\nprint(f'SAM2 checkpoint ready: {checkpoint} ({checkpoint.stat().st_size} bytes)')\nPY",
         "rm -rf /opt/Wan2.1 && git clone --depth 1 https://github.com/Wan-Video/Wan2.1.git /opt/Wan2.1",
         "python - <<'PY'\nfrom pathlib import Path\nsrc = Path('/opt/Wan2.1/requirements.txt')\nout = Path('/tmp/wan-requirements-no-flash.txt')\nskip = {'flash-attn', 'flash_attn'}\nlines = []\nfor line in src.read_text().splitlines():\n    stripped = line.strip()\n    normalized = stripped.split('==')[0].split('>=')[0].split('<=')[0].split('~=')[0].split('[')[0].replace('_', '-').lower()\n    if normalized in skip:\n        print(f'Skipping optional CUDA build dependency: {stripped}')\n        continue\n    lines.append(line)\nout.write_text('\\n'.join(lines) + '\\n')\nPY",
         "pip install -r /tmp/wan-requirements-no-flash.txt",
@@ -44,7 +39,8 @@ worker_image = (
         index_url="https://download.pytorch.org/whl/cu121",
     )
     .run_commands(
-        "python - <<'PY'\nimport torch\nif torch.version.cuda is None:\n    raise RuntimeError(f'CPU-only PyTorch wheel installed: torch={torch.__version__}')\nprint(f'CUDA PyTorch image verified: torch={torch.__version__} cuda_build={torch.version.cuda}')\nPY",
+        "pip install --no-deps 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl'",
+        "python - <<'PY'\nimport flash_attn\nimport torch\nif torch.version.cuda is None:\n    raise RuntimeError(f'CPU-only PyTorch wheel installed: torch={torch.__version__}')\nif flash_attn.__version__ != '2.7.4.post1':\n    raise RuntimeError(f'Unexpected Flash Attention build: {flash_attn.__version__}')\nprint(f'CUDA image verified: torch={torch.__version__} cuda_build={torch.version.cuda} flash_attn={flash_attn.__version__}')\nPY",
     )
     .add_local_dir("gpu-worker", remote_path="/app")
 )
@@ -54,6 +50,7 @@ app = modal.App("tvapp-video-eraser-gpu")
 
 def require_gpu_runtime() -> dict[str, str | bool]:
     """Refuse to start a worker that cannot actually see its assigned GPU."""
+    import flash_attn
     import torch
 
     cuda_available = bool(torch.cuda.is_available())
@@ -70,10 +67,12 @@ def require_gpu_runtime() -> dict[str, str | bool]:
         "device": device_name,
         "torch": str(torch.__version__),
         "cuda_build": str(torch.version.cuda),
+        "flash_attn": str(flash_attn.__version__),
     }
     print(
         "TVAPP GPU runtime verified: "
-        f"device={device_name} torch={torch.__version__} cuda_build={torch.version.cuda}",
+        f"device={device_name} torch={torch.__version__} cuda_build={torch.version.cuda} "
+        f"flash_attn={flash_attn.__version__}",
         flush=True,
     )
     return details
