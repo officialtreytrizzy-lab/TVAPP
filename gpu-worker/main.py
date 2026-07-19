@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import math
 import os
+import re
 import select
 import signal
 import shutil
@@ -20,6 +24,7 @@ from pydantic import BaseModel
 WORK_DIR = Path(os.environ.get("ERASER_WORK_DIR", "/tmp/video-eraser-jobs"))
 TRANSITION_WORK_DIR = Path(os.environ.get("TRANSITION_WORK_DIR", "/tmp/video-transition-jobs"))
 REMIX_WORK_DIR = Path(os.environ.get("AI_REMIX_WORK_DIR", "/tmp/ai-remix-jobs"))
+UPLOAD_WORK_DIR = Path(os.environ.get("ERASER_UPLOAD_WORK_DIR", str(WORK_DIR / "_chunked_uploads")))
 PUBLIC_BASE_URL = os.environ.get("ERASER_PUBLIC_BASE_URL", "").rstrip("/")
 PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/optical_flow_vace_inpaint.py").strip()
 AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pipelines/wan_vace_remix.py").strip()
@@ -27,13 +32,17 @@ AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pip
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.7.3"
+APP_VERSION = "1.8.0"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
 MAX_AI_REMIX_UPLOAD_BYTES = int(os.environ.get("AI_REMIX_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 MAX_AI_REMIX_SECONDS = float(os.environ.get("AI_REMIX_MAX_SECONDS", "6"))
+ERASER_UPLOAD_CHUNK_BYTES = int(os.environ.get("ERASER_UPLOAD_CHUNK_BYTES", str(2 * 1024 * 1024)))
+ERASER_MAX_UPLOAD_BYTES = int(os.environ.get("ERASER_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
+UPLOAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 
 app = FastAPI(title="TVAPP GPU Worker", version=APP_VERSION)
 app.add_middleware(
@@ -107,6 +116,30 @@ class JobState(BaseModel):
     prompt: str | None = None
     intent: str | None = None
     strength: str | None = None
+
+
+class ChunkUploadCreate(BaseModel):
+    job_id: str = ""
+    filename: str = "video.mp4"
+    size: int
+    mime_type: str = "video/mp4"
+    chunk_size: int | None = None
+
+
+class ChunkUploadComplete(BaseModel):
+    job_id: str = ""
+    mask_base64: str
+    selected_time: str | float | int = "0"
+    selected_frame_index: str | int = "0"
+    fps: str | float | int = "30"
+    duration: str | float | int = "0"
+    width: str | int = "0"
+    height: str | int = "0"
+    pipeline: str = "optical-flow-vace-diffusion"
+    quality: str = "source"
+    preserve_resolution: bool = True
+    preserve_fps: bool = True
+    preserve_audio: bool = True
 
 
 jobs: dict[str, JobState] = {}
@@ -184,6 +217,51 @@ def save_upload(upload: UploadFile, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as out:
         shutil.copyfileobj(upload.file, out)
+
+
+def safe_upload_id(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not UPLOAD_ID_PATTERN.fullmatch(value):
+        raise HTTPException(status_code=400, detail="Invalid upload session id")
+    return value
+
+
+def safe_job_id(raw: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_-]+", "-", str(raw or "").strip()).strip("-")
+    return value[:120] or str(uuid.uuid4())
+
+
+def upload_dir_for(upload_id: str) -> Path:
+    return UPLOAD_WORK_DIR / safe_upload_id(upload_id)
+
+
+def upload_manifest_path(upload_id: str) -> Path:
+    return upload_dir_for(upload_id) / "manifest.json"
+
+
+def read_upload_manifest(upload_id: str) -> dict[str, Any]:
+    path = upload_manifest_path(upload_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Upload manifest is unreadable: {exc}")
+    return payload
+
+
+def decode_mask_data_url(raw: str) -> bytes:
+    value = str(raw or "").strip()
+    if not value:
+        raise HTTPException(status_code=400, detail="mask_base64 is required")
+    encoded = value.split(",", 1)[1] if "," in value else value
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"mask_base64 is invalid: {exc}")
+    if not decoded or len(decoded) > 16 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Mask is empty or too large")
+    return decoded
 
 
 def append_text_log(path: Path, line: str) -> None:
@@ -496,6 +574,137 @@ async def health(request: Request):
 @app.get("/v1/ai-remix/debug")
 async def ai_remix_debug(request: Request):
     return {"ok": True, "max_recommended_upload_mb": MAX_AI_REMIX_UPLOAD_BYTES // (1024 * 1024), "max_duration_seconds": MAX_AI_REMIX_SECONDS, "routes": ["GET /health", "GET /v1/ai-remix/debug", "POST /v1/ai-remix/jobs", "GET /v1/ai-remix/jobs/{jobId}", "GET /v1/ai-remix/jobs/{jobId}/output", "GET /v1/ai-remix/jobs/{jobId}/log"], "cors": "enabled", "modal_worker_url_hint": absolute_base_url(request)}
+
+
+@app.post("/v1/video-eraser/uploads")
+async def create_chunked_upload(payload: ChunkUploadCreate, request: Request):
+    expected_size = int(payload.size or 0)
+    if expected_size <= 0 or expected_size > ERASER_MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"Video size must be between 1 byte and {ERASER_MAX_UPLOAD_BYTES} bytes")
+    requested_chunk = int(payload.chunk_size or ERASER_UPLOAD_CHUNK_BYTES)
+    chunk_size = max(256 * 1024, min(requested_chunk, 4 * 1024 * 1024))
+    upload_id = f"upl_{uuid.uuid4().hex}"
+    upload_dir = upload_dir_for(upload_id)
+    upload_dir.mkdir(parents=True, exist_ok=False)
+    expected_chunks = int(math.ceil(expected_size / chunk_size))
+    manifest = {
+        "upload_id": upload_id,
+        "job_id": safe_job_id(payload.job_id),
+        "filename": Path(payload.filename or "video.mp4").name,
+        "mime_type": payload.mime_type or "video/mp4",
+        "expected_size": expected_size,
+        "chunk_size": chunk_size,
+        "expected_chunks": expected_chunks,
+        "created_at": time.time(),
+    }
+    upload_manifest_path(upload_id).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    base = absolute_base_url(request)
+    return {
+        **manifest,
+        "chunk_upload_url_template": f"{base}/v1/video-eraser/uploads/{upload_id}/chunks/{{index}}",
+        "complete_url": f"{base}/v1/video-eraser/uploads/{upload_id}/complete",
+    }
+
+
+@app.post("/v1/video-eraser/uploads/{upload_id}/chunks/{chunk_index}")
+async def upload_video_chunk(upload_id: str, chunk_index: int, request: Request):
+    manifest = read_upload_manifest(upload_id)
+    expected_chunks = int(manifest["expected_chunks"])
+    chunk_size = int(manifest["chunk_size"])
+    expected_size = int(manifest["expected_size"])
+    if chunk_index < 0 or chunk_index >= expected_chunks:
+        raise HTTPException(status_code=400, detail="Chunk index is outside the upload range")
+    body = await request.body()
+    expected_chunk_size = chunk_size if chunk_index < expected_chunks - 1 else expected_size - (chunk_size * (expected_chunks - 1))
+    if len(body) != expected_chunk_size:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chunk {chunk_index} has {len(body)} bytes; expected {expected_chunk_size}",
+        )
+    supplied_hash = str(request.headers.get("x-chunk-sha256") or "").strip().lower()
+    actual_hash = hashlib.sha256(body).hexdigest()
+    if supplied_hash and supplied_hash != actual_hash:
+        raise HTTPException(status_code=400, detail=f"Chunk {chunk_index} checksum mismatch")
+    chunk_path = upload_dir_for(upload_id) / f"chunk-{chunk_index:06d}.part"
+    temp_path = chunk_path.with_suffix(".tmp")
+    temp_path.write_bytes(body)
+    temp_path.replace(chunk_path)
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "chunk_index": chunk_index,
+        "bytes": len(body),
+        "sha256": actual_hash,
+    }
+
+
+@app.post("/v1/video-eraser/uploads/{upload_id}/complete")
+async def complete_chunked_upload(upload_id: str, payload: ChunkUploadComplete):
+    manifest = read_upload_manifest(upload_id)
+    upload_dir = upload_dir_for(upload_id)
+    expected_chunks = int(manifest["expected_chunks"])
+    expected_size = int(manifest["expected_size"])
+    missing = [index for index in range(expected_chunks) if not (upload_dir / f"chunk-{index:06d}.part").exists()]
+    if missing:
+        raise HTTPException(status_code=409, detail=f"Upload is incomplete; missing chunks: {missing[:20]}")
+
+    remote_job_id = safe_job_id(payload.job_id or str(manifest.get("job_id") or ""))
+    job_dir = WORK_DIR / remote_job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)
+    job_dir.mkdir(parents=True, exist_ok=False)
+    assembled_temp = job_dir / "input_video.tmp"
+    digest = hashlib.sha256()
+    assembled_size = 0
+    with assembled_temp.open("wb") as output:
+        for index in range(expected_chunks):
+            chunk_path = upload_dir / f"chunk-{index:06d}.part"
+            with chunk_path.open("rb") as source:
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    output.write(block)
+                    digest.update(block)
+                    assembled_size += len(block)
+    if assembled_size != expected_size:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=f"Assembled upload has {assembled_size} bytes; expected {expected_size}")
+    assembled_temp.replace(job_dir / "input_video")
+    (job_dir / "mask.png").write_bytes(decode_mask_data_url(payload.mask_base64))
+    shutil.rmtree(upload_dir, ignore_errors=True)
+
+    state = set_job(
+        remote_job_id,
+        phase="queued",
+        progress=5,
+        statusMessage="Chunked upload verified; queued optical-flow diffusion removal",
+    )
+    Thread(
+        target=process_job,
+        args=(
+            remote_job_id,
+            str(payload.selected_time),
+            str(payload.selected_frame_index),
+            str(payload.fps),
+            str(payload.duration),
+            str(payload.width),
+            str(payload.height),
+            "higher" if payload.quality == "higher" else "source",
+        ),
+        daemon=True,
+    ).start()
+    response = dump_job_payload(state)
+    response.update({
+        "upload_id": upload_id,
+        "uploaded_bytes": assembled_size,
+        "source_sha256": digest.hexdigest(),
+        "statusUrl": f"/v1/video-eraser/jobs/{remote_job_id}",
+        "status_url": f"/v1/video-eraser/jobs/{remote_job_id}",
+        "outputUrl": f"/v1/video-eraser/jobs/{remote_job_id}/output",
+        "output_url": f"/v1/video-eraser/jobs/{remote_job_id}/output",
+    })
+    return response
 
 
 @app.post("/v1/video-eraser/jobs")

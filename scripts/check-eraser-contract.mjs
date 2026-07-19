@@ -74,6 +74,12 @@ requireText('api/v1/trecut/eraser/_handlers/jobs.ts', 'submitRemovalToModal', 'c
 requireText('api/v1/trecut/eraser/_handlers/job.ts', 'readModalStatus', 'status endpoint must read worker state');
 requireText('api/v1/trecut/eraser/_handlers/output.ts', 'modalCompositeOutputFromPayload', 'output endpoint must stream the final composite');
 requireText('src/lib/eraser/gpu.ts', 'upload-target', 'large files must upload directly to the GPU worker');
+requireText('src/lib/eraser/gpu.ts', 'runChunkedWorkerUpload', 'mobile uploads must use retryable chunks');
+requireText('src/lib/eraser/gpu.ts', 'X-Chunk-SHA256', 'each upload chunk must be checksummed');
+requireText('gpu-worker/main.py', '/v1/video-eraser/uploads/{upload_id}/chunks/{chunk_index}', 'worker must accept numbered upload chunks');
+requireText('gpu-worker/main.py', 'Chunked upload verified; queued optical-flow diffusion removal', 'worker must verify the assembled upload before processing');
+requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'chunked_upload_url', 'first-party discovery must expose chunked upload');
+requireText('api/v1/direct-upload.ts', 'chunked_upload_url', 'licensed discovery must expose chunked upload');
 requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'legacy base64 relay must remain size guarded');
 
 // Modal production routing and GPU constraints.

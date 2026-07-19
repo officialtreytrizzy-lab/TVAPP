@@ -24,6 +24,8 @@ export default async function handler(req: any, res: any) {
       worker_base: base,
       workerBase: base,
       upload_url: `${base}/v1/video-eraser/jobs`,
+      chunked_upload_url: `${base}/v1/video-eraser/uploads`,
+      chunkedUploadUrl: `${base}/v1/video-eraser/uploads`,
       uploadUrl: `${base}/v1/video-eraser/jobs`,
       status_path_prefix: '/v1/video-eraser/jobs',
       health_url: `${base}/health`,
