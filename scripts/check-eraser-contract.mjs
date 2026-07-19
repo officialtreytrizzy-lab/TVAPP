@@ -131,6 +131,10 @@ requireText(pipeline, 'def crop_source_for_fixed_roi(', 'fixed-mark source video
 requireText(pipeline, 'def crop_masks_for_fixed_roi(', 'tracked masks must map exactly into the fixed repair ROI');
 requireText(pipeline, 'def source_preserving_composite(', 'only repaired mask pixels may replace source pixels');
 requireText(pipeline, 'def harmonize_composite_frame(', 'final patches must receive adaptive color and texture harmonization');
+requireText(pipeline, 'def nearest_background_texture(', 'missing patch grain must be sampled from real nearby source texture');
+requireText(pipeline, 'def transfer_local_texture(', 'smooth diffusion repairs must receive only the missing local texture energy');
+requireText(pipeline, 'patch_mask = binary[crop_y1:crop_y2, crop_x1:crop_x2].copy()', 'gradient cloning must never mutate the authoritative matte');
+requireText(pipeline, 'composite_masks,', 'final validation must inspect the refined composite matte');
 requireText(pipeline, 'cv2.seamlessClone', 'patch boundaries must use gradient-domain blending');
 requireText(pipeline, 'cv2.VideoWriter_fourcc(*\"FFV1\")', 'the intermediate composite must remain lossless');
 requireText('gpu-worker/pipelines/sam2_refinement.py', 'def fuse_semantic_mask(', 'SAM2 output must be constrained to the optical-flow envelope');

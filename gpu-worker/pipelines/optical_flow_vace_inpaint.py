@@ -1165,6 +1165,72 @@ def robust_mad(values: np.ndarray) -> float:
     return float(np.median(np.abs(flattened - median)) * 1.4826)
 
 
+def nearest_background_texture(
+    source_frame: np.ndarray,
+    binary_mask: np.ndarray,
+) -> np.ndarray:
+    """Extend real source high-frequency residuals inward from the matte edge."""
+    binary = (binary_mask > 24).astype(np.uint8)
+    source_float = source_frame.astype(np.float32)
+    source_high = source_float - cv2.GaussianBlur(source_float, (0, 0), 1.0)
+    _distance, labels = cv2.distanceTransformWithLabels(
+        binary,
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    outside = binary == 0
+    outside_labels = labels[outside]
+    outside_y, outside_x = np.where(outside)
+    maximum_label = int(labels.max())
+    map_y = np.zeros((maximum_label + 1,), dtype=np.int32)
+    map_x = np.zeros((maximum_label + 1,), dtype=np.int32)
+    valid = (outside_labels > 0) & (outside_labels <= maximum_label)
+    map_y[outside_labels[valid]] = outside_y[valid]
+    map_x[outside_labels[valid]] = outside_x[valid]
+    nearest_y = map_y[np.clip(labels, 0, maximum_label)]
+    nearest_x = map_x[np.clip(labels, 0, maximum_label)]
+    return source_high[nearest_y, nearest_x]
+
+
+def transfer_local_texture(
+    source_frame: np.ndarray,
+    corrected_repair: np.ndarray,
+    binary_mask: np.ndarray,
+    outer_ring: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Add only the missing amount of real nearby texture to a smooth repair."""
+    inside = binary_mask > 24
+    if int(np.count_nonzero(inside)) < 16 or int(np.count_nonzero(outer_ring)) < 16:
+        return corrected_repair, 0.0
+
+    source_gray = cv2.cvtColor(source_frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    repair_gray = cv2.cvtColor(corrected_repair, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    source_high_gray = source_gray - cv2.GaussianBlur(source_gray, (0, 0), 1.0)
+    repair_high_gray = repair_gray - cv2.GaussianBlur(repair_gray, (0, 0), 1.0)
+    target_detail = min(6.0, max(0.0, robust_mad(source_high_gray[outer_ring])))
+    current_detail = max(0.0, robust_mad(repair_high_gray[inside]))
+    missing_detail = math.sqrt(max(target_detail * target_detail - current_detail * current_detail, 0.0))
+    if missing_detail < 0.12:
+        return corrected_repair, 0.0
+
+    texture = nearest_background_texture(source_frame, binary_mask).astype(np.float32)
+    texture_inside = texture[inside]
+    channel_center = np.median(texture_inside, axis=0)
+    texture -= channel_center.reshape(1, 1, 3)
+    texture_gray = cv2.cvtColor(
+        np.clip(texture + 128.0, 0, 255).astype(np.uint8),
+        cv2.COLOR_BGR2GRAY,
+    ).astype(np.float32) - 128.0
+    texture_scale = max(robust_mad(texture_gray[inside]), 0.15)
+    gain = float(np.clip(missing_detail / texture_scale, 0.0, 1.75))
+
+    textured = corrected_repair.astype(np.float32)
+    textured[inside] += texture[inside] * gain
+    textured = np.clip(textured, 0, 255).astype(np.uint8)
+    return textured, gain
+
+
 def harmonize_composite_frame(
     source_frame: np.ndarray,
     repair_frame: np.ndarray,
@@ -1215,6 +1281,12 @@ def harmonize_composite_frame(
 
     corrected_lab = np.clip(repair_lab + color_shift.reshape(1, 1, 3), 0, 255).astype(np.uint8)
     corrected = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+    corrected, texture_transfer_gain = transfer_local_texture(
+        source_frame,
+        corrected,
+        binary,
+        outer_ring,
+    )
 
     pad = max(4, min(12, int(round(minimum_side * 0.12))))
     crop_x1 = max(0, x1 - pad)
@@ -1222,7 +1294,7 @@ def harmonize_composite_frame(
     crop_x2 = min(source_frame.shape[1], x2 + pad + 1)
     crop_y2 = min(source_frame.shape[0], y2 + pad + 1)
     patch = corrected[crop_y1:crop_y2, crop_x1:crop_x2]
-    patch_mask = binary[crop_y1:crop_y2, crop_x1:crop_x2]
+    patch_mask = binary[crop_y1:crop_y2, crop_x1:crop_x2].copy()
     center = (crop_x1 + patch.shape[1] // 2, crop_y1 + patch.shape[0] // 2)
 
     clone_candidate = corrected.copy()
@@ -1294,7 +1366,7 @@ def harmonize_composite_frame(
         candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY).astype(np.float32)
         candidate_high = candidate_gray - cv2.GaussianBlur(candidate_gray, (0, 0), 1.0)
         texture_ratio = float(np.std(candidate_high[binary > 0]) / source_texture)
-        texture_penalty = abs(math.log(max(texture_ratio, 0.05))) * 1.25
+        texture_penalty = abs(math.log(max(texture_ratio, 0.05))) * 2.75
         score = boundary_delta + texture_penalty
         candidate_scores[mode] = (score, boundary_delta, texture_ratio)
 
@@ -1322,6 +1394,7 @@ def harmonize_composite_frame(
         "blend_score": float(selected_score),
         "boundary_delta": float(boundary_delta),
         "texture_ratio": float(texture_ratio),
+        "texture_transfer_gain": float(texture_transfer_gain),
         "transition_width": float(transition_width),
     }
     return composited, state, metrics
@@ -1789,7 +1862,7 @@ def main() -> None:
     validate_output(
         source_mp4,
         output_video,
-        tracked_masks,
+        composite_masks,
         anchor_index,
         source_width,
         source_height,

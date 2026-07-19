@@ -248,6 +248,13 @@ def verify_patch_harmonizer() -> None:
     repair = np.clip(repair, 0, 255).astype(np.uint8)
 
     harmonized, _state, metrics = pipeline.harmonize_composite_frame(source, repair, mask)
+    expected_mask_pixels = int(np.count_nonzero(mask > 24))
+    if int(metrics.get("mask_pixels", -1)) != expected_mask_pixels:
+        raise AssertionError(
+            f"Patch harmonizer mutated the authoritative matte: expected={expected_mask_pixels}, metrics={metrics}"
+        )
+    if float(metrics.get("texture_transfer_gain", 0.0)) <= 0.0:
+        raise AssertionError(f"Patch harmonizer did not transfer missing local texture: {metrics}")
     outside = mask == 0
     inside = mask > 0
     if not np.array_equal(harmonized[outside], source[outside]):
