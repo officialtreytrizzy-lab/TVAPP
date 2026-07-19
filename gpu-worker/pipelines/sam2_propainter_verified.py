@@ -31,6 +31,10 @@ PATCH_MAX_EXTENT_RATIO = float(os.environ.get("ERASER_PATCH_MAX_EXTENT_RATIO", "
 TIMELINE_SAMPLE_COUNT = max(7, int(os.environ.get("ERASER_TIMELINE_SAMPLE_COUNT", "11")))
 TIMELINE_MIN_PASS_RATIO = float(os.environ.get("ERASER_TIMELINE_MIN_PASS_RATIO", "0.82"))
 TIMELINE_BOUNDARY_FRAMES = max(24, int(os.environ.get("ERASER_PROPAINTER_CHUNK_FRAMES", "120")))
+TIMELINE_CONTEXT_MIN_CONTRAST = float(os.environ.get("ERASER_CONTEXT_MIN_CONTRAST", "4.0"))
+TIMELINE_CONTEXT_MAX_RESIDUAL_RATIO = float(os.environ.get("ERASER_CONTEXT_MAX_RESIDUAL_RATIO", "0.90"))
+TIMELINE_CONTEXT_MIN_GAIN = float(os.environ.get("ERASER_CONTEXT_MIN_GAIN", "0.75"))
+TIMELINE_MIN_VERIFIABLE_FRAMES = max(2, int(os.environ.get("ERASER_MIN_VERIFIABLE_FRAMES", "3")))
 
 
 class SelectionNotRemovedError(RuntimeError):
@@ -61,6 +65,50 @@ def verification_mask(input_mask: Path, width: int, height: int) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
 
+def local_context_residual(frame: np.ndarray, mask: np.ndarray) -> float:
+    """Estimate how visibly the selected pixels differ from nearby background.
+
+    The source and result are each compared with a tight context-only inpaint.
+    This lets subtle successful removals pass even when the replacement color is
+    numerically close to the source, while an unchanged visible object still
+    retains a high residual and fails.
+    """
+    height, width = frame.shape[:2]
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    binary = (mask > 24).astype(np.uint8) * 255
+    selector = binary > 0
+    if not np.any(selector):
+        return 0.0
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    context_mask = cv2.dilate(binary, kernel, iterations=1)
+    radius = max(2, min(7, int(round(max(width, height) * 0.004))))
+    predicted_background = cv2.inpaint(frame, context_mask, radius, cv2.INPAINT_TELEA)
+    residual = cv2.absdiff(frame, predicted_background).astype(np.float32).mean(axis=2)
+    return float(residual[selector].mean())
+
+
+def selection_outcome(stats: dict[str, float], *, allow_inconclusive: bool) -> str:
+    direct_change = (
+        stats["mean_change"] >= ANCHOR_MIN_MEAN_CHANGE
+        or stats["changed_ratio"] >= ANCHOR_MIN_CHANGED_RATIO
+    )
+    context_gain = stats["source_context_residual"] - stats["candidate_context_residual"]
+    context_ratio = stats["context_residual_ratio"]
+    context_improved = (
+        stats["source_context_residual"] >= TIMELINE_CONTEXT_MIN_CONTRAST
+        and context_gain >= TIMELINE_CONTEXT_MIN_GAIN
+        and context_ratio <= TIMELINE_CONTEXT_MAX_RESIDUAL_RATIO
+    )
+    if direct_change or context_improved:
+        return "passed"
+    if allow_inconclusive and stats["source_context_residual"] < TIMELINE_CONTEXT_MIN_CONTRAST:
+        return "inconclusive"
+    return "failed"
+
+
+
 def selection_change_metrics(
     source_video: Path,
     candidate_video: Path,
@@ -86,6 +134,11 @@ def selection_change_metrics(
     mean_change = float(selected_delta.mean())
     median_change = float(np.median(selected_delta))
     changed_ratio = float(np.mean(selected_delta >= ANCHOR_CHANGED_PIXEL_THRESHOLD))
+    source_context_residual = local_context_residual(source, mask)
+    candidate_context_residual = local_context_residual(candidate, mask)
+    context_residual_ratio = float(
+        candidate_context_residual / max(source_context_residual, 0.001)
+    )
 
     return {
         "frame_index": float(frame_index),
@@ -93,6 +146,9 @@ def selection_change_metrics(
         "mean_change": mean_change,
         "median_change": median_change,
         "changed_ratio": changed_ratio,
+        "source_context_residual": source_context_residual,
+        "candidate_context_residual": candidate_context_residual,
+        "context_residual_ratio": context_residual_ratio,
     }
 
 
@@ -106,16 +162,15 @@ def validate_selection_changed(
     stats = selection_change_metrics(source_video, candidate_video, mask, frame_index)
     print(f"{label} selected-region verification: {json.dumps(stats, sort_keys=True)}", flush=True)
 
-    # Require either meaningful average replacement or broad pixel replacement.
-    # A tiny codec fluctuation is not enough to call the object removed.
-    if (
-        stats["mean_change"] < ANCHOR_MIN_MEAN_CHANGE
-        and stats["changed_ratio"] < ANCHOR_MIN_CHANGED_RATIO
-    ):
+    # The user-selected anchor must be positively verified. Unlike timeline
+    # samples, it is never allowed to become merely inconclusive.
+    if selection_outcome(stats, allow_inconclusive=False) != "passed":
         raise SelectionNotRemovedError(
             f"{label} left the painted selection unchanged: "
             f"mean_change={stats['mean_change']:.3f}, "
-            f"changed_ratio={stats['changed_ratio']:.3f}"
+            f"changed_ratio={stats['changed_ratio']:.3f}, "
+            f"source_context={stats['source_context_residual']:.3f}, "
+            f"candidate_context={stats['candidate_context_residual']:.3f}"
         )
     return stats
 
@@ -196,9 +251,10 @@ def validate_timeline_selection_changed(
     anchor_timeline_mask = read_timeline_mask(mask_dir, anchor_index, width, height)
     static_overlay = locked_core.is_probably_static_overlay(anchor_timeline_mask, width, height)
 
-    results: list[dict[str, float | bool]] = []
+    results: list[dict[str, float | str]] = []
     missing_masks: list[int] = []
     failed_frames: list[int] = []
+    inconclusive_frames: list[int] = []
 
     for frame_index in timeline_sample_indexes(
         source_frames,
@@ -213,23 +269,26 @@ def validate_timeline_selection_changed(
             continue
 
         stats = selection_change_metrics(source_video, candidate_video, mask, frame_index)
-        passed = (
-            stats["mean_change"] >= ANCHOR_MIN_MEAN_CHANGE
-            or stats["changed_ratio"] >= ANCHOR_MIN_CHANGED_RATIO
-        )
-        results.append({**stats, "passed": passed})
-        if not passed:
+        outcome = selection_outcome(stats, allow_inconclusive=True)
+        results.append({**stats, "outcome": outcome})
+        if outcome == "failed":
             failed_frames.append(frame_index)
+        elif outcome == "inconclusive":
+            inconclusive_frames.append(frame_index)
 
     checked = len(results)
-    passed_count = sum(1 for row in results if bool(row["passed"]))
-    pass_ratio = float(passed_count / checked) if checked else 0.0
+    passed_count = sum(1 for row in results if row["outcome"] == "passed")
+    failed_count = sum(1 for row in results if row["outcome"] == "failed")
+    verifiable_count = passed_count + failed_count
+    pass_ratio = float(passed_count / verifiable_count) if verifiable_count else 0.0
     required_ratio = 1.0 if static_overlay else TIMELINE_MIN_PASS_RATIO
     summary = {
         "source_frames": float(source_frames),
         "candidate_frames": float(candidate_frames),
         "checked_frames": float(checked),
+        "verifiable_frames": float(verifiable_count),
         "passed_frames": float(passed_count),
+        "inconclusive_frames": float(len(inconclusive_frames)),
         "pass_ratio": pass_ratio,
         "required_ratio": required_ratio,
         "static_overlay": float(static_overlay),
@@ -244,11 +303,17 @@ def validate_timeline_selection_changed(
 
     if checked <= 0:
         raise SelectionNotRemovedError(f"{label} had no tracked timeline frames to verify")
-    if pass_ratio < required_ratio or (static_overlay and (missing_masks or failed_frames)):
+    if verifiable_count < min(TIMELINE_MIN_VERIFIABLE_FRAMES, checked):
+        raise SelectionNotRemovedError(
+            f"{label} did not have enough visible timeline samples to verify: "
+            f"verifiable={verifiable_count}, checked={checked}"
+        )
+    if pass_ratio < required_ratio or (static_overlay and missing_masks):
         raise SelectionNotRemovedError(
             f"{label} did not keep the selection removed for the full clip: "
             f"pass_ratio={pass_ratio:.3f}, required={required_ratio:.3f}, "
-            f"failed_frames={sorted(set(failed_frames))}, missing_masks={missing_masks}"
+            f"failed_frames={sorted(set(failed_frames))}, "
+            f"inconclusive_frames={inconclusive_frames}, missing_masks={missing_masks}"
         )
     return summary
 

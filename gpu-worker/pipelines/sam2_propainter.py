@@ -378,22 +378,41 @@ def mask_area(mask: np.ndarray) -> int:
 
 
 def is_probably_static_overlay(mask: np.ndarray, width: int, height: int) -> bool:
+    """Recognize compact screen-space marks without requiring bezel contact.
+
+    Watermarks, logos, captions, and camera blemishes are usually inset several
+    percent from an edge. Treating those as moving subjects lets SAM2 jump to a
+    nearby person after a cut and grow a small mask into a large repair region.
+    """
     bbox = mask_bbox(mask)
     if bbox is None:
         return False
+
     x1, y1, x2, y2 = bbox
     area_ratio = mask_area(mask) / max(width * height, 1)
     box_width = x2 - x1 + 1
     box_height = y2 - y1 + 1
-    edge_margin = max(3, int(round(min(width, height) * 0.025)))
-    touches_frame_edge = (
-        x1 <= edge_margin
-        or y1 <= edge_margin
-        or x2 >= width - 1 - edge_margin
-        or y2 >= height - 1 - edge_margin
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+
+    compact = box_width <= width * 0.28 and box_height <= height * 0.28
+    if not compact or area_ratio > 0.06:
+        return False
+
+    strict_margin = max(3, int(round(min(width, height) * 0.025)))
+    inset_margin = max(8, int(round(min(width, height) * 0.085)))
+    nearest_edge = min(x1, y1, max(0, width - 1 - x2), max(0, height - 1 - y2))
+    touches_frame_edge = nearest_edge <= strict_margin
+    near_frame_edge = nearest_edge <= inset_margin
+    near_corner = (
+        (center_x <= width * 0.24 or center_x >= width * 0.76)
+        and (center_y <= height * 0.24 or center_y >= height * 0.76)
     )
-    compact = box_width <= width * 0.25 and box_height <= height * 0.25
-    return touches_frame_edge and compact and area_ratio <= 0.06
+
+    tiny_inset_mark = area_ratio <= 0.025 and near_frame_edge
+    compact_corner_mark = area_ratio <= 0.04 and near_corner
+    return touches_frame_edge or tiny_inset_mark or compact_corner_mark
+
 
 
 def read_tracking_frame(frames_dir: Path, index: int, width: int, height: int) -> np.ndarray:

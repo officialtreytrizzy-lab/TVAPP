@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from 'node:fs';
+﻿import { readFileSync, existsSync } from 'node:fs';
 
 const requiredFiles = [
   'src/lib/eraser/gpu.ts',
@@ -31,14 +31,14 @@ function file(path) {
 function requireText(path, text, reason) {
   const body = file(path);
   if (!body.includes(text)) {
-    checks.push(`FAIL ${path}: missing ${JSON.stringify(text)} — ${reason}`);
+    checks.push(`FAIL ${path}: missing ${JSON.stringify(text)} â€” ${reason}`);
   }
 }
 
 function forbidText(path, text, reason) {
   const body = file(path);
   if (body.includes(text)) {
-    checks.push(`FAIL ${path}: forbidden ${JSON.stringify(text)} — ${reason}`);
+    checks.push(`FAIL ${path}: forbidden ${JSON.stringify(text)} â€” ${reason}`);
   }
 }
 
@@ -149,6 +149,11 @@ requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_timeli
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'TIMELINE_BOUNDARY_FRAMES', 'the five-second chunk boundary must be sampled explicitly');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'chunk_boundary_indexes', 'every adaptive memory-safe segment join must be sampled explicitly');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'Keep the exact painted screen position active for every frame', 'fixed corner selections must survive cuts without SAM2 drift');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'tiny_inset_mark', 'small marks inset from an edge must stay locked to screen coordinates');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'local_context_residual', 'subtle removals must be verified against nearby background context');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'inconclusive_frames', 'low-contrast timeline frames must not become automatic false failures');
+requireText('scripts/verify_etreyser_timeline.py', 'verify_inset_static_overlay_lock', 'regression suite must cover inset screen-space mark drift');
+requireText('scripts/verify_etreyser_timeline.py', 'verify_context_aware_timeline', 'regression suite must distinguish low-contrast frames from a returned visible mark');
 
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');
 requireText('gpu-worker/requirements.txt', 'numpy', 'mask preparation uses NumPy');
