@@ -17,6 +17,7 @@ interface Props {
   brushSize: number; // display px
   erasing: boolean;
   maskVisible: boolean;
+  onStrokeStart?: () => void;
   onStrokeEnd?: () => void;
   disabled?: boolean;
 }
@@ -24,7 +25,7 @@ interface Props {
 const MAX_HISTORY = 25;
 
 const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
-  { frameW, frameH, videoEl, brushSize, erasing, maskVisible, onStrokeEnd, disabled },
+  { frameW, frameH, videoEl, brushSize, erasing, maskVisible, onStrokeStart, onStrokeEnd, disabled },
   ref
 ) {
   const overlayRef = useRef<HTMLCanvasElement | null>(null); // visible overlay
@@ -169,6 +170,7 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     const p = displayToFrame(g, dx, dy);
     if (!p) return;
 
+    onStrokeStart?.();
     pushHistory();
     drawingRef.current = true;
     paintAt(p.x, p.y, null, null);

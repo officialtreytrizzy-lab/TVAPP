@@ -287,6 +287,8 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
         completed = subprocess.run(PIPELINE_CMD, shell=True, cwd=str(job_dir), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60 * 45)
         if completed.returncode != 0:
             raise RuntimeError(completed.stdout[-6000:] or f"Pipeline exited with {completed.returncode}")
+        if completed.stdout:
+            print(completed.stdout[-16000:], flush=True)
         assert_playable_mp4(output_path)
         final_url = public_output_url(job_id)
         set_job(job_id, phase="completed", progress=100, statusMessage="GPU AI removal complete", outputUrl=final_url, finalCompositeUrl=final_url, compositeOutputUrl=final_url, fullVideoUrl=final_url, finalOutputUrl=final_url, outputKind="final_composite_video", error=None)

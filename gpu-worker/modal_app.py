@@ -123,6 +123,8 @@ def fastapi_app():
     os.environ["ERASER_REQUIRE_CUDA"] = "true"
     os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_verified.py"
     os.environ.setdefault("SAM2_PROMPT_MODE", "hybrid")
+    os.environ.setdefault("ERASER_MASK_DILATION_PX", "1")
+    os.environ.setdefault("ERASER_TRACK_REANCHOR_FRAMES", "48")
     os.environ.setdefault("ERASER_ALLOW_OPENCV_FALLBACK", "false")
     gpu_details = require_gpu_runtime()
 
