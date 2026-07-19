@@ -141,8 +141,13 @@ const MaskCanvas = forwardRef<MaskCanvasHandle, Props>(function MaskCanvas(
     const ctx = mask.getContext('2d')!;
     const frameRadius = displayToFrameRadius(g, brushSize / 2);
     ctx.globalCompositeOperation = erasing ? 'destination-out' : 'source-over';
-    ctx.fillStyle = 'rgba(0,0,0,1)';
-    ctx.strokeStyle = 'rgba(0,0,0,1)';
+    // Paint the mask WHITE (not black). The exported PNG must read as "remove"
+    // no matter how the GPU worker decodes it: white survives an alpha read
+    // (alpha stays 255), a grayscale read, AND a color read (cv2.imread without
+    // IMREAD_UNCHANGED drops alpha — black paint would then vanish into the
+    // black background and nothing would be removed).
+    ctx.fillStyle = 'rgba(255,255,255,1)';
+    ctx.strokeStyle = 'rgba(255,255,255,1)';
     ctx.lineWidth = frameRadius * 2;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
