@@ -124,6 +124,9 @@ requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(960, "12", "6
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'ERASER_ALLOW_OPENCV_FALLBACK', 'low-quality fallback must be explicitly opt-in');
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'validate_video_liveness', 'every candidate and final output must be checked for frozen video');
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'outside_tracked_mask', 'liveness validation must ignore intentionally removed object motion');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'long_clip_chunk_plan', 'high-resolution long clips must be segmented by a GPU memory budget');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'make_propainter_chunk', 'long clips must render as frame-exact overlapping segments');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'CHUNK_MANIFEST_NAME', 'adaptive segment boundaries must be exposed to final timeline verification');
 forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'force_visible_fill', 'the worker must never manufacture a Gaussian-blur blob');
 forbidText('gpu-worker/pipelines/sam2_propainter.py', 'force_visible_fill', 'the locked core must never manufacture a Gaussian-blur blob');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_MASK_DILATION_PX', 'mask growth must be tightly controlled');
@@ -144,6 +147,7 @@ requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'Final quality-s
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'ERASER_ANCHOR_MIN_CHANGED_RATIO', 'selection-change sensitivity must remain configurable');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_timeline_selection_changed', 'removal must be verified across the entire clip, including later processing chunks');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'TIMELINE_BOUNDARY_FRAMES', 'the five-second chunk boundary must be sampled explicitly');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'chunk_boundary_indexes', 'every adaptive memory-safe segment join must be sampled explicitly');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'Keep the exact painted screen position active for every frame', 'fixed corner selections must survive cuts without SAM2 drift');
 
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');

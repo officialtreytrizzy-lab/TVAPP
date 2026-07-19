@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import tempfile
@@ -13,6 +14,7 @@ PIPELINES = ROOT / "gpu-worker" / "pipelines"
 sys.path.insert(0, str(PIPELINES))
 
 import sam2_propainter as core  # noqa: E402
+import sam2_propainter_resilient as resilient  # noqa: E402
 import sam2_propainter_verified as verified  # noqa: E402
 
 
@@ -102,11 +104,95 @@ def verify_static_mask_lock(root: Path) -> None:
             raise AssertionError(f"Static overlay drifted at frame {index}")
 
 
+def verify_long_clip_chunk_plan() -> None:
+    high_resolution = resilient.long_clip_chunk_plan(450, 1920, 1080, "source")
+    if not bool(high_resolution["chunked"]):
+        raise AssertionError(f"15-second high-resolution clip was not segmented: {high_resolution}")
+    if int(high_resolution["max_context_frames"]) > 48:
+        raise AssertionError(f"High-resolution segment exceeds the memory-safe budget: {high_resolution}")
+    if int(high_resolution["overlap_frames"]) < 2:
+        raise AssertionError(f"Long-clip segments have no temporal overlap: {high_resolution}")
+
+    short_low_resolution = resilient.long_clip_chunk_plan(192, 320, 180, "source")
+    if bool(short_low_resolution["chunked"]):
+        raise AssertionError(f"Small eight-second clip was segmented unnecessarily: {short_low_resolution}")
+
+
+def verify_adaptive_chunk_boundaries(masks: Path) -> None:
+    boundaries = [26, 52, 78]
+    manifest = masks.parent / resilient.CHUNK_MANIFEST_NAME
+    manifest.write_text(json.dumps({"boundaries": boundaries}), encoding="utf-8")
+    discovered = verified.chunk_boundary_indexes(masks, FRAME_COUNT)
+    if discovered != boundaries:
+        raise AssertionError(f"Adaptive chunk manifest was not read correctly: {discovered}")
+
+    samples = verified.timeline_sample_indexes(FRAME_COUNT, 0, discovered)
+    for boundary in boundaries:
+        required = {boundary - 1, boundary, boundary + 1}
+        if not required.issubset(samples):
+            raise AssertionError(
+                f"Adaptive chunk boundary {boundary} is not fully verified: samples={samples}"
+            )
+
+
+def verify_chunk_stitching(root: Path, source: Path, masks: Path) -> None:
+    original_runner = resilient.run_propainter_single
+
+    def copy_segment(
+        source_mp4: Path,
+        _mask_path: Path,
+        result_root: Path,
+        _width: int,
+        _height: int,
+        _quality: str,
+        _label_prefix: str = "ProPainter",
+    ) -> Path:
+        result_root.mkdir(parents=True, exist_ok=True)
+        candidate = result_root / "inpaint_out.mp4"
+        shutil.copy2(source_mp4, candidate)
+        return candidate
+
+    plan: dict[str, int | bool] = {
+        "chunked": True,
+        "core_frames": 26,
+        "overlap_frames": 6,
+        "max_context_frames": 38,
+        "processing_width": WIDTH,
+        "processing_height": HEIGHT,
+        "pixels_per_frame": WIDTH * HEIGHT,
+    }
+    try:
+        resilient.run_propainter_single = copy_segment
+        joined = resilient.run_propainter_chunked(
+            source,
+            masks,
+            root / "chunk_stitch_results",
+            WIDTH,
+            HEIGHT,
+            "source",
+            plan,
+        )
+    finally:
+        resilient.run_propainter_single = original_runner
+
+    joined_frames = resilient.video_frame_count(joined)
+    if joined_frames != FRAME_COUNT:
+        raise AssertionError(
+            f"Overlapping ProPainter segment stitch changed frame count: {joined_frames}"
+        )
+    boundaries = verified.chunk_boundary_indexes(masks, FRAME_COUNT)
+    if boundaries != [26, 52, 78, 104, 130]:
+        raise AssertionError(f"Unexpected stitched segment boundaries: {boundaries}")
+
+
 def main() -> None:
     root = Path(tempfile.mkdtemp(prefix="etreyser-timeline-"))
+    verify_long_clip_chunk_plan()
     try:
         source, partial, complete, masks = build_videos(root)
+        verify_adaptive_chunk_boundaries(masks)
         verify_static_mask_lock(root)
+        verify_chunk_stitching(root, source, masks)
 
         try:
             verified.validate_timeline_selection_changed(

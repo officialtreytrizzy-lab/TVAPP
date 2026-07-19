@@ -129,7 +129,32 @@ def read_timeline_mask(mask_dir: Path, frame_index: int, width: int, height: int
     return (mask > 24).astype(np.uint8) * 255
 
 
-def timeline_sample_indexes(frame_count: int, anchor_index: int) -> list[int]:
+def chunk_boundary_indexes(mask_dir: Path, frame_count: int) -> list[int]:
+    manifest_path = mask_dir.parent / pipeline.CHUNK_MANIFEST_NAME
+    if not manifest_path.exists():
+        return []
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"Could not read ProPainter chunk manifest: {exc}", flush=True)
+        return []
+
+    boundaries: list[int] = []
+    for value in payload.get("boundaries", []):
+        try:
+            boundary = int(value)
+        except Exception:
+            continue
+        if 0 < boundary < frame_count:
+            boundaries.append(boundary)
+    return sorted(set(boundaries))
+
+
+def timeline_sample_indexes(
+    frame_count: int,
+    anchor_index: int,
+    chunk_boundaries: list[int] | None = None,
+) -> list[int]:
     if frame_count <= 0:
         return []
 
@@ -145,6 +170,8 @@ def timeline_sample_indexes(frame_count: int, anchor_index: int) -> list[int]:
     # processing boundary. This catches the exact failure where chunk one is
     # repaired but later chunks silently return to the original frames.
     for boundary in range(TIMELINE_BOUNDARY_FRAMES, frame_count, TIMELINE_BOUNDARY_FRAMES):
+        indexes.update({boundary - 1, boundary, boundary + 1})
+    for boundary in chunk_boundaries or []:
         indexes.update({boundary - 1, boundary, boundary + 1})
 
     return sorted(index for index in indexes if 0 <= index < frame_count)
@@ -173,7 +200,11 @@ def validate_timeline_selection_changed(
     missing_masks: list[int] = []
     failed_frames: list[int] = []
 
-    for frame_index in timeline_sample_indexes(source_frames, anchor_index):
+    for frame_index in timeline_sample_indexes(
+        source_frames,
+        anchor_index,
+        chunk_boundary_indexes(mask_dir, source_frames),
+    ):
         mask = read_timeline_mask(mask_dir, frame_index, width, height)
         if locked_core.mask_bbox(mask) is None:
             missing_masks.append(frame_index)

@@ -28,6 +28,23 @@ MIN_OUTPUT_DURATION_RATIO = float(os.environ.get("ERASER_MIN_OUTPUT_DURATION_RAT
 MAX_OUTPUT_DURATION_RATIO = float(os.environ.get("ERASER_MAX_OUTPUT_DURATION_RATIO", "1.20"))
 FROZEN_SOURCE_MOTION_THRESHOLD = float(os.environ.get("ERASER_SOURCE_MOTION_THRESHOLD", "0.35"))
 FROZEN_OUTPUT_MOTION_RATIO = float(os.environ.get("ERASER_OUTPUT_MOTION_RATIO", "0.035"))
+LONG_CLIP_PIXEL_BUDGET = max(
+    8_000_000,
+    int(os.environ.get("ERASER_PROPAINTER_CHUNK_PIXEL_BUDGET", "20000000")),
+)
+LONG_CLIP_MIN_CORE_FRAMES = max(
+    12,
+    int(os.environ.get("ERASER_PROPAINTER_MIN_CHUNK_FRAMES", "24")),
+)
+LONG_CLIP_MAX_CORE_FRAMES = max(
+    LONG_CLIP_MIN_CORE_FRAMES,
+    int(os.environ.get("ERASER_PROPAINTER_CHUNK_FRAMES", "120")),
+)
+LONG_CLIP_OVERLAP_FRAMES = max(
+    2,
+    int(os.environ.get("ERASER_PROPAINTER_CHUNK_OVERLAP", "6")),
+)
+CHUNK_MANIFEST_NAME = "propainter_chunk_boundaries.json"
 
 
 class FrozenVideoError(RuntimeError):
@@ -315,13 +332,42 @@ def validate_video_liveness(
     return stats
 
 
-def run_propainter(
+def long_clip_chunk_plan(
+    frame_count: int,
+    width: int,
+    height: int,
+    quality: str,
+) -> dict[str, int | bool]:
+    first_cap = propainter_attempts()[0][0]
+    proc_w, proc_h = core.processing_size(width, height, quality, first_cap)
+    pixels_per_frame = max(proc_w * proc_h, 1)
+    max_context_frames = max(18, LONG_CLIP_PIXEL_BUDGET // pixels_per_frame)
+    overlap = min(
+        LONG_CLIP_OVERLAP_FRAMES,
+        max(2, (max_context_frames - 12) // 2),
+    )
+    core_frames = max_context_frames - (overlap * 2)
+    core_frames = max(LONG_CLIP_MIN_CORE_FRAMES, min(core_frames, LONG_CLIP_MAX_CORE_FRAMES))
+    should_chunk = frame_count > max_context_frames
+    return {
+        "chunked": should_chunk,
+        "core_frames": core_frames,
+        "overlap_frames": overlap,
+        "max_context_frames": core_frames + (overlap * 2),
+        "processing_width": proc_w,
+        "processing_height": proc_h,
+        "pixels_per_frame": pixels_per_frame,
+    }
+
+
+def run_propainter_single(
     source_mp4: Path,
     mask_path: Path,
     result_root: Path,
     width: int,
     height: int,
     quality: str,
+    label_prefix: str = "ProPainter",
 ) -> Path:
     inference = core.PROPAINTER_ROOT / "inference_propainter.py"
     if not inference.exists():
@@ -364,25 +410,194 @@ def run_propainter(
 
         try:
             print(
-                f"Running resilient ProPainter attempt {index + 1}/{len(attempts)}: "
+                f"Running {label_prefix} attempt {index + 1}/{len(attempts)}: "
                 f"{proc_w}x{proc_h}, subvideo={subvideo_length}, neighbor={neighbor_length}",
                 flush=True,
             )
             core.run(cmd, cwd=core.PROPAINTER_ROOT, env=env)
             candidate = core.find_propainter_output(result_root)
-            validate_video_liveness(source_mp4, candidate, f"ProPainter attempt {index + 1}", mask_path)
+            validate_video_liveness(
+                source_mp4,
+                candidate,
+                f"{label_prefix} attempt {index + 1}",
+                mask_path,
+            )
             return candidate
         except RuntimeError as exc:
             message = str(exc)
             errors.append(message[-2000:])
             reason = "CUDA OOM" if core.is_cuda_oom(message) else exc.__class__.__name__
-            action = "retrying smaller" if index < len(attempts) - 1 else "using tracked fallback"
+            action = "retrying smaller" if index < len(attempts) - 1 else "failing this segment"
             print(
-                f"ProPainter attempt {index + 1} failed ({reason}); {action}: {message[-900:]}",
+                f"{label_prefix} attempt {index + 1} failed ({reason}); {action}: {message[-900:]}",
                 flush=True,
             )
 
-    raise RuntimeError("ProPainter failed all resilient attempts:\n" + "\n---\n".join(errors[-2:]))
+    raise RuntimeError(
+        f"{label_prefix} failed all resilient attempts:\n" + "\n---\n".join(errors[-2:])
+    )
+
+
+def trim_propainter_chunk(
+    candidate: Path,
+    destination: Path,
+    keep_start: int,
+    keep_end: int,
+) -> Path:
+    if keep_end <= keep_start:
+        raise RuntimeError(
+            f"Invalid ProPainter chunk trim: start={keep_start}, end={keep_end}"
+        )
+    core.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(candidate),
+            "-vf",
+            f"trim=start_frame={keep_start}:end_frame={keep_end},setpts=PTS-STARTPTS",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "12",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+    )
+    expected = keep_end - keep_start
+    actual = video_frame_count(destination)
+    if actual < max(1, expected - 1) or actual > expected + 1:
+        raise RuntimeError(
+            f"Trimmed ProPainter chunk frame mismatch: expected={expected}, actual={actual}"
+        )
+    return destination
+
+
+def run_propainter_chunked(
+    source_mp4: Path,
+    mask_path: Path,
+    result_root: Path,
+    width: int,
+    height: int,
+    quality: str,
+    plan: dict[str, int | bool],
+) -> Path:
+    frame_count = video_frame_count(source_mp4)
+    core_frames = int(plan["core_frames"])
+    overlap = int(plan["overlap_frames"])
+    chunk_workspace = result_root.parent / "propainter_chunk_work"
+    if chunk_workspace.exists():
+        shutil.rmtree(chunk_workspace)
+    chunk_workspace.mkdir(parents=True, exist_ok=True)
+
+    outputs: list[Path] = []
+    boundaries: list[int] = []
+    chunk_total = (frame_count + core_frames - 1) // core_frames
+    print(
+        "Long high-resolution clip detected; using overlapping memory-safe ProPainter segments: "
+        f"frames={frame_count}, chunks={chunk_total}, core_frames={core_frames}, "
+        f"overlap={overlap}, processing={plan['processing_width']}x{plan['processing_height']}",
+        flush=True,
+    )
+
+    for chunk_index, core_start in enumerate(range(0, frame_count, core_frames), start=1):
+        core_end = min(frame_count, core_start + core_frames)
+        context_start = max(0, core_start - overlap)
+        context_end = min(frame_count, core_end + overlap)
+        chunk_root = chunk_workspace / f"chunk_{chunk_index:03d}"
+        chunk_video, chunk_masks = core.make_propainter_chunk(
+            source_mp4,
+            mask_path,
+            chunk_root,
+            context_start,
+            context_end,
+        )
+        print(
+            f"Running memory-safe ProPainter segment {chunk_index}/{chunk_total}: "
+            f"context={context_start}-{context_end - 1}, keep={core_start}-{core_end - 1}",
+            flush=True,
+        )
+        candidate = run_propainter_single(
+            chunk_video,
+            chunk_masks,
+            chunk_root / "results",
+            width,
+            height,
+            quality,
+            f"ProPainter segment {chunk_index}/{chunk_total}",
+        )
+        keep_start = core_start - context_start
+        keep_end = keep_start + (core_end - core_start)
+        completed = trim_propainter_chunk(
+            candidate,
+            chunk_root / "completed.mp4",
+            keep_start,
+            keep_end,
+        )
+        outputs.append(completed)
+        if core_end < frame_count:
+            boundaries.append(core_end)
+
+    joined = result_root.parent / "propainter_chunked_joined.mp4"
+    if joined.exists():
+        joined.unlink()
+    core.concatenate_propainter_chunks(outputs, joined)
+    manifest = {
+        "frame_count": frame_count,
+        "core_frames": core_frames,
+        "overlap_frames": overlap,
+        "boundaries": boundaries,
+        "chunk_count": len(outputs),
+        "processing_width": int(plan["processing_width"]),
+        "processing_height": int(plan["processing_height"]),
+    }
+    (result_root.parent / CHUNK_MANIFEST_NAME).write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    validate_video_liveness(source_mp4, joined, "Chunked ProPainter output", mask_path)
+    return joined
+
+
+def run_propainter(
+    source_mp4: Path,
+    mask_path: Path,
+    result_root: Path,
+    width: int,
+    height: int,
+    quality: str,
+) -> Path:
+    frame_count = video_frame_count(source_mp4)
+    if frame_count <= 0:
+        raise RuntimeError("Could not determine ProPainter source frame count")
+    plan = long_clip_chunk_plan(frame_count, width, height, quality)
+    manifest_path = result_root.parent / CHUNK_MANIFEST_NAME
+    if manifest_path.exists():
+        manifest_path.unlink()
+    if bool(plan["chunked"]):
+        return run_propainter_chunked(
+            source_mp4,
+            mask_path,
+            result_root,
+            width,
+            height,
+            quality,
+            plan,
+        )
+    return run_propainter_single(
+        source_mp4,
+        mask_path,
+        result_root,
+        width,
+        height,
+        quality,
+    )
 
 
 def run_opencv_tracked_inpaint(source_mp4: Path, mask_dir: Path, work_dir: Path, fps: float) -> Path:
