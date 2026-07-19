@@ -5,7 +5,12 @@ import type { EraserOutputQuality } from '@/lib/eraser/gpu';
 const PHASE_LABEL: Record<string, string> = {
   awaiting_mask: 'Awaiting mask',
   mask_ready: 'Mask ready',
-  segmenting: 'Segmenting',
+  segmenting: 'Uploading',
+  frame_extraction: 'Frame extraction',
+  optical_flow_tracking: 'Optical-flow tracking',
+  diffusion_inpainting: 'Diffusion inpainting',
+  audio_preserving_export: 'Audio-preserving export',
+  validation: 'Validation',
   tracking_mask: 'Tracking object',
   smoothing_masks: 'Smoothing masks',
   inpainting: 'Inpainting',
@@ -17,7 +22,7 @@ const PHASE_LABEL: Record<string, string> = {
   cancelled: 'Cancelled',
 };
 
-const TECHNICAL_ERROR_PATTERN = /traceback|userwarning|importerror|subprocess|pipeline exited|sam2|propainter|frame loading|propagate in video|file\s+"[^"]+\.py"|\/(?:opt|app|tmp)\/|\.py:\d+|\d+\/\d+\s+\[[^\]]*<[^\]]*\]/i;
+const TECHNICAL_ERROR_PATTERN = /traceback|userwarning|importerror|subprocess|pipeline exited|sam2|propainter|wan|vace|frame loading|propagate in video|file\s+"[^"]+\.py"|\/(?:opt|app|tmp)\/|\.py:\d+|\d+\/\d+\s+\[[^\]]*<[^\]]*\]/i;
 
 function userFacingProcessingError(rawError: string): string {
   const raw = String(rawError || '').trim();

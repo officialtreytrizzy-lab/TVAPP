@@ -1,4 +1,4 @@
-import type { PipelineOutput } from './pipeline';
+﻿import type { PipelineOutput } from './pipeline';
 
 export type EraserOutputQuality = 'source' | 'higher';
 
@@ -62,7 +62,7 @@ const ERASER_API_PROXY_URL = String(import.meta.env.VITE_TRECUT_ERASER_PROXY_URL
 const PROXY_EXPLICITLY_DISABLED = envFlag('VITE_TRECUT_ERASER_DISABLE_PROXY');
 const USE_ERASER_API_PROXY = !PROXY_EXPLICITLY_DISABLED && ERASER_API_PROXY_URL.length > 0;
 const POLL_MS = 1400;
-const MAX_POLLS = 900; // about 21 minutes
+const MAX_POLLS = 2100; // about 49 minutes, aligned with the long-running diffusion worker
 // Vercel serverless functions reject request bodies over ~4.5MB with
 // FUNCTION_PAYLOAD_TOO_LARGE. Base64 inflates the video by ~33%, so only tiny
 // clips can use the JSON relay; everything else must upload directly to the
@@ -74,9 +74,9 @@ export function isGpuRemovalConfigured(): boolean {
 }
 
 export function gpuRemovalLabel(): string {
-  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser GPU proxy';
-  if (DIRECT_WORKER_URL) return 'GPU AI worker';
-  return 'browser fallback';
+  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser GPU · Optical-flow diffusion';
+  if (DIRECT_WORKER_URL) return 'GPU optical-flow diffusion worker';
+  return 'GPU pipeline unavailable';
 }
 
 export function gpuRemovalDiagnostics() {
@@ -154,6 +154,11 @@ function getStatusUrl(payload: WorkerJobResponse, baseUrl: string, pathPrefix: s
 
 function normalizePhase(payload: WorkerJobResponse): string {
   const raw = String(payload.phase || payload.status || '').toLowerCase();
+  if (raw.includes('frame_extraction')) return 'frame_extraction';
+  if (raw.includes('optical_flow_tracking')) return 'optical_flow_tracking';
+  if (raw.includes('diffusion_inpainting')) return 'diffusion_inpainting';
+  if (raw.includes('audio_preserving_export')) return 'audio_preserving_export';
+  if (raw.includes('validation')) return 'validation';
   if (raw.includes('segment')) return 'segmenting';
   if (raw.includes('track') || raw.includes('mask')) return 'tracking_mask';
   if (raw.includes('paint') || raw.includes('fill')) return 'inpainting';
@@ -208,7 +213,7 @@ function buildRemovalForm(input: GpuRemovalInput, maskBlob: Blob): FormData {
   form.append('duration', String(duration));
   form.append('width', String(width));
   form.append('height', String(height));
-  form.append('pipeline', 'sam2-propainter');
+  form.append('pipeline', 'optical-flow-vace-diffusion');
   form.append('mask_semantics', 'alpha_gt_0_remove');
   form.append('quality', outputQuality);
   form.append('preserve_resolution', 'true');
@@ -406,7 +411,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
       duration,
       width,
       height,
-      pipeline: 'sam2-propainter',
+      pipeline: 'optical-flow-vace-diffusion',
       mask_semantics: 'alpha_gt_0_remove',
       preserve_resolution: true,
       preserve_fps: true,
@@ -429,7 +434,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
         duration,
         width,
         height,
-        pipeline: 'sam2-propainter',
+        pipeline: 'optical-flow-vace-diffusion',
         mask_semantics: 'alpha_gt_0_remove',
       },
     }),

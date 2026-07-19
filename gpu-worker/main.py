@@ -21,14 +21,14 @@ WORK_DIR = Path(os.environ.get("ERASER_WORK_DIR", "/tmp/video-eraser-jobs"))
 TRANSITION_WORK_DIR = Path(os.environ.get("TRANSITION_WORK_DIR", "/tmp/video-transition-jobs"))
 REMIX_WORK_DIR = Path(os.environ.get("AI_REMIX_WORK_DIR", "/tmp/ai-remix-jobs"))
 PUBLIC_BASE_URL = os.environ.get("ERASER_PUBLIC_BASE_URL", "").rstrip("/")
-PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2_propainter.py").strip()
+PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/optical_flow_vace_inpaint.py").strip()
 AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pipelines/wan_vace_remix.py").strip()
 
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
@@ -261,10 +261,18 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
     video_path = job_dir / "input_video"
     mask_path = job_dir / "mask.png"
     output_path = job_dir / "output.mp4"
+    process: subprocess.Popen[str] | None = None
     try:
-        set_job(job_id, phase="segmenting", progress=8, statusMessage="Preparing source-quality ProPainter job")
+        set_job(
+            job_id,
+            phase="frame_extraction",
+            progress=10,
+            statusMessage="Preparing frame extraction",
+        )
         if not PIPELINE_CMD:
-            raise RuntimeError("ERASER_PIPELINE_CMD is not configured. Point it at the SAM2/ProPainter pipeline command.")
+            raise RuntimeError(
+                "ERASER_PIPELINE_CMD is not configured. Point it at the optical-flow VACE diffusion pipeline."
+            )
         env = os.environ.copy()
         env.update({
             "ERASER_JOB_ID": job_id,
@@ -281,20 +289,67 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             "ERASER_PRESERVE_RESOLUTION": "true",
             "ERASER_PRESERVE_FPS": "true",
             "ERASER_PRESERVE_AUDIO": "true",
+            "PYTHONUNBUFFERED": "1",
         })
-        status = "Running ProPainter and restoring source-quality MP4" if quality != "higher" else "Running ProPainter and exporting higher-quality MP4"
-        set_job(job_id, phase="inpainting", progress=35, statusMessage=status)
-        completed = subprocess.run(PIPELINE_CMD, shell=True, cwd=str(job_dir), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60 * 45)
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stdout[-6000:] or f"Pipeline exited with {completed.returncode}")
-        if completed.stdout:
-            print(completed.stdout[-16000:], flush=True)
+        process = subprocess.Popen(
+            PIPELINE_CMD,
+            shell=True,
+            cwd=str(job_dir),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        log_lines: list[str] = []
+        for raw_line in process.stdout:
+            line = raw_line.rstrip("\n")
+            log_lines.append(line)
+            print(line, flush=True)
+            if line.startswith("PIPELINE_STAGE:"):
+                try:
+                    stage = json.loads(line.split(":", 1)[1])
+                    set_job(
+                        job_id,
+                        phase=str(stage.get("name") or "processing"),
+                        progress=max(1, min(99, int(stage.get("progress") or 1))),
+                        statusMessage=str(stage.get("message") or "Processing video"),
+                    )
+                except Exception as stage_error:
+                    print(f"Could not parse pipeline stage update: {stage_error}", flush=True)
+        return_code = process.wait(timeout=60 * 60)
+        if return_code != 0:
+            raise RuntimeError("\n".join(log_lines[-120:]) or f"Pipeline exited with {return_code}")
         assert_playable_mp4(output_path)
         final_url = public_output_url(job_id)
-        set_job(job_id, phase="completed", progress=100, statusMessage="GPU AI removal complete", outputUrl=final_url, finalCompositeUrl=final_url, compositeOutputUrl=final_url, fullVideoUrl=final_url, finalOutputUrl=final_url, outputKind="final_composite_video", error=None)
+        set_job(
+            job_id,
+            phase="completed",
+            progress=100,
+            statusMessage="Optical-flow diffusion removal complete",
+            outputUrl=final_url,
+            finalCompositeUrl=final_url,
+            compositeOutputUrl=final_url,
+            fullVideoUrl=final_url,
+            finalOutputUrl=final_url,
+            outputKind="final_composite_video",
+            error=None,
+        )
     except Exception as exc:
-        set_job(job_id, phase="failed", progress=100, statusMessage="GPU AI removal failed", error=str(exc))
-
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except Exception:
+                process.kill()
+        set_job(
+            job_id,
+            phase="failed",
+            progress=100,
+            statusMessage="Optical-flow diffusion removal failed",
+            error=str(exc),
+        )
 
 def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, preserve_audio: str, preserve_face: str, preserve_motion: str, quality: str) -> None:
     job_dir = REMIX_WORK_DIR / job_id
@@ -444,13 +499,13 @@ async def ai_remix_debug(request: Request):
 
 
 @app.post("/v1/video-eraser/jobs")
-async def create_job(video: UploadFile = File(...), mask: UploadFile = File(...), job_id: str = Form(default=""), selected_time: str = Form(default="0"), selected_frame_index: str = Form(default="0"), fps: str = Form(default="30"), duration: str = Form(default="0"), width: str = Form(default="0"), height: str = Form(default="0"), pipeline: str = Form(default="sam2-propainter"), quality: str = Form(default="source"), preserve_resolution: str = Form(default="true"), preserve_fps: str = Form(default="true"), preserve_audio: str = Form(default="true")):
+async def create_job(video: UploadFile = File(...), mask: UploadFile = File(...), job_id: str = Form(default=""), selected_time: str = Form(default="0"), selected_frame_index: str = Form(default="0"), fps: str = Form(default="30"), duration: str = Form(default="0"), width: str = Form(default="0"), height: str = Form(default="0"), pipeline: str = Form(default="optical-flow-vace-diffusion"), quality: str = Form(default="source"), preserve_resolution: str = Form(default="true"), preserve_fps: str = Form(default="true"), preserve_audio: str = Form(default="true")):
     remote_job_id = job_id.strip() or str(uuid.uuid4())
     job_dir = WORK_DIR / remote_job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     save_upload(video, job_dir / "input_video")
     save_upload(mask, job_dir / "mask.png")
-    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued source-quality ProPainter job")
+    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued optical-flow diffusion removal")
     Thread(target=process_job, args=(remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, quality), daemon=True).start()
     payload = dump_job_payload(state)
     payload["statusUrl"] = payload["status_url"] = f"/v1/video-eraser/jobs/{remote_job_id}"

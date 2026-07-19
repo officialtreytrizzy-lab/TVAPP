@@ -6,7 +6,7 @@ import Controls from './Controls';
 import ProcessingPanel from './ProcessingPanel';
 import { probeVideo } from '@/lib/eraser/frames';
 import { eraserApi } from '@/lib/eraser/api';
-import { runPipeline, type PipelineOutput } from '@/lib/eraser/pipeline';
+import type { PipelineOutput } from '@/lib/eraser/pipeline';
 import { gpuRemovalLabel, isGpuRemovalConfigured, runGpuRemoval, type EraserOutputQuality } from '@/lib/eraser/gpu';
 import { RotateCcw, ShieldCheck } from 'lucide-react';
 
@@ -15,6 +15,8 @@ const MAX_DURATION = 30;
 // Phases where the backend job is actively crunching — Process must be blocked + set_mask skipped.
 const ACTIVE_PROCESSING = new Set([
   'segmenting', 'tracking_mask', 'smoothing_masks', 'inpainting',
+  'frame_extraction', 'optical_flow_tracking', 'diffusion_inpainting',
+  'audio_preserving_export', 'validation',
   'rebuilding_video', 'attaching_audio', 'generating_preview',
 ]);
 // Phases where it's safe to (re)start processing.
@@ -25,9 +27,6 @@ function isIdempotencyError(msg: string): boolean {
   return /Mask can only be set|already processing|mask already accepted/i.test(msg || '');
 }
 
-function isGpuConfigurationOrAvailabilityError(msg: string): boolean {
-  return /not configured|disabled or not configured|failed to fetch|networkerror|load failed|http (404|502|503|504)|worker unavailable|job_not_found|etreyser_first_party_job_failed/i.test(msg || '');
-}
 
 interface Meta { duration: number; width: number; height: number; fps: number; url: string; filename: string; }
 
@@ -191,48 +190,34 @@ export default function Editor() {
       setPhase('mask_ready');
       setProgress(20);
 
-      const runBrowserFallback = () => runPipeline({
-        jobId, video: videoRef.current!, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
-        selectedTime, maskCanvas, cancelRef: cancelRef.current,
+      const useGpu = isGpuRemovalConfigured() && !!sourceFileRef.current;
+      if (!useGpu) {
+        throw new Error(
+          'The required frame-extraction, optical-flow, diffusion-inpainting GPU pipeline is not configured.',
+        );
+      }
+
+      const out: PipelineOutput = await runGpuRemoval({
+        jobId,
+        file: sourceFileRef.current!,
+        sourceUrl: meta.url,
+        fps: meta.fps,
+        duration: meta.duration,
+        width: meta.width,
+        height: meta.height,
+        selectedTime,
+        selectedFrameIndex,
+        maskCanvas,
+        outputQuality,
+        cancelRef: cancelRef.current,
         onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
       });
-
-      const useGpu = isGpuRemovalConfigured() && !!sourceFileRef.current;
-      let completedWithGpu = false;
-      let out: PipelineOutput;
-      if (useGpu) {
-        try {
-          out = await runGpuRemoval({
-            jobId,
-            file: sourceFileRef.current!,
-            sourceUrl: meta.url,
-            fps: meta.fps,
-            duration: meta.duration,
-            width: meta.width,
-            height: meta.height,
-            selectedTime,
-            selectedFrameIndex,
-            maskCanvas,
-            outputQuality,
-            cancelRef: cancelRef.current,
-            onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
-          });
-          completedWithGpu = true;
-        } catch (gpuError) {
-          const gpuMessage = (gpuError as Error).message || '';
-          if (gpuMessage === '__CANCELLED__' || !isGpuConfigurationOrAvailabilityError(gpuMessage)) throw gpuError;
-          setStatusMessage(`GPU worker unavailable (${gpuMessage}). Falling back to browser processing...`);
-          out = await runBrowserFallback();
-        }
-      } else {
-        out = await runBrowserFallback();
-      }
 
       outputRef.current = out;
       setFinalUrl(out.finalUrl);
       setPhase('completed');
       setProgress(100);
-      setStatusMessage(completedWithGpu ? `Done with GPU AI removal (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).` : 'Done with browser fallback.');
+      setStatusMessage(`Done with frame extraction, optical-flow tracking, diffusion inpainting, and audio-preserving export (${outputQuality === 'higher' ? 'higher quality' : 'source quality'}).`);
     } catch (e) {
       const msg = (e as Error).message;
       if (msg === '__CANCELLED__') {

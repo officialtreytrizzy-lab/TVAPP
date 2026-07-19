@@ -1,10 +1,11 @@
-﻿import { readFileSync, existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 const requiredFiles = [
   'src/lib/eraser/gpu.ts',
   'src/components/eraser/Editor.tsx',
   'src/components/eraser/ProcessingPanel.tsx',
   'api/_lib/trecut-eraser-proxy.ts',
+  'api/_lib/modal.ts',
   'api/v1/direct-upload.ts',
   'api/v1/trecut/eraser/[...path].ts',
   'api/v1/trecut/eraser/_handlers/jobs.ts',
@@ -13,15 +14,13 @@ const requiredFiles = [
   'api/v1/trecut/eraser/_handlers/upload-target.ts',
   'gpu-worker/modal_app.py',
   'gpu-worker/main.py',
-  'gpu-worker/pipelines/sam2_propainter.py',
-  'gpu-worker/pipelines/sam2_propainter_resilient.py',
-  'gpu-worker/pipelines/sam2_propainter_verified.py',
+  'gpu-worker/pipelines/optical_flow_vace_inpaint.py',
   'gpu-worker/requirements.txt',
-  'scripts/verify_etreyser_timeline.py',
+  'scripts/verify_optical_flow_vace_pipeline.py',
   'vercel.json',
 ];
 
-const checks = [];
+const failures = [];
 
 function file(path) {
   if (!existsSync(path)) throw new Error(`Missing required file: ${path}`);
@@ -29,139 +28,116 @@ function file(path) {
 }
 
 function requireText(path, text, reason) {
-  const body = file(path);
-  if (!body.includes(text)) {
-    checks.push(`FAIL ${path}: missing ${JSON.stringify(text)} â€” ${reason}`);
+  if (!file(path).includes(text)) {
+    failures.push(`FAIL ${path}: missing ${JSON.stringify(text)} - ${reason}`);
   }
 }
 
 function forbidText(path, text, reason) {
-  const body = file(path);
-  if (body.includes(text)) {
-    checks.push(`FAIL ${path}: forbidden ${JSON.stringify(text)} â€” ${reason}`);
+  if (file(path).includes(text)) {
+    failures.push(`FAIL ${path}: forbidden ${JSON.stringify(text)} - ${reason}`);
   }
 }
 
 for (const path of requiredFiles) file(path);
 
-// Frontend must use the server-side proxy by default so the generated API key is never exposed in browser code.
-requireText('src/lib/eraser/gpu.ts', 'VITE_TRECUT_ERASER_PROXY_URL', 'frontend must read the local proxy path from Vercel env');
-requireText('src/lib/eraser/gpu.ts', "'/api/v1/trecut/eraser'", 'frontend must default to the local Trecut eraser proxy');
-requireText('src/lib/eraser/gpu.ts', 'USE_ERASER_API_PROXY', 'frontend must prefer the secure API proxy path');
-requireText('src/lib/eraser/gpu.ts', 'source_video_base64', 'frontend proxy payload must send source video data to the API proxy');
-requireText('src/lib/eraser/gpu.ts', 'mask_base64', 'frontend proxy payload must send the mask PNG data to the API proxy');
-requireText('src/lib/eraser/gpu.ts', 'selected_frame_index', 'selected frame must be included in metadata');
-requireText('src/lib/eraser/gpu.ts', 'preserve_resolution: true', 'frontend must request source-resolution restoration');
-requireText('src/lib/eraser/gpu.ts', 'preserve_fps: true', 'frontend must request source-FPS restoration');
-requireText('src/lib/eraser/gpu.ts', 'preserve_audio: true', 'frontend must request audio preservation');
-requireText('src/lib/eraser/gpu.ts', "form.append('video'", 'direct worker fallback must still upload original video when explicitly enabled');
-requireText('src/lib/eraser/gpu.ts', "form.append('mask'", 'direct worker fallback must still upload mask PNG when explicitly enabled');
-forbidText('src/lib/eraser/gpu.ts', 'VITE_ERASER_GPU_API_KEY', 'the generated eTreyser API key must not be exposed through Vite/browser env');
+// Secure browser-to-worker bridge.
+requireText('src/lib/eraser/gpu.ts', 'VITE_TRECUT_ERASER_PROXY_URL', 'frontend must support the server-side proxy');
+requireText('src/lib/eraser/gpu.ts', "'/api/v1/trecut/eraser'", 'frontend must default to the local eraser proxy');
+requireText('src/lib/eraser/gpu.ts', 'USE_ERASER_API_PROXY', 'frontend must prefer the secure proxy path');
+requireText('src/lib/eraser/gpu.ts', 'source_video_base64', 'proxy fallback must include source video bytes');
+requireText('src/lib/eraser/gpu.ts', 'mask_base64', 'proxy fallback must include painted mask bytes');
+requireText('src/lib/eraser/gpu.ts', 'selected_frame_index', 'the exact painted frame must reach the worker');
+requireText('src/lib/eraser/gpu.ts', 'preserve_resolution: true', 'source resolution must be requested');
+requireText('src/lib/eraser/gpu.ts', 'preserve_fps: true', 'source FPS must be requested');
+requireText('src/lib/eraser/gpu.ts', 'preserve_audio: true', 'original audio must be requested');
+requireText('src/lib/eraser/gpu.ts', "form.append('pipeline', 'optical-flow-vace-diffusion')", 'frontend must request the exact production pipeline');
+forbidText('src/lib/eraser/gpu.ts', 'VITE_ERASER_GPU_API_KEY', 'server credentials must never enter browser code');
+forbidText('src/lib/eraser/gpu.ts', "'sam2-propainter'", 'frontend must not request the retired SAM2/ProPainter path');
+requireText('src/lib/eraser/gpu.ts', "raw.includes('frame_extraction')", 'frontend must preserve the frame-extraction phase');
+requireText('src/lib/eraser/gpu.ts', "raw.includes('optical_flow_tracking')", 'frontend must preserve the optical-flow phase');
+requireText('src/lib/eraser/gpu.ts', "raw.includes('diffusion_inpainting')", 'frontend must preserve the diffusion phase');
+requireText('src/lib/eraser/gpu.ts', "raw.includes('audio_preserving_export')", 'frontend must preserve the export phase');
+requireText('src/components/eraser/ProcessingPanel.tsx', "frame_extraction: 'Frame extraction'", 'progress UI must name stage 1');
+requireText('src/components/eraser/ProcessingPanel.tsx', "optical_flow_tracking: 'Optical-flow tracking'", 'progress UI must name stage 2');
+requireText('src/components/eraser/ProcessingPanel.tsx', "diffusion_inpainting: 'Diffusion inpainting'", 'progress UI must name stage 3');
+requireText('src/components/eraser/ProcessingPanel.tsx', "audio_preserving_export: 'Audio-preserving export'", 'progress UI must name stage 4');
+requireText('src/components/eraser/Editor.tsx', 'const out: PipelineOutput = await runGpuRemoval', 'editor must execute the GPU pipeline directly');
+forbidText('src/components/eraser/Editor.tsx', 'runBrowserFallback', 'production must not silently switch to another algorithm');
+forbidText('src/components/eraser/Editor.tsx', 'runPipeline({', 'production must not execute browser fallback processing');
 
-// Proxy must hold and apply the generated bearer token server-side only.
-requireText('api/_lib/trecut-eraser-proxy.ts', 'TRECUT_ETREYSER_API_KEY', 'server proxy must read the generated eTreyser API key from server env');
-requireText('api/_lib/trecut-eraser-proxy.ts', 'Authorization', 'server proxy must attach the bearer token to licensed API calls');
-requireText('api/_lib/trecut-eraser-proxy.ts', 'rewriteVideoRemovalJobPayload', 'server proxy must rewrite protected API URLs back to proxy URLs');
-requireText('api/v1/trecut/eraser/_handlers/jobs.ts', 'submitRemovalToModal', 'Trecut create endpoint must submit jobs to the first-party GPU worker');
-requireText('api/v1/trecut/eraser/_handlers/job.ts', 'readModalStatus', 'Trecut status endpoint must read status from the first-party GPU worker');
-requireText('api/v1/trecut/eraser/_handlers/output.ts', 'modalCompositeOutputFromPayload', 'Trecut output endpoint must only stream the strict composite output');
+requireText('api/_lib/modal.ts', "'optical-flow-vace-diffusion'", 'licensed API calls must use the exact production pipeline');
+requireText('api/_lib/trecut-eraser-proxy.ts', 'TRECUT_ETREYSER_API_KEY', 'proxy must read the API key server-side');
+requireText('api/_lib/trecut-eraser-proxy.ts', 'Authorization', 'proxy must attach bearer authorization');
+requireText('api/_lib/trecut-eraser-proxy.ts', 'rewriteVideoRemovalJobPayload', 'worker URLs must be rewritten through the proxy');
+requireText('api/v1/trecut/eraser/_handlers/jobs.ts', 'submitRemovalToModal', 'create endpoint must submit to the first-party worker');
+requireText('api/v1/trecut/eraser/_handlers/job.ts', 'readModalStatus', 'status endpoint must read worker state');
+requireText('api/v1/trecut/eraser/_handlers/output.ts', 'modalCompositeOutputFromPayload', 'output endpoint must stream the final composite');
+requireText('src/lib/eraser/gpu.ts', 'upload-target', 'large files must upload directly to the GPU worker');
+requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'legacy base64 relay must remain size guarded');
 
-// Large uploads must not flow through Vercel functions (~4.5MB FUNCTION_PAYLOAD_TOO_LARGE limit).
-requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'modalBaseUrl', 'upload-target must resolve the GPU worker from server env');
+// Modal production routing and GPU constraints.
 requireText('vercel.json', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'Vercel must target the wthemif Modal worker');
-requireText('api/v1/direct-upload.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'licensed direct uploads must fall back to the wthemif worker');
-requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'eTreyser upload discovery must fall back to the wthemif worker');
-forbidText('vercel.json', 'californiatrey--tvapp-video-eraser-gpu', 'production must never route back to the old Modal account');
-forbidText('api/v1/direct-upload.ts', 'californiatrey--tvapp-video-eraser-gpu', 'direct uploads must never route back to the old Modal account');
-forbidText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'californiatrey--tvapp-video-eraser-gpu', 'upload discovery must never route back to the old Modal account');
-requireText('src/lib/eraser/gpu.ts', 'upload-target', 'frontend must discover the direct GPU upload URL to bypass the ~4.5MB Vercel payload limit');
-requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'frontend must size-guard the legacy base64 relay fallback');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'PYTORCH_CUDA_ALLOC_CONF', 'ProPainter must run with the expandable-segments allocator to reduce CUDA OOMs');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'is_cuda_oom', 'the locked core must retain CUDA OOM classification');
+requireText('api/v1/direct-upload.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'direct uploads must target wthemif');
+requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'upload discovery must target wthemif');
+forbidText('vercel.json', 'californiatrey--tvapp-video-eraser-gpu', 'production must not route to the retired Modal account');
+requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'diffusion inpainting requires a real GPU');
+requireText('gpu-worker/modal_app.py', 'max_containers=1', 'in-memory status requires one active worker container');
+requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'one diffusion render may run per GPU container');
+requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'diffusion jobs need a long worker timeout');
+requireText('gpu-worker/modal_app.py', 'python /app/pipelines/optical_flow_vace_inpaint.py', 'Modal must execute the exact four-stage pipeline');
+forbidText('gpu-worker/modal_app.py', 'python /app/pipelines/sam2_propainter_verified.py', 'Modal must not execute the retired production entrypoint');
 
-requireText('src/components/eraser/Editor.tsx', 'runGpuRemoval', 'editor must call the AI removal bridge when configured');
-requireText('src/components/eraser/Editor.tsx', 'isGpuRemovalConfigured()', 'editor must choose AI proxy/worker vs browser fallback explicitly');
-requireText('src/components/eraser/Editor.tsx', 'outputQuality', 'editor must keep the source/higher quality setting wired');
-requireText('src/components/eraser/Editor.tsx', 'maskAnchorTimeRef', 'drawing must stay locked to the exact displayed source frame');
-requireText('src/components/eraser/MaskCanvas.tsx', 'onStrokeStart', 'mask drawing must pause and capture the exact video frame');
-requireText('src/components/eraser/ProcessingPanel.tsx', 'Mode: {processingMode}', 'UI must show whether proxy/GPU or browser fallback is active');
-requireText('src/components/eraser/ProcessingPanel.tsx', 'Same quality', 'UI must expose source-quality output');
-requireText('src/components/eraser/ProcessingPanel.tsx', 'Higher quality', 'UI must expose higher-quality output');
+// Worker status must expose the real four stages, not cosmetic labels.
+requireText('gpu-worker/main.py', 'python /app/pipelines/optical_flow_vace_inpaint.py', 'worker default must be the optical-flow VACE pipeline');
+requireText('gpu-worker/main.py', 'PIPELINE_STAGE:', 'worker must parse pipeline-emitted stage events');
+requireText('gpu-worker/main.py', 'frame_extraction', 'job status must begin with frame extraction');
+requireText('gpu-worker/main.py', 'Optical-flow diffusion removal complete', 'completion status must identify the real path');
+requireText('gpu-worker/main.py', 'optical-flow-vace-diffusion', 'job endpoint must default to the exact pipeline ID');
+requireText('gpu-worker/main.py', 'ERASER_PRESERVE_RESOLUTION', 'worker must pass source-resolution preservation');
+requireText('gpu-worker/main.py', 'ERASER_PRESERVE_FPS', 'worker must pass source-FPS preservation');
+requireText('gpu-worker/main.py', 'ERASER_PRESERVE_AUDIO', 'worker must pass audio preservation');
 
-// Modal worker must stay pinned to one active GPU container until a durable store replaces memory state.
-requireText('gpu-worker/modal_app.py', 'git clone --depth 1 https://github.com/sczhou/ProPainter.git /opt/ProPainter', 'Modal image must install ProPainter');
-requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'worker must request a real GPU');
-requireText('gpu-worker/modal_app.py', 'max_containers=1', 'status polling depends on single-container state until durable storage is added');
-requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'ProPainter jobs must not run concurrently in one container');
-requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'ProPainter jobs need enough time for video inpainting');
-requireText('gpu-worker/modal_app.py', 'sam2_propainter_verified.py', 'Modal must execute the exact-selection verified production entrypoint');
-requireText('gpu-worker/modal_app.py', 'sam2.1_hiera_small.pt', 'production tracking must use the stronger SAM2.1 small checkpoint');
+const pipeline = 'gpu-worker/pipelines/optical_flow_vace_inpaint.py';
+requireText(pipeline, 'def extract_frames(', 'stage 1 must perform actual frame extraction');
+requireText(pipeline, 'cv2.calcOpticalFlowFarneback', 'stage 2 must use dense optical flow');
+requireText(pipeline, 'cv2.calcOpticalFlowPyrLK', 'stage 2 must include sparse optical-flow recovery');
+requireText(pipeline, 'def track_masks_with_optical_flow(', 'tracked masks must be written for the full clip');
+requireText(pipeline, 'def is_scene_cut(', 'tracking must recognize shot changes');
+requireText(pipeline, 'def reacquire_from_anchor(', 'tracking must recover after scene cuts when possible');
+requireText(pipeline, 'def build_vace_mask_video(', 'tracked masks must be converted into a temporal diffusion condition');
+requireText(pipeline, 'semantics=white_generate_black_preserve', 'VACE mask semantics must be explicit');
+requireText(pipeline, 'def build_vace_condition_video(', 'white mask regions must be neutralized in the diffusion condition video');
+requireText(pipeline, 'generated_regions_gray=127', 'VACE missing regions must use the documented neutral-gray value');
+requireText(pipeline, '"--task"', 'stage 3 must invoke a named Wan task');
+requireText(pipeline, '"vace-1.3B"', 'stage 3 must execute Wan VACE diffusion');
+requireText(pipeline, '"--src_video"', 'diffusion must receive the source video');
+requireText(pipeline, '"--src_mask"', 'diffusion must receive the tracked temporal mask');
+requireText(pipeline, 'def run_diffusion_inpainting(', 'long clips must be processed as overlapping diffusion chunks');
+requireText(pipeline, 'def source_preserving_composite(', 'only repaired mask pixels may replace source pixels');
+requireText(pipeline, 'def mux_original_audio(', 'stage 4 must restore the original soundtrack');
+requireText(pipeline, '"1:a?"', 'audio export must map original audio when present');
+requireText(pipeline, 'def validate_output(', 'final dimensions, frames, audio and selected-region change must be verified');
+requireText(pipeline, 'emit_stage("frame_extraction"', 'stage order must be machine-readable');
+requireText(pipeline, 'emit_stage("optical_flow_tracking"', 'optical-flow stage must be machine-readable');
+requireText(pipeline, 'emit_stage("diffusion_inpainting"', 'diffusion stage must be machine-readable');
+requireText(pipeline, '"audio_preserving_export"', 'export stage must be machine-readable');
+forbidText(pipeline, 'import sam2', 'the exact production pipeline must not import SAM2');
+forbidText(pipeline, 'ProPainter', 'the exact production pipeline must not execute ProPainter');
+forbidText(pipeline, 'cv2.inpaint', 'the diffusion stage must not secretly fall back to local OpenCV inpaint');
 
-// Worker command and API contract.
-requireText('gpu-worker/main.py', 'python /app/pipelines/sam2_propainter.py', 'worker must retain a safe core default outside Modal');
-requireText('gpu-worker/main.py', '@app.post("/v1/video-eraser/jobs")', 'frontend depends on this create-job endpoint');
-requireText('gpu-worker/main.py', '@app.get("/v1/video-eraser/jobs/{job_id}")', 'frontend polling depends on this status endpoint');
-requireText('gpu-worker/main.py', '@app.get("/v1/video-eraser/jobs/{job_id}/output")', 'frontend output playback depends on this endpoint');
-requireText('gpu-worker/main.py', 'ERASER_OUTPUT_QUALITY', 'worker must pass source/higher quality through to the pipeline');
-requireText('gpu-worker/main.py', 'ERASER_PRESERVE_RESOLUTION', 'worker must pass source-resolution preservation through to the pipeline');
-requireText('gpu-worker/main.py', 'ERASER_PRESERVE_FPS', 'worker must pass source-FPS preservation through to the pipeline');
-requireText('gpu-worker/main.py', 'ERASER_PRESERVE_AUDIO', 'worker must pass audio preservation through to the pipeline');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_moving_mask_tracking', 'regression test must cover moving optical-flow tracking');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_fixed_screen_selection', 'regression test must cover fixed inset marks');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_vace_condition_mask', 'regression test must verify gray generated regions and retained black-mask pixels');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_full_pipeline_with_stubbed_diffusion', 'regression test must exercise the complete four-stage path and audio export');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_vace_frame_contract', 'regression test must cover VACE frame-count constraints');
+requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'frame extraction and optical flow require OpenCV');
+requireText('gpu-worker/requirements.txt', 'numpy', 'mask and flow operations require NumPy');
 
-// Locked SAM2/ProPainter core invariants.
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'PROPAINTER_ROOT', 'pipeline must locate the ProPainter installation');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'inference_propainter.py', 'pipeline must call ProPainter inference, not the old smoke test');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'build_static_masks', 'static logo/watermark removal path must remain available');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'mask_dilation', 'mask dilation must be controlled by ProPainter call');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'mux_audio', 'final output must preserve original audio when possible');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'scale={out_w}:{out_h}:flags=lanczos', 'final output must be restored to source dimensions');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'fps={fps:.6f}', 'final output must be restored to source frame rate');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_OUTPUT_QUALITY', 'pipeline must honor source/higher output quality');
-forbidText('gpu-worker/pipelines/sam2_propainter.py', 'Smoke-test pipeline', 'do not regress to unchanged-video smoke test');
-
-// Production resilience and quality invariants.
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'allow_empty=True', 'an empty SAM2 frame must not abort the entire track');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(960, "12", "6"', 'the A10G worker must attempt a high-resolution ProPainter pass first');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'ERASER_ALLOW_OPENCV_FALLBACK', 'low-quality fallback must be explicitly opt-in');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'validate_video_liveness', 'every candidate and final output must be checked for frozen video');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'outside_tracked_mask', 'liveness validation must ignore intentionally removed object motion');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'long_clip_chunk_plan', 'high-resolution long clips must be segmented by a GPU memory budget');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'make_propainter_chunk', 'long clips must render as frame-exact overlapping segments');
-requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'CHUNK_MANIFEST_NAME', 'adaptive segment boundaries must be exposed to final timeline verification');
-forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'force_visible_fill', 'the worker must never manufacture a Gaussian-blur blob');
-forbidText('gpu-worker/pipelines/sam2_propainter.py', 'force_visible_fill', 'the locked core must never manufacture a Gaussian-blur blob');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_MASK_DILATION_PX', 'mask growth must be tightly controlled');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'SAM2_PROMPT_MODE\", \"hybrid\"', 'weak mask tracking must retry with a tight box-and-points prompt');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'calcOpticalFlowFarneback', 'empty SAM2 frames must be motion-propagated instead of copied in place');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'reacquire_from_anchor', 'long tracks must periodically correct cumulative motion drift');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'negative_points', 'SAM2 prompts must include background negatives for precise selection calibration');
-forbidText('gpu-worker/pipelines/sam2_propainter.py', 'nearest valid tracked frame', 'tracking gaps must never be filled with a stationary nearest-mask copy');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'composite_inpainted_region', 'only the repaired area may be composited over source frames');
-
-// Exact-selection acceptance invariants. A playable moving result is still a failure when the marked spot remains.
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_selection_changed', 'the selected frame must be checked directly, not inferred from unrelated sample frames');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'SelectionNotRemovedError', 'unchanged selections must fail instead of being reported as complete');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'build_recovery_masks', 'a missed selection must receive a tight second ProPainter pass');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_patch_quality', 'a broad rectangular repair must be rejected before delivery');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'refusing to return a blurred patch', 'failed AI recovery must not be reported as a low-quality success');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'Final quality-safe recovery output', 'the final muxed MP4 must pass exact-selection verification');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'ERASER_ANCHOR_MIN_CHANGED_RATIO', 'selection-change sensitivity must remain configurable');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_timeline_selection_changed', 'removal must be verified across the entire clip, including later processing chunks');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'TIMELINE_BOUNDARY_FRAMES', 'the five-second chunk boundary must be sampled explicitly');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'chunk_boundary_indexes', 'every adaptive memory-safe segment join must be sampled explicitly');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'Keep the exact painted screen position active for every frame', 'fixed corner selections must survive cuts without SAM2 drift');
-requireText('gpu-worker/pipelines/sam2_propainter.py', 'tiny_inset_mark', 'small marks inset from an edge must stay locked to screen coordinates');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'local_context_residual', 'subtle removals must be verified against nearby background context');
-requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'inconclusive_frames', 'low-contrast timeline frames must not become automatic false failures');
-requireText('scripts/verify_etreyser_timeline.py', 'verify_inset_static_overlay_lock', 'regression suite must cover inset screen-space mark drift');
-requireText('scripts/verify_etreyser_timeline.py', 'verify_context_aware_timeline', 'regression suite must distinguish low-contrast frames from a returned visible mark');
-
-requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');
-requireText('gpu-worker/requirements.txt', 'numpy', 'mask preparation uses NumPy');
-
-if (checks.length) {
+if (failures.length) {
   console.error('\nEraser contract check failed:\n');
-  for (const check of checks) console.error(`- ${check}`);
+  for (const failure of failures) console.error(`- ${failure}`);
   process.exit(1);
 }
 
-console.log('Eraser contract check passed. Proxy security, locked SAM2/ProPainter behavior, resilient fallbacks, frozen-video checks, exact-selection verification, quality controls, and frontend bridge are intact.');
+console.log('Eraser contract check passed. Frame extraction, optical-flow tracking, Wan VACE diffusion inpainting, source-preserving compositing, and audio-preserving export are locked as the production path.');

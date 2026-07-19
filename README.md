@@ -45,7 +45,7 @@ The job creation request is multipart form data with:
 - `selected_time`: selected timestamp in seconds
 - `selected_frame_index`: selected frame index
 - `fps`, `duration`, `width`, `height`
-- `pipeline`: `sam2-propainter`
+- `pipeline`: `optical-flow-vace-diffusion`
 - `quality`: `commercial`
 
 The worker can either return a completed video immediately or return a job id/status URL.
@@ -56,9 +56,9 @@ Expected JSON examples:
 {
   "jobId": "remote-job-id",
   "statusUrl": "/v1/video-eraser/jobs/remote-job-id",
-  "phase": "segmenting",
-  "progress": 10,
-  "statusMessage": "Segmenting selected object"
+  "phase": "frame_extraction",
+  "progress": 15,
+  "statusMessage": "Extracting source frames"
 }
 ```
 
@@ -73,16 +73,14 @@ Expected JSON examples:
 
 ## What the GPU worker should do
 
-For commercial-grade results, the worker should run this pipeline:
+The production worker runs this exact pipeline:
 
-1. Extract frames and audio with FFmpeg.
-2. Use a promptable video segmentation model, such as SAM2-style click/mask prompting, to create a clean per-frame mask.
-3. Track masks through the video with confidence checks and correction-keyframe support.
-4. Reject masks that suddenly jump, grow, or drift away from the selected target.
-5. Use temporal video inpainting, such as ProPainter/E2FGVI-style propagation and hallucination, instead of canvas blur/diffusion.
-6. Post-process with edge feathering, color matching, grain/noise matching, and flicker checks.
-7. Encode the final MP4 with the original audio preserved.
-8. Return a signed or public `outputUrl` to the frontend.
+1. **Frame extraction:** decode the original clip into source-timed frames while retaining the original media metadata.
+2. **Optical-flow tracking:** propagate the painted removal mask forward and backward with dense Farneback flow, sparse Lucas-Kanade recovery, scene-cut detection, and fixed screen-space handling.
+3. **Diffusion inpainting:** convert the tracked mask sequence into a Wan VACE temporal mask where white means generate and black means preserve, then reconstruct the missing background in overlapping diffusion chunks.
+4. **Audio-preserving export:** composite only the repaired mask region over the original source frames, restore the original resolution and FPS, and mux the original soundtrack into the final MP4.
+
+The production route does not execute SAM2 or ProPainter.
 
 ## What is local now
 

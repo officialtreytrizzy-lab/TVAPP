@@ -10,6 +10,11 @@ const OUTPUT_STORE = 'outputs';
 
 const ACTIVE_PROCESSING = new Set([
   'segmenting',
+  'frame_extraction',
+  'optical_flow_tracking',
+  'diffusion_inpainting',
+  'audio_preserving_export',
+  'validation',
   'tracking_mask',
   'smoothing_masks',
   'inpainting',
