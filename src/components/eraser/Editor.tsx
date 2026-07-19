@@ -44,10 +44,11 @@ export default function Editor() {
   const sourceFileRef = useRef<File | null>(null);
   // Synchronous lock — fires before setProcessing(true) renders, blocking double-tap/mobile dupes.
   const processingLockRef = useRef(false);
+  const maskAnchorTimeRef = useRef<number | null>(null);
 
   const [current, setCurrent] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [brushSize, setBrushSize] = useState(28);
+  const [brushSize, setBrushSize] = useState(20);
   const [erasing, setErasing] = useState(false);
   const [maskVisible, setMaskVisible] = useState(true);
   const [hasMask, setHasMask] = useState(false);
@@ -112,11 +113,41 @@ export default function Editor() {
     };
   }, [meta]);
 
-  const seek = (t: number) => { const v = videoRef.current; if (v) { v.currentTime = t; setCurrent(t); } };
+  const seek = (t: number) => {
+    const v = videoRef.current;
+    if (!v || !meta) return;
+    const safeTime = Math.max(0, Math.min(meta.duration, t));
+    const anchorTime = maskAnchorTimeRef.current;
+    if (anchorTime !== null && Math.abs(safeTime - anchorTime) > 0.5 / Math.max(meta.fps, 1)) {
+      maskRef.current?.clear();
+      maskAnchorTimeRef.current = null;
+      setHasMask(false);
+      setStatusMessage('Frame changed. Mark the object again on this exact frame.');
+    }
+    v.currentTime = safeTime;
+    setCurrent(safeTime);
+  };
   const togglePlay = () => { const v = videoRef.current; if (!v) return; if (v.paused) v.play(); else v.pause(); };
-  const step = (dir: 1 | -1) => { if (!meta) return; const v = videoRef.current; if (!v) return; v.pause(); const dt = 1 / meta.fps; v.currentTime = Math.max(0, Math.min(meta.duration, v.currentTime + dir * dt)); };
+  const step = (dir: 1 | -1) => {
+    if (!meta) return;
+    const v = videoRef.current;
+    if (!v) return;
+    v.pause();
+    seek(v.currentTime + dir * (1 / meta.fps));
+  };
 
   const refreshHasMask = () => setHasMask(maskRef.current?.hasMask() ?? false);
+
+  const freezeMaskFrame = () => {
+    const v = videoRef.current;
+    if (!v || !meta) return;
+    v.pause();
+    const exactTime = Math.max(0, Math.min(meta.duration, v.currentTime));
+    if (maskAnchorTimeRef.current === null) maskAnchorTimeRef.current = exactTime;
+    v.currentTime = maskAnchorTimeRef.current;
+    setCurrent(maskAnchorTimeRef.current);
+    setStatusMessage(`Mask locked to frame ${Math.round(maskAnchorTimeRef.current * meta.fps)}.`);
+  };
 
   const process = async (isRefine = false) => {
     if (!jobId || !meta || !videoRef.current || !maskRef.current) return;
@@ -144,7 +175,8 @@ export default function Editor() {
         }
       } catch { /* non-fatal: fall through to normal flow */ }
 
-      const selectedFrameIndex = Math.round(current * meta.fps);
+      const selectedTime = Math.max(0, Math.min(meta.duration, maskAnchorTimeRef.current ?? videoRef.current.currentTime));
+      const selectedFrameIndex = Math.max(0, Math.round(selectedTime * meta.fps));
       const payload = { jobId, selectedFrameIndex, maskWidth: meta.width, maskHeight: meta.height };
       let maskRes: MaskResponse;
       if (isRefine) maskRes = await eraserApi.refineMask(payload);
@@ -161,7 +193,7 @@ export default function Editor() {
 
       const runBrowserFallback = () => runPipeline({
         jobId, video: videoRef.current!, sourceUrl: meta.url, fps: meta.fps, duration: meta.duration,
-        selectedTime: current, maskCanvas, cancelRef: cancelRef.current,
+        selectedTime, maskCanvas, cancelRef: cancelRef.current,
         onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
       });
 
@@ -178,7 +210,7 @@ export default function Editor() {
             duration: meta.duration,
             width: meta.width,
             height: meta.height,
-            selectedTime: current,
+            selectedTime,
             selectedFrameIndex,
             maskCanvas,
             outputQuality,
@@ -245,11 +277,13 @@ export default function Editor() {
     setPhase('awaiting_mask'); setProgress(18); setProcessing(false); setHasMask(false);
     sourceFileRef.current = null;
     outputRef.current = null;
+    maskAnchorTimeRef.current = null;
   };
 
   const addKeyframe = () => {
     setStatusMessage('Drew a correction mask? Click Process again to re-run with this keyframe.');
     maskRef.current?.clear();
+    maskAnchorTimeRef.current = null;
     setHasMask(false);
   };
 
@@ -280,7 +314,7 @@ export default function Editor() {
               ref={maskRef}
               frameW={meta.width} frameH={meta.height} videoEl={videoRef.current}
               brushSize={brushSize} erasing={erasing} maskVisible={maskVisible}
-              onStrokeEnd={refreshHasMask} disabled={!editing}
+              onStrokeStart={freezeMaskFrame} onStrokeEnd={refreshHasMask} disabled={!editing}
             />
           </div>
         </div>
@@ -307,7 +341,7 @@ export default function Editor() {
           maskVisible={maskVisible} toggleMask={() => setMaskVisible((v) => !v)}
           onUndo={() => { maskRef.current?.undo(); refreshHasMask(); }}
           onRedo={() => { maskRef.current?.redo(); refreshHasMask(); }}
-          onClear={() => { maskRef.current?.clear(); refreshHasMask(); }}
+          onClear={() => { maskRef.current?.clear(); maskAnchorTimeRef.current = null; refreshHasMask(); }}
           disabled={!editing}
         />
         <ProcessingPanel
@@ -319,7 +353,7 @@ export default function Editor() {
         />
 
         {phase === 'completed' && (
-          <button onClick={() => { setPhase('awaiting_mask'); setFinalUrl(null); setProgress(20); maskRef.current?.clear(); setHasMask(false); }}
+          <button onClick={() => { setPhase('awaiting_mask'); setFinalUrl(null); setProgress(20); maskRef.current?.clear(); maskAnchorTimeRef.current = null; setHasMask(false); }}
             className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-800 px-4 py-2.5 text-sm font-medium text-amber-300 hover:bg-slate-700">
             Refine with another keyframe
           </button>
