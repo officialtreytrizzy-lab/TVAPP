@@ -81,6 +81,8 @@ requireText('gpu-worker/pipelines/sam2_propainter.py', 'is_cuda_oom', 'the locke
 requireText('src/components/eraser/Editor.tsx', 'runGpuRemoval', 'editor must call the AI removal bridge when configured');
 requireText('src/components/eraser/Editor.tsx', 'isGpuRemovalConfigured()', 'editor must choose AI proxy/worker vs browser fallback explicitly');
 requireText('src/components/eraser/Editor.tsx', 'outputQuality', 'editor must keep the source/higher quality setting wired');
+requireText('src/components/eraser/Editor.tsx', 'maskAnchorTimeRef', 'drawing must stay locked to the exact displayed source frame');
+requireText('src/components/eraser/MaskCanvas.tsx', 'onStrokeStart', 'mask drawing must pause and capture the exact video frame');
 requireText('src/components/eraser/ProcessingPanel.tsx', 'Mode: {processingMode}', 'UI must show whether proxy/GPU or browser fallback is active');
 requireText('src/components/eraser/ProcessingPanel.tsx', 'Same quality', 'UI must expose source-quality output');
 requireText('src/components/eraser/ProcessingPanel.tsx', 'Higher quality', 'UI must expose higher-quality output');
@@ -125,6 +127,8 @@ forbidText('gpu-worker/pipelines/sam2_propainter.py', 'force_visible_fill', 'the
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_MASK_DILATION_PX', 'mask growth must be tightly controlled');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'SAM2_PROMPT_MODE\", \"hybrid\"', 'weak mask tracking must retry with a tight box-and-points prompt');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'calcOpticalFlowFarneback', 'empty SAM2 frames must be motion-propagated instead of copied in place');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'reacquire_from_anchor', 'long tracks must periodically correct cumulative motion drift');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'negative_points', 'SAM2 prompts must include background negatives for precise selection calibration');
 forbidText('gpu-worker/pipelines/sam2_propainter.py', 'nearest valid tracked frame', 'tracking gaps must never be filled with a stationary nearest-mask copy');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'composite_inpainted_region', 'only the repaired area may be composited over source frames');
 

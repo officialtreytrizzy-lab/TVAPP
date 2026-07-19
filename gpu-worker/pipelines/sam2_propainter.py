@@ -182,11 +182,16 @@ def clean_mask(mask: np.ndarray, width: int, height: int, pad_ratio: float = 0.1
 
     count, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
     if count > 1:
-        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        mask = (labels == largest).astype(np.uint8) * 255
+        largest_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+        minimum_component_area = max(3, int(round(largest_area * 0.01)))
+        kept = np.zeros_like(mask)
+        for component in range(1, count):
+            if int(stats[component, cv2.CC_STAT_AREA]) >= minimum_component_area:
+                kept[labels == component] = 255
+        mask = kept
 
-    configured = clean_int(os.environ.get("ERASER_MASK_DILATION_PX"), 2, 0, 8)
-    dilation_px = min(8, configured + (1 if pad_ratio >= 0.24 else 0))
+    configured = clean_int(os.environ.get("ERASER_MASK_DILATION_PX"), 1, 0, 6)
+    dilation_px = min(6, configured + (1 if pad_ratio >= 0.24 else 0))
     if dilation_px > 0:
         kernel_size = dilation_px * 2 + 1
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
@@ -259,8 +264,29 @@ def prompt_from_mask(mask: np.ndarray, width: int, height: int) -> tuple[np.ndar
     if not deduped:
         deduped.append((float((box[0] + box[2]) / 2), float((box[1] + box[3]) / 2)))
 
-    points = np.array(deduped[:5], dtype=np.float32)
-    labels = np.ones((len(points),), dtype=np.int32)
+    positive_points = deduped[:5]
+    extent = max(x2 - x1 + 1, y2 - y1 + 1)
+    negative_margin = max(6, int(round(extent * 0.22)))
+    negative_candidates = [
+        (x1 - negative_margin, y1 - negative_margin),
+        ((x1 + x2) / 2, y1 - negative_margin),
+        (x2 + negative_margin, y1 - negative_margin),
+        (x1 - negative_margin, (y1 + y2) / 2),
+        (x2 + negative_margin, (y1 + y2) / 2),
+        (x1 - negative_margin, y2 + negative_margin),
+        ((x1 + x2) / 2, y2 + negative_margin),
+        (x2 + negative_margin, y2 + negative_margin),
+    ]
+    negative_points: list[tuple[float, float]] = []
+    for nx, ny in negative_candidates:
+        px = int(round(max(0, min(width - 1, nx))))
+        py = int(round(max(0, min(height - 1, ny))))
+        if binary[py, px] == 0 and all((px - qx) ** 2 + (py - qy) ** 2 >= 9 for qx, qy in negative_points):
+            negative_points.append((float(px), float(py)))
+
+    all_points = positive_points + negative_points
+    points = np.array(all_points, dtype=np.float32)
+    labels = np.array([1] * len(positive_points) + [0] * len(negative_points), dtype=np.int32)
     return box, points, labels
 
 
@@ -357,8 +383,17 @@ def is_probably_static_overlay(mask: np.ndarray, width: int, height: int) -> boo
         return False
     x1, y1, x2, y2 = bbox
     area_ratio = mask_area(mask) / max(width * height, 1)
-    near_edge = x1 <= width * 0.12 or x2 >= width * 0.88 or y1 <= height * 0.12 or y2 >= height * 0.88
-    return near_edge and area_ratio <= 0.10
+    box_width = x2 - x1 + 1
+    box_height = y2 - y1 + 1
+    edge_margin = max(3, int(round(min(width, height) * 0.025)))
+    touches_frame_edge = (
+        x1 <= edge_margin
+        or y1 <= edge_margin
+        or x2 >= width - 1 - edge_margin
+        or y2 >= height - 1 - edge_margin
+    )
+    compact = box_width <= width * 0.25 and box_height <= height * 0.25
+    return touches_frame_edge and compact and area_ratio <= 0.06
 
 
 def read_tracking_frame(frames_dir: Path, index: int, width: int, height: int) -> np.ndarray:
@@ -370,25 +405,163 @@ def read_tracking_frame(frames_dir: Path, index: int, width: int, height: int) -
     return frame
 
 
-def warp_mask_with_optical_flow(previous_frame: np.ndarray, current_frame: np.ndarray, previous_mask: np.ndarray) -> np.ndarray:
-    prev_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
-    curr_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
-    flow = cv2.calcOpticalFlowFarneback(curr_gray, prev_gray, None, 0.5, 4, 21, 4, 7, 1.5, 0)
-    height, width = previous_mask.shape[:2]
-    grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
-    warped = cv2.remap(
-        previous_mask,
-        grid_x + flow[..., 0],
-        grid_y + flow[..., 1],
-        interpolation=cv2.INTER_NEAREST,
+def translate_mask(mask: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    height, width = mask.shape[:2]
+    matrix = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+    translated = cv2.warpAffine(
+        mask,
+        matrix,
+        (width, height),
+        flags=cv2.INTER_NEAREST,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )
-    warped = (warped > 24).astype(np.uint8) * 255
+    return (translated > 24).astype(np.uint8) * 255
+
+
+def template_translation(previous_frame: np.ndarray, current_frame: np.ndarray, previous_mask: np.ndarray) -> tuple[float, float, float] | None:
+    bbox = mask_bbox(previous_mask)
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    box_width = x2 - x1 + 1
+    box_height = y2 - y1 + 1
+    search_pad_x = max(12, int(round(box_width * 0.55)))
+    search_pad_y = max(10, int(round(box_height * 0.45)))
+    sx1 = max(0, x1 - search_pad_x)
+    sy1 = max(0, y1 - search_pad_y)
+    sx2 = min(current_frame.shape[1], x2 + search_pad_x + 1)
+    sy2 = min(current_frame.shape[0], y2 + search_pad_y + 1)
+
+    template = previous_frame[y1 : y2 + 1, x1 : x2 + 1]
+    template_mask = previous_mask[y1 : y2 + 1, x1 : x2 + 1]
+    search = current_frame[sy1:sy2, sx1:sx2]
+    if (
+        template.size == 0
+        or search.shape[0] < template.shape[0]
+        or search.shape[1] < template.shape[1]
+    ):
+        return None
+
+    result = cv2.matchTemplate(search, template, cv2.TM_CCORR_NORMED, mask=template_mask)
+    _minimum, score, _minimum_location, location = cv2.minMaxLoc(result)
+    matched_x = sx1 + location[0]
+    matched_y = sy1 + location[1]
+    return float(matched_x - x1), float(matched_y - y1), float(score)
+
+
+def sparse_flow_translation(previous_frame: np.ndarray, current_frame: np.ndarray, previous_mask: np.ndarray) -> tuple[float, float] | None:
+    prev_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+    curr_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+    feature_mask = cv2.dilate(
+        (previous_mask > 24).astype(np.uint8) * 255,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    points = cv2.goodFeaturesToTrack(
+        prev_gray,
+        maxCorners=100,
+        qualityLevel=0.005,
+        minDistance=3,
+        mask=feature_mask,
+        blockSize=5,
+    )
+    if points is None or len(points) < 3:
+        return None
+    tracked, status, errors = cv2.calcOpticalFlowPyrLK(
+        prev_gray,
+        curr_gray,
+        points,
+        None,
+        winSize=(25, 25),
+        maxLevel=3,
+        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+    )
+    if tracked is None or status is None:
+        return None
+    valid = status.reshape(-1) > 0
+    if errors is not None:
+        valid &= errors.reshape(-1) < 30
+    if int(np.count_nonzero(valid)) < 3:
+        return None
+    displacement = tracked.reshape(-1, 2)[valid] - points.reshape(-1, 2)[valid]
+    dx = float(np.median(displacement[:, 0]))
+    dy = float(np.median(displacement[:, 1]))
+    return dx, dy
+
+
+def warp_mask_with_optical_flow(previous_frame: np.ndarray, current_frame: np.ndarray, previous_mask: np.ndarray) -> np.ndarray:
+    template_motion = template_translation(previous_frame, current_frame, previous_mask)
+    sparse_motion = sparse_flow_translation(previous_frame, current_frame, previous_mask)
+
+    if template_motion is not None and template_motion[2] >= 0.72:
+        dx, dy, _score = template_motion
+        if sparse_motion is not None:
+            sparse_dx, sparse_dy = sparse_motion
+            if abs(dx - sparse_dx) <= 8 and abs(dy - sparse_dy) <= 8:
+                dx = (dx * 0.7) + (sparse_dx * 0.3)
+                dy = (dy * 0.7) + (sparse_dy * 0.3)
+        warped = translate_mask(previous_mask, dx, dy)
+    elif sparse_motion is not None:
+        warped = translate_mask(previous_mask, sparse_motion[0], sparse_motion[1])
+    else:
+        prev_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+        curr_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
+        flow = cv2.calcOpticalFlowFarneback(curr_gray, prev_gray, None, 0.5, 4, 21, 4, 7, 1.5, 0)
+        height, width = previous_mask.shape[:2]
+        grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32))
+        warped = cv2.remap(
+            previous_mask,
+            grid_x + flow[..., 0],
+            grid_y + flow[..., 1],
+            interpolation=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        warped = (warped > 24).astype(np.uint8) * 255
+
     if mask_bbox(warped) is not None:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         warped = cv2.morphologyEx(warped, cv2.MORPH_CLOSE, kernel, iterations=1)
     return warped
+
+
+def reacquire_from_anchor(
+    anchor_frame: np.ndarray,
+    current_frame: np.ndarray,
+    anchor_mask: np.ndarray,
+    predicted_mask: np.ndarray,
+) -> tuple[np.ndarray, float] | None:
+    anchor_bbox = mask_bbox(anchor_mask)
+    predicted_bbox = mask_bbox(predicted_mask)
+    if anchor_bbox is None or predicted_bbox is None:
+        return None
+    ax1, ay1, ax2, ay2 = anchor_bbox
+    px1, py1, px2, py2 = predicted_bbox
+    template = anchor_frame[ay1 : ay2 + 1, ax1 : ax2 + 1]
+    template_mask = anchor_mask[ay1 : ay2 + 1, ax1 : ax2 + 1]
+    if template.size == 0:
+        return None
+
+    box_width = ax2 - ax1 + 1
+    box_height = ay2 - ay1 + 1
+    search_pad_x = max(24, int(round(box_width * 2.5)))
+    search_pad_y = max(20, int(round(box_height * 2.0)))
+    sx1 = max(0, px1 - search_pad_x)
+    sy1 = max(0, py1 - search_pad_y)
+    sx2 = min(current_frame.shape[1], px2 + search_pad_x + 1)
+    sy2 = min(current_frame.shape[0], py2 + search_pad_y + 1)
+    search = current_frame[sy1:sy2, sx1:sx2]
+    if search.shape[0] < template.shape[0] or search.shape[1] < template.shape[1]:
+        return None
+
+    result = cv2.matchTemplate(search, template, cv2.TM_CCORR_NORMED, mask=template_mask)
+    _minimum, score, _minimum_location, location = cv2.minMaxLoc(result)
+    if not np.isfinite(score):
+        return None
+    matched_x = sx1 + location[0]
+    matched_y = sy1 + location[1]
+    return translate_mask(anchor_mask, float(matched_x - ax1), float(matched_y - ay1)), float(score)
 
 
 def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -399,13 +572,41 @@ def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def choose_tracked_mask(sam2_mask: np.ndarray | None, flow_mask: np.ndarray) -> np.ndarray:
-    if sam2_mask is None or mask_bbox(sam2_mask) is None:
+    sam_bbox = mask_bbox(sam2_mask) if sam2_mask is not None else None
+    flow_bbox = mask_bbox(flow_mask)
+    if sam_bbox is None:
         return flow_mask
-    if mask_bbox(flow_mask) is None:
+    if flow_bbox is None:
         return sam2_mask
-    area_ratio = mask_area(sam2_mask) / max(mask_area(flow_mask), 1)
-    if 0.20 <= area_ratio <= 5.0 and mask_iou(sam2_mask, flow_mask) >= 0.04:
-        return sam2_mask
+
+    sam_area = mask_area(sam2_mask)
+    flow_area = max(mask_area(flow_mask), 1)
+    area_ratio = sam_area / flow_area
+    overlap = mask_iou(sam2_mask, flow_mask)
+
+    sx1, sy1, sx2, sy2 = sam_bbox
+    fx1, fy1, fx2, fy2 = flow_bbox
+    sam_center = np.array([(sx1 + sx2) / 2.0, (sy1 + sy2) / 2.0])
+    flow_center = np.array([(fx1 + fx2) / 2.0, (fy1 + fy2) / 2.0])
+    center_distance = float(np.linalg.norm(sam_center - flow_center))
+    flow_extent = max(fx2 - fx1 + 1, fy2 - fy1 + 1, 1)
+
+    consistent = (
+        0.50 <= area_ratio <= 2.0
+        and overlap >= 0.35
+        and center_distance <= max(5.0, flow_extent * 0.25)
+    )
+    if not consistent:
+        return flow_mask
+
+    envelope = cv2.dilate(
+        flow_mask,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+        iterations=1,
+    )
+    constrained = cv2.bitwise_and(sam2_mask, envelope)
+    if mask_area(constrained) >= flow_area * 0.55:
+        return constrained
     return flow_mask
 
 
@@ -417,9 +618,17 @@ def propagate_missing_masks(
     height: int,
     anchor: int,
     anchor_mask: np.ndarray,
+    fps: float,
 ) -> tuple[dict[int, np.ndarray], int]:
     result: dict[int, np.ndarray] = {anchor: anchor_mask}
     static_overlay = is_probably_static_overlay(anchor_mask, width, height)
+    anchor_frame = read_tracking_frame(frames_dir, anchor, width, height)
+    reanchor_interval = clean_int(
+        os.environ.get("ERASER_TRACK_REANCHOR_FRAMES"),
+        max(8, int(round(max(fps, 1.0) * 2.0))),
+        6,
+        240,
+    )
     recovered = 0
 
     for direction in (1, -1):
@@ -434,6 +643,13 @@ def propagate_missing_masks(
                 recovered += 1
             else:
                 flow_mask = warp_mask_with_optical_flow(previous_frame, current_frame, previous_mask)
+                if abs(index - anchor) % reanchor_interval == 0 and mask_bbox(flow_mask) is not None:
+                    reacquired = reacquire_from_anchor(anchor_frame, current_frame, anchor_mask, flow_mask)
+                    if reacquired is not None and reacquired[1] >= 0.80:
+                        candidate, score = reacquired
+                        if mask_iou(candidate, flow_mask) >= 0.08:
+                            flow_mask = candidate
+                            print(f"Tracker re-anchored frame={index} score={score:.3f}", flush=True)
                 chosen = choose_tracked_mask(sam2_mask, flow_mask)
                 if sam2_mask is None or mask_bbox(sam2_mask) is None or chosen is flow_mask:
                     recovered += 1
@@ -454,6 +670,7 @@ def write_masks(
     height: int,
     anchor: int,
     anchor_mask: np.ndarray,
+    fps: float,
 ) -> None:
     if output_dir.exists():
         shutil.rmtree(output_dir)
@@ -472,10 +689,21 @@ def write_masks(
 
     anchor_mask = clean_mask(anchor_mask, width, height, 0.10)
     normalized[anchor] = anchor_mask
-    tracked, recovered = propagate_missing_masks(normalized, frames_dir, frame_count, width, height, anchor, anchor_mask)
+    tracked, recovered = propagate_missing_masks(normalized, frames_dir, frame_count, width, height, anchor, anchor_mask, fps)
 
     for idx in range(frame_count):
         cv2.imwrite(str(output_dir / f"{idx:05d}.png"), tracked.get(idx, np.zeros((height, width), dtype=np.uint8)))
+
+    sample_indexes = sorted(set([0, anchor, frame_count // 4, frame_count // 2, (frame_count * 3) // 4, max(0, frame_count - 1)]))
+    sample_stats = []
+    for sample_index in sample_indexes:
+        sample_mask = tracked.get(sample_index, np.zeros((height, width), dtype=np.uint8))
+        sample_stats.append({
+            "frame": sample_index,
+            "bbox": mask_bbox(sample_mask),
+            "area": mask_area(sample_mask),
+        })
+    print(f"Tracking mask samples: {json.dumps(sample_stats)}", flush=True)
 
     usable_sam2 = sum(1 for mask in normalized.values() if mask_bbox(mask) is not None)
     print(
@@ -532,7 +760,7 @@ def build_sam2_masks(source_mp4: Path, input_mask: Path, output_dir: Path, fps: 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    write_masks(masks, output_dir, frames_dir, frame_count, width, height, anchor, anchor_mask)
+    write_masks(masks, output_dir, frames_dir, frame_count, width, height, anchor, anchor_mask, fps)
 
     print(f"SAM2 propagated masks for {frame_count} frames", flush=True)
     print("Using SAM2 mask sequence for ProPainter", flush=True)
