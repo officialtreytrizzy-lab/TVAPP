@@ -28,6 +28,9 @@ PATCH_DELTA_THRESHOLD = float(os.environ.get("ERASER_PATCH_DELTA_THRESHOLD", "10
 PATCH_MAX_SPILL_MEAN = float(os.environ.get("ERASER_PATCH_MAX_SPILL_MEAN", "6.0"))
 PATCH_MAX_SPILL_RATIO = float(os.environ.get("ERASER_PATCH_MAX_SPILL_RATIO", "0.12"))
 PATCH_MAX_EXTENT_RATIO = float(os.environ.get("ERASER_PATCH_MAX_EXTENT_RATIO", "5.0"))
+TIMELINE_SAMPLE_COUNT = max(7, int(os.environ.get("ERASER_TIMELINE_SAMPLE_COUNT", "11")))
+TIMELINE_MIN_PASS_RATIO = float(os.environ.get("ERASER_TIMELINE_MIN_PASS_RATIO", "0.82"))
+TIMELINE_BOUNDARY_FRAMES = max(24, int(os.environ.get("ERASER_PROPAINTER_CHUNK_FRAMES", "120")))
 
 
 class SelectionNotRemovedError(RuntimeError):
@@ -115,6 +118,108 @@ def validate_selection_changed(
             f"changed_ratio={stats['changed_ratio']:.3f}"
         )
     return stats
+
+
+def read_timeline_mask(mask_dir: Path, frame_index: int, width: int, height: int) -> np.ndarray:
+    mask = cv2.imread(str(mask_dir / f"{frame_index:05d}.png"), cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        return np.zeros((height, width), dtype=np.uint8)
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    return (mask > 24).astype(np.uint8) * 255
+
+
+def timeline_sample_indexes(frame_count: int, anchor_index: int) -> list[int]:
+    if frame_count <= 0:
+        return []
+
+    indexes = {
+        0,
+        max(0, frame_count - 1),
+        max(0, min(anchor_index, frame_count - 1)),
+    }
+    sample_total = min(TIMELINE_SAMPLE_COUNT, frame_count)
+    indexes.update(int(round(value)) for value in np.linspace(0, frame_count - 1, sample_total))
+
+    # Explicitly sample both sides of every 120-frame/approximately-five-second
+    # processing boundary. This catches the exact failure where chunk one is
+    # repaired but later chunks silently return to the original frames.
+    for boundary in range(TIMELINE_BOUNDARY_FRAMES, frame_count, TIMELINE_BOUNDARY_FRAMES):
+        indexes.update({boundary - 1, boundary, boundary + 1})
+
+    return sorted(index for index in indexes if 0 <= index < frame_count)
+
+
+def validate_timeline_selection_changed(
+    source_video: Path,
+    candidate_video: Path,
+    mask_dir: Path,
+    anchor_index: int,
+    label: str,
+) -> dict[str, float]:
+    source_frames = pipeline.video_frame_count(source_video)
+    candidate_frames = pipeline.video_frame_count(candidate_video)
+    if candidate_frames < max(1, source_frames - 1):
+        raise SelectionNotRemovedError(
+            f"{label} ended early: source_frames={source_frames}, candidate_frames={candidate_frames}"
+        )
+
+    source_frame = read_frame(source_video, 0)
+    height, width = source_frame.shape[:2]
+    anchor_timeline_mask = read_timeline_mask(mask_dir, anchor_index, width, height)
+    static_overlay = locked_core.is_probably_static_overlay(anchor_timeline_mask, width, height)
+
+    results: list[dict[str, float | bool]] = []
+    missing_masks: list[int] = []
+    failed_frames: list[int] = []
+
+    for frame_index in timeline_sample_indexes(source_frames, anchor_index):
+        mask = read_timeline_mask(mask_dir, frame_index, width, height)
+        if locked_core.mask_bbox(mask) is None:
+            missing_masks.append(frame_index)
+            if static_overlay:
+                failed_frames.append(frame_index)
+            continue
+
+        stats = selection_change_metrics(source_video, candidate_video, mask, frame_index)
+        passed = (
+            stats["mean_change"] >= ANCHOR_MIN_MEAN_CHANGE
+            or stats["changed_ratio"] >= ANCHOR_MIN_CHANGED_RATIO
+        )
+        results.append({**stats, "passed": passed})
+        if not passed:
+            failed_frames.append(frame_index)
+
+    checked = len(results)
+    passed_count = sum(1 for row in results if bool(row["passed"]))
+    pass_ratio = float(passed_count / checked) if checked else 0.0
+    required_ratio = 1.0 if static_overlay else TIMELINE_MIN_PASS_RATIO
+    summary = {
+        "source_frames": float(source_frames),
+        "candidate_frames": float(candidate_frames),
+        "checked_frames": float(checked),
+        "passed_frames": float(passed_count),
+        "pass_ratio": pass_ratio,
+        "required_ratio": required_ratio,
+        "static_overlay": float(static_overlay),
+        "missing_masks": float(len(missing_masks)),
+        "failed_frames": float(len(failed_frames)),
+    }
+    print(
+        f"{label} full-timeline verification: {json.dumps(summary, sort_keys=True)} "
+        f"samples={json.dumps(results, sort_keys=True)}",
+        flush=True,
+    )
+
+    if checked <= 0:
+        raise SelectionNotRemovedError(f"{label} had no tracked timeline frames to verify")
+    if pass_ratio < required_ratio or (static_overlay and (missing_masks or failed_frames)):
+        raise SelectionNotRemovedError(
+            f"{label} did not keep the selection removed for the full clip: "
+            f"pass_ratio={pass_ratio:.3f}, required={required_ratio:.3f}, "
+            f"failed_frames={sorted(set(failed_frames))}, missing_masks={missing_masks}"
+        )
+    return summary
 
 
 def patch_quality_metrics(
@@ -259,6 +364,9 @@ def verified_recovery(
         pipeline.validate_video_liveness(source_video, candidate, "ProPainter recovery", recovery_masks)
         validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
         validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "ProPainter recovery")
+        validate_timeline_selection_changed(
+            source_video, candidate, recovery_masks, anchor_index, "ProPainter recovery"
+        )
         return candidate, recovery_masks
     except RuntimeError as exc:
         if not ALLOW_OPENCV_FALLBACK:
@@ -268,6 +376,9 @@ def verified_recovery(
         candidate = pipeline.run_opencv_tracked_inpaint(source_video, recovery_masks, work_dir, fps)
         validate_selection_changed(source_video, candidate, anchor_mask, anchor_index, "Opt-in OpenCV fallback")
         validate_patch_quality(source_video, candidate, anchor_mask, anchor_index, "Opt-in OpenCV fallback")
+        validate_timeline_selection_changed(
+            source_video, candidate, recovery_masks, anchor_index, "Opt-in OpenCV fallback"
+        )
         return candidate, recovery_masks
 
 
@@ -339,6 +450,13 @@ def main() -> None:
             anchor_index,
             "ProPainter",
         )
+        validate_timeline_selection_changed(
+            source_mp4,
+            inpainted,
+            tracked_masks,
+            anchor_index,
+            "ProPainter",
+        )
     except RuntimeError as exc:
         used_fallback = True
         print(
@@ -390,6 +508,13 @@ def main() -> None:
             anchor_index,
             "Final eraser output",
         )
+        validate_timeline_selection_changed(
+            source_mp4,
+            output_video,
+            active_masks,
+            anchor_index,
+            "Final eraser output",
+        )
     except RuntimeError as exc:
         if used_fallback:
             raise
@@ -436,6 +561,13 @@ def main() -> None:
             source_mp4,
             output_video,
             anchor_mask,
+            anchor_index,
+            "Final quality-safe recovery output",
+        )
+        validate_timeline_selection_changed(
+            source_mp4,
+            output_video,
+            active_masks,
             anchor_index,
             "Final quality-safe recovery output",
         )

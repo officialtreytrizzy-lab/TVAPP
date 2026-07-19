@@ -638,9 +638,18 @@ def propagate_missing_masks(
         while 0 <= index < frame_count:
             current_frame = read_tracking_frame(frames_dir, index, width, height)
             sam2_mask = normalized.get(index)
-            if static_overlay and (sam2_mask is None or mask_bbox(sam2_mask) is None):
+            if static_overlay:
+                # Small edge/corner selections are fixed screen-space content
+                # such as watermarks, logos, or persistent blemishes. SAM2 can
+                # jump to a similarly shaped person/object after a scene cut.
+                # Keep the exact painted screen position active for every frame.
                 chosen = anchor_mask.copy()
-                recovered += 1
+                if (
+                    sam2_mask is None
+                    or mask_bbox(sam2_mask) is None
+                    or mask_iou(sam2_mask, anchor_mask) < 0.85
+                ):
+                    recovered += 1
             else:
                 flow_mask = warp_mask_with_optical_flow(previous_frame, current_frame, previous_mask)
                 if abs(index - anchor) % reanchor_interval == 0 and mask_bbox(flow_mask) is not None:

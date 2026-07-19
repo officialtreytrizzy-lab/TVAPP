@@ -17,6 +17,7 @@ const requiredFiles = [
   'gpu-worker/pipelines/sam2_propainter_resilient.py',
   'gpu-worker/pipelines/sam2_propainter_verified.py',
   'gpu-worker/requirements.txt',
+  'scripts/verify_etreyser_timeline.py',
   'vercel.json',
 ];
 
@@ -141,6 +142,9 @@ requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_patch_
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'refusing to return a blurred patch', 'failed AI recovery must not be reported as a low-quality success');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'Final quality-safe recovery output', 'the final muxed MP4 must pass exact-selection verification');
 requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'ERASER_ANCHOR_MIN_CHANGED_RATIO', 'selection-change sensitivity must remain configurable');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_timeline_selection_changed', 'removal must be verified across the entire clip, including later processing chunks');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'TIMELINE_BOUNDARY_FRAMES', 'the five-second chunk boundary must be sampled explicitly');
+requireText('gpu-worker/pipelines/sam2_propainter.py', 'Keep the exact painted screen position active for every frame', 'fixed corner selections must survive cuts without SAM2 drift');
 
 requireText('gpu-worker/requirements.txt', 'opencv-python-headless', 'mask preparation uses OpenCV');
 requireText('gpu-worker/requirements.txt', 'numpy', 'mask preparation uses NumPy');
