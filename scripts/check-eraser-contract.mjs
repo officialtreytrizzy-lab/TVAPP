@@ -122,6 +122,7 @@ requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'allow_empty=Tr
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', '(960, "12", "6"', 'the A10G worker must attempt a high-resolution ProPainter pass first');
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'ERASER_ALLOW_OPENCV_FALLBACK', 'low-quality fallback must be explicitly opt-in');
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'validate_video_liveness', 'every candidate and final output must be checked for frozen video');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'outside_tracked_mask', 'liveness validation must ignore intentionally removed object motion');
 forbidText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'force_visible_fill', 'the worker must never manufacture a Gaussian-blur blob');
 forbidText('gpu-worker/pipelines/sam2_propainter.py', 'force_visible_fill', 'the locked core must never manufacture a Gaussian-blur blob');
 requireText('gpu-worker/pipelines/sam2_propainter.py', 'ERASER_MASK_DILATION_PX', 'mask growth must be tightly controlled');
