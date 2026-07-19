@@ -22,6 +22,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from sam2_refinement import build_semantic_composite_masks
+
 WAN_ROOT = Path(os.environ.get("WAN_ROOT", "/opt/Wan2.1"))
 WAN_CKPT_DIR = Path(os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B"))
 DIFFUSION_FPS = float(os.environ.get("ERASER_DIFFUSION_FPS", "16"))
@@ -504,6 +506,112 @@ def track_masks_with_optical_flow(
         flush=True,
     )
     return masks_dir
+
+
+def fixed_repair_roi(
+    source_mask: np.ndarray,
+    source_width: int,
+    source_height: int,
+) -> tuple[int, int, int, int] | None:
+    """Create a context-rich ROI that gives a compact mark more VACE pixels."""
+    bbox = mask_bbox(source_mask)
+    if bbox is None:
+        return None
+    x1, y1, x2, y2 = bbox
+    mask_width = x2 - x1 + 1
+    mask_height = y2 - y1 + 1
+    area_ratio = mask_area(source_mask) / float(max(source_width * source_height, 1))
+    if area_ratio > 0.065 or mask_width > source_width * 0.32 or mask_height > source_height * 0.32:
+        return None
+
+    target_aspect = 832.0 / 480.0 if source_width >= source_height else 480.0 / 832.0
+    minimum_height = max(128, int(round(mask_height * 3.2)))
+    minimum_width = max(128, int(round(mask_width * 3.2)))
+    roi_height = minimum_height
+    roi_width = max(minimum_width, int(round(roi_height * target_aspect)))
+    if roi_width / max(roi_height, 1) < target_aspect:
+        roi_width = int(round(roi_height * target_aspect))
+    else:
+        roi_height = max(roi_height, int(round(roi_width / target_aspect)))
+    roi_width = min(source_width, max(mask_width + 24, roi_width))
+    roi_height = min(source_height, max(mask_height + 24, roi_height))
+    roi_width -= roi_width % 2
+    roi_height -= roi_height % 2
+
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+    roi_x = int(round(center_x - roi_width / 2.0))
+    roi_y = int(round(center_y - roi_height / 2.0))
+    roi_x = max(0, min(roi_x, source_width - roi_width))
+    roi_y = max(0, min(roi_y, source_height - roi_height))
+    if not (
+        roi_x <= x1
+        and roi_y <= y1
+        and roi_x + roi_width > x2
+        and roi_y + roi_height > y2
+    ):
+        return None
+    return roi_x, roi_y, roi_width, roi_height
+
+
+def crop_source_for_fixed_roi(
+    source_video: Path,
+    destination: Path,
+    roi: tuple[int, int, int, int],
+) -> Path:
+    x, y, width, height = roi
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source_video),
+            "-map",
+            "0:v:0",
+            "-vf",
+            f"crop={width}:{height}:{x}:{y}",
+            "-an",
+            "-c:v",
+            "ffv1",
+            "-level",
+            "3",
+            "-g",
+            "1",
+            "-pix_fmt",
+            "yuv444p",
+            str(destination),
+        ]
+    )
+    return destination
+
+
+def crop_masks_for_fixed_roi(
+    masks_dir: Path,
+    destination: Path,
+    frame_count: int,
+    tracking_width: int,
+    tracking_height: int,
+    source_width: int,
+    source_height: int,
+    roi: tuple[int, int, int, int],
+) -> Path:
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    x, y, width, height = roi
+    for index in range(frame_count):
+        mask = cv2.imread(str(masks_dir / f"{index:06d}.png"), cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise RuntimeError(f"Could not read tracked mask for fixed ROI at frame {index}")
+        if mask.shape[1] != tracking_width or mask.shape[0] != tracking_height:
+            mask = cv2.resize(mask, (tracking_width, tracking_height), interpolation=cv2.INTER_NEAREST)
+        source_mask = cv2.resize(mask, (source_width, source_height), interpolation=cv2.INTER_NEAREST)
+        cropped = source_mask[y : y + height, x : x + width]
+        if cropped.shape != (height, width):
+            raise RuntimeError(f"Fixed ROI mask crop changed geometry at frame {index}")
+        if not cv2.imwrite(str(destination / f"{index:06d}.png"), cropped):
+            raise RuntimeError(f"Could not write fixed ROI mask {index}")
+    return destination
 
 
 def vace_dimensions(source_width: int, source_height: int) -> tuple[int, int, str]:
@@ -1036,27 +1144,198 @@ def prepare_repair_at_source_geometry(
             str(source_frame_count),
             "-an",
             "-c:v",
-            "libx264",
-            "-preset",
-            "medium",
-            "-crf",
-            "12",
-            "-movflags",
-            "+faststart",
+            "ffv1",
+            "-level",
+            "3",
+            "-g",
+            "1",
+            "-pix_fmt",
+            "yuv444p",
             str(destination),
         ]
     )
     return destination
 
 
+def robust_mad(values: np.ndarray) -> float:
+    flattened = np.asarray(values, dtype=np.float32).reshape(-1)
+    if flattened.size <= 0:
+        return 0.0
+    median = float(np.median(flattened))
+    return float(np.median(np.abs(flattened - median)) * 1.4826)
+
+
+def harmonize_composite_frame(
+    source_frame: np.ndarray,
+    repair_frame: np.ndarray,
+    binary_mask: np.ndarray,
+    previous_state: dict[str, np.ndarray | float | str] | None = None,
+) -> tuple[
+    np.ndarray,
+    dict[str, np.ndarray | float | str],
+    dict[str, float | str],
+]:
+    """Select the least-visible repair blend while preserving source pixels.
+
+    The repair is first aligned to the local source color in LAB space. Three
+    edge-safe candidates are then evaluated: gradient-domain cloning, cosine
+    inward blending, and linear inward blending. The candidate with the lowest
+    boundary discontinuity and closest local texture ratio wins. Nothing outside
+    the final matte is ever changed.
+    """
+    binary = (binary_mask > 24).astype(np.uint8) * 255
+    bbox = mask_bbox(binary)
+    if bbox is None:
+        return source_frame.copy(), {}, {"mask_pixels": 0.0, "blend_mode": "none"}
+    x1, y1, x2, y2 = bbox
+    minimum_side = max(1, min(x2 - x1 + 1, y2 - y1 + 1))
+
+    ring_radius = max(5, min(15, int(round(minimum_side * 0.20))))
+    ring_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (ring_radius * 2 + 1, ring_radius * 2 + 1),
+    )
+    outer_ring = (cv2.dilate(binary, ring_kernel, iterations=1) > 0) & (binary == 0)
+    if int(np.count_nonzero(outer_ring)) < 24:
+        outer_ring = binary == 0
+
+    source_lab = cv2.cvtColor(source_frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    repair_lab = cv2.cvtColor(repair_frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    measured_shift = np.median(source_lab[outer_ring] - repair_lab[outer_ring], axis=0).astype(np.float32)
+    measured_shift = np.clip(
+        measured_shift,
+        np.asarray([-24.0, -10.0, -10.0], dtype=np.float32),
+        np.asarray([24.0, 10.0, 10.0], dtype=np.float32),
+    )
+    if previous_state:
+        prior_shift = np.asarray(previous_state.get("color_shift", measured_shift), dtype=np.float32)
+        color_shift = prior_shift * 0.72 + measured_shift * 0.28
+    else:
+        color_shift = measured_shift
+
+    corrected_lab = np.clip(repair_lab + color_shift.reshape(1, 1, 3), 0, 255).astype(np.uint8)
+    corrected = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2BGR)
+
+    pad = max(4, min(12, int(round(minimum_side * 0.12))))
+    crop_x1 = max(0, x1 - pad)
+    crop_y1 = max(0, y1 - pad)
+    crop_x2 = min(source_frame.shape[1], x2 + pad + 1)
+    crop_y2 = min(source_frame.shape[0], y2 + pad + 1)
+    patch = corrected[crop_y1:crop_y2, crop_x1:crop_x2]
+    patch_mask = binary[crop_y1:crop_y2, crop_x1:crop_x2]
+    center = (crop_x1 + patch.shape[1] // 2, crop_y1 + patch.shape[0] // 2)
+
+    clone_candidate = corrected.copy()
+    clone_available = False
+    if (
+        patch.size > 0
+        and int(np.count_nonzero(patch_mask)) > 0
+        and crop_x1 > 0
+        and crop_y1 > 0
+        and crop_x2 < source_frame.shape[1]
+        and crop_y2 < source_frame.shape[0]
+    ):
+        try:
+            clone_candidate = cv2.seamlessClone(
+                patch,
+                source_frame.copy(),
+                patch_mask,
+                center,
+                cv2.NORMAL_CLONE,
+            )
+            clone_available = True
+        except cv2.error:
+            clone_candidate = corrected.copy()
+
+    distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    transition_width = max(2.5, min(7.0, minimum_side * 0.08))
+    normalized_distance = np.clip(distance / transition_width, 0.0, 1.0)
+    linear_alpha = np.clip((distance + 0.20) / transition_width, 0.0, 1.0)
+    cosine_alpha = 0.5 - 0.5 * np.cos(normalized_distance * np.pi)
+    linear_alpha[binary == 0] = 0.0
+    cosine_alpha[binary == 0] = 0.0
+
+    def alpha_composite(alpha_2d: np.ndarray) -> np.ndarray:
+        alpha = alpha_2d[:, :, None].astype(np.float32)
+        result = np.clip(
+            corrected.astype(np.float32) * alpha
+            + source_frame.astype(np.float32) * (1.0 - alpha),
+            0,
+            255,
+        ).astype(np.uint8)
+        result[binary == 0] = source_frame[binary == 0]
+        return result
+
+    candidates: dict[str, np.ndarray] = {
+        "cosine": alpha_composite(cosine_alpha),
+        "linear": alpha_composite(linear_alpha),
+    }
+    if clone_available:
+        clone_candidate[binary == 0] = source_frame[binary == 0]
+        candidates["gradient_clone"] = clone_candidate
+
+    edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    inner_edge = (binary > 0) & (cv2.erode(binary, edge_kernel, iterations=1) == 0)
+    edge_outer = (cv2.dilate(binary, edge_kernel, iterations=1) > 0) & (binary == 0)
+    if int(np.count_nonzero(inner_edge)) < 8 or int(np.count_nonzero(edge_outer)) < 8:
+        inner_edge = binary > 0
+        edge_outer = outer_ring
+
+    source_gray = cv2.cvtColor(source_frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    source_high = source_gray - cv2.GaussianBlur(source_gray, (0, 0), 1.0)
+    source_texture = max(float(np.std(source_high[edge_outer])), 0.01)
+
+    candidate_scores: dict[str, tuple[float, float, float]] = {}
+    for mode, candidate in candidates.items():
+        candidate_lab = cv2.cvtColor(candidate, cv2.COLOR_BGR2LAB).astype(np.float32)
+        boundary_delta = float(
+            np.abs(candidate_lab[inner_edge].mean(axis=0) - source_lab[edge_outer].mean(axis=0)).mean()
+        )
+        candidate_gray = cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        candidate_high = candidate_gray - cv2.GaussianBlur(candidate_gray, (0, 0), 1.0)
+        texture_ratio = float(np.std(candidate_high[binary > 0]) / source_texture)
+        texture_penalty = abs(math.log(max(texture_ratio, 0.05))) * 1.25
+        score = boundary_delta + texture_penalty
+        candidate_scores[mode] = (score, boundary_delta, texture_ratio)
+
+    best_mode = min(candidate_scores, key=lambda name: candidate_scores[name][0])
+    best_score = candidate_scores[best_mode][0]
+    previous_mode = str(previous_state.get("blend_mode", "")) if previous_state else ""
+    if previous_mode in candidate_scores:
+        previous_score = candidate_scores[previous_mode][0]
+        if previous_score <= best_score + max(0.08, best_score * 0.08):
+            best_mode = previous_mode
+
+    composited = candidates[best_mode]
+    composited[binary == 0] = source_frame[binary == 0]
+    selected_score, boundary_delta, texture_ratio = candidate_scores[best_mode]
+    state: dict[str, np.ndarray | float | str] = {
+        "color_shift": color_shift.astype(np.float32),
+        "blend_mode": best_mode,
+    }
+    metrics: dict[str, float | str] = {
+        "mask_pixels": float(np.count_nonzero(binary)),
+        "color_shift_l": float(color_shift[0]),
+        "color_shift_a": float(color_shift[1]),
+        "color_shift_b": float(color_shift[2]),
+        "blend_mode": best_mode,
+        "blend_score": float(selected_score),
+        "boundary_delta": float(boundary_delta),
+        "texture_ratio": float(texture_ratio),
+        "transition_width": float(transition_width),
+    }
+    return composited, state, metrics
+
+
 def source_preserving_composite(
     source_video: Path,
     repair_video: Path,
-    tracked_masks_dir: Path,
+    composite_masks_dir: Path,
     destination: Path,
     source_fps: float,
     source_width: int,
     source_height: int,
+    repair_roi: tuple[int, int, int, int] | None = None,
 ) -> Path:
     source_cap = cv2.VideoCapture(str(source_video))
     repair_cap = cv2.VideoCapture(str(repair_video))
@@ -1065,20 +1344,23 @@ def source_preserving_composite(
         repair_cap.release()
         raise RuntimeError("Could not open source and diffusion repair for export")
 
-    raw_output = destination.with_suffix(".raw.mp4")
+    raw_output = destination.with_suffix(".raw.mkv")
     writer = cv2.VideoWriter(
         str(raw_output),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        cv2.VideoWriter_fourcc(*"FFV1"),
         source_fps,
         (source_width, source_height),
     )
     if not writer.isOpened():
         source_cap.release()
         repair_cap.release()
-        raise RuntimeError("Could not create source-preserving composite")
+        raise RuntimeError("Could not create lossless source-preserving composite")
 
     frame_index = 0
     last_repair: np.ndarray | None = None
+    previous_source: np.ndarray | None = None
+    harmonizer_state: dict[str, np.ndarray | float | str] | None = None
+    metric_samples: list[dict[str, float | int | str]] = []
     while True:
         ok_source, source_frame = source_cap.read()
         if not ok_source:
@@ -1094,39 +1376,47 @@ def source_preserving_composite(
             writer.release()
             raise RuntimeError(f"Diffusion repair ended before source frame {frame_index}")
 
-        if repair_frame.shape[1] != source_width or repair_frame.shape[0] != source_height:
+        if repair_roi is not None:
+            roi_x, roi_y, roi_width, roi_height = repair_roi
+            if repair_frame.shape[1] != roi_width or repair_frame.shape[0] != roi_height:
+                repair_frame = cv2.resize(
+                    repair_frame,
+                    (roi_width, roi_height),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
+            repair_canvas = source_frame.copy()
+            repair_canvas[roi_y : roi_y + roi_height, roi_x : roi_x + roi_width] = repair_frame
+            repair_frame = repair_canvas
+        elif repair_frame.shape[1] != source_width or repair_frame.shape[0] != source_height:
             repair_frame = cv2.resize(
                 repair_frame,
                 (source_width, source_height),
                 interpolation=cv2.INTER_LANCZOS4,
             )
         mask = cv2.imread(
-            str(tracked_masks_dir / f"{frame_index:06d}.png"),
+            str(composite_masks_dir / f"{frame_index:06d}.png"),
             cv2.IMREAD_GRAYSCALE,
         )
         if mask is None:
             source_cap.release()
             repair_cap.release()
             writer.release()
-            raise RuntimeError(f"Tracked mask is missing during export at frame {frame_index}")
+            raise RuntimeError(f"Composite mask is missing during export at frame {frame_index}")
         if mask.shape[1] != source_width or mask.shape[0] != source_height:
             mask = cv2.resize(mask, (source_width, source_height), interpolation=cv2.INTER_NEAREST)
         binary = (mask > 24).astype(np.uint8) * 255
-        outer = cv2.dilate(
+        if previous_source is not None and is_scene_cut(previous_source, source_frame):
+            harmonizer_state = None
+        composited, harmonizer_state, metrics = harmonize_composite_frame(
+            source_frame,
+            repair_frame,
             binary,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
-            iterations=1,
+            harmonizer_state,
         )
-        alpha = cv2.GaussianBlur(outer, (0, 0), sigmaX=1.35, sigmaY=1.35).astype(np.float32) / 255.0
-        alpha[binary > 0] = 1.0
-        alpha = alpha[:, :, None]
-        composited = np.clip(
-            repair_frame.astype(np.float32) * alpha
-            + source_frame.astype(np.float32) * (1.0 - alpha),
-            0,
-            255,
-        ).astype(np.uint8)
+        if frame_index == 0 or frame_index % max(1, int(round(source_fps * 2.0))) == 0:
+            metric_samples.append({"frame": frame_index, **metrics})
         writer.write(composited)
+        previous_source = source_frame
         frame_index += 1
 
     source_cap.release()
@@ -1134,7 +1424,11 @@ def source_preserving_composite(
     writer.release()
     if frame_index <= 0:
         raise RuntimeError("Source-preserving composite wrote no frames")
-    print(f"Source-preserving diffusion composite wrote {frame_index} frames", flush=True)
+    print(
+        "Adaptive patch harmonizer complete: "
+        f"frames={frame_index}, samples={json.dumps(metric_samples, separators=(',', ':'))}",
+        flush=True,
+    )
     return raw_output
 
 
@@ -1343,12 +1637,15 @@ def main() -> None:
     source_mp4 = work_dir / "source.mp4"
     extracted_frames = work_dir / "extracted_frames"
     tracked_masks = work_dir / "optical_flow_masks"
+    composite_masks = work_dir / "sam2_composite_masks"
+    fixed_roi_source = work_dir / "fixed_roi_source.mkv"
+    fixed_roi_masks = work_dir / "fixed_roi_masks"
     vace_source = work_dir / "vace_source.mp4"
     vace_mask = work_dir / "vace_mask.mp4"
     vace_condition = work_dir / "vace_condition.mp4"
     diffusion_output = work_dir / "diffusion_inpainted.mp4"
-    source_geometry_repair = work_dir / "diffusion_source_geometry.mp4"
-    silent_composite = work_dir / "source_preserving_composite.mp4"
+    source_geometry_repair = work_dir / "diffusion_source_geometry.mkv"
+    silent_composite = work_dir / "source_preserving_composite.mkv"
 
     prepare_source(input_video, source_mp4)
 
@@ -1373,22 +1670,79 @@ def main() -> None:
         tracking_height,
         anchor_index,
     )
+    anchor_tracking_mask = cv2.imread(
+        str(tracked_masks / f"{anchor_index:06d}.png"),
+        cv2.IMREAD_GRAYSCALE,
+    )
+    if anchor_tracking_mask is None:
+        raise RuntimeError("Could not read optical-flow anchor mask for SAM2 refinement")
+    build_semantic_composite_masks(
+        extracted_frames,
+        tracked_masks,
+        composite_masks,
+        source_frame_count,
+        tracking_width,
+        tracking_height,
+        anchor_index,
+        is_fixed_screen_selection(anchor_tracking_mask, tracking_width, tracking_height),
+    )
 
     emit_stage("diffusion_inpainting", 50, "Running Wan VACE diffusion inpainting")
-    target_width, target_height, size_name = vace_dimensions(source_width, source_height)
+    source_anchor_mask = cv2.resize(
+        anchor_tracking_mask,
+        (source_width, source_height),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    repair_roi = (
+        fixed_repair_roi(source_anchor_mask, source_width, source_height)
+        if is_fixed_screen_selection(anchor_tracking_mask, tracking_width, tracking_height)
+        else None
+    )
+    diffusion_source = source_mp4
+    diffusion_masks = tracked_masks
+    diffusion_width = source_width
+    diffusion_height = source_height
+    mask_geometry_width = tracking_width
+    mask_geometry_height = tracking_height
+    if repair_roi is not None:
+        crop_source_for_fixed_roi(source_mp4, fixed_roi_source, repair_roi)
+        crop_masks_for_fixed_roi(
+            tracked_masks,
+            fixed_roi_masks,
+            source_frame_count,
+            tracking_width,
+            tracking_height,
+            source_width,
+            source_height,
+            repair_roi,
+        )
+        diffusion_source = fixed_roi_source
+        diffusion_masks = fixed_roi_masks
+        diffusion_width = repair_roi[2]
+        diffusion_height = repair_roi[3]
+        mask_geometry_width = diffusion_width
+        mask_geometry_height = diffusion_height
+        print(
+            "High-resolution fixed-mark ROI enabled: "
+            f"roi={repair_roi}, source={source_width}x{source_height}, "
+            f"effective_scale={min(832 / diffusion_width, 480 / diffusion_height):.3f}",
+            flush=True,
+        )
+
+    target_width, target_height, size_name = vace_dimensions(diffusion_width, diffusion_height)
     scaled_width, scaled_height, pad_x, pad_y = build_vace_source(
-        source_mp4,
+        diffusion_source,
         vace_source,
-        source_width,
-        source_height,
+        diffusion_width,
+        diffusion_height,
         target_width,
         target_height,
     )
     build_vace_mask_video(
-        tracked_masks,
+        diffusion_masks,
         source_fps,
-        tracking_width,
-        tracking_height,
+        mask_geometry_width,
+        mask_geometry_height,
         source_frame_count,
         vace_mask,
         target_width,
@@ -1405,8 +1759,8 @@ def main() -> None:
     prepare_repair_at_source_geometry(
         diffusion_output,
         source_geometry_repair,
-        source_width,
-        source_height,
+        diffusion_width,
+        diffusion_height,
         source_fps,
         source_frame_count,
         scaled_width,
@@ -1417,11 +1771,12 @@ def main() -> None:
     raw_composite = source_preserving_composite(
         source_mp4,
         source_geometry_repair,
-        tracked_masks,
+        composite_masks,
         silent_composite,
         source_fps,
         source_width,
         source_height,
+        repair_roi,
     )
     audio_copied_bit_exactly = mux_original_audio(
         raw_composite,

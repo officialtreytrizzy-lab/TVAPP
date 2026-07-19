@@ -16,6 +16,7 @@ PIPELINES = ROOT / "gpu-worker" / "pipelines"
 sys.path.insert(0, str(PIPELINES))
 
 import optical_flow_vace_inpaint as pipeline  # noqa: E402
+import sam2_refinement  # noqa: E402
 
 WIDTH = 320
 HEIGHT = 180
@@ -134,6 +135,26 @@ def verify_fixed_screen_selection(root: Path) -> None:
 
 
 
+def verify_fixed_roi_geometry() -> None:
+    mask = np.zeros((720, 1280), dtype=np.uint8)
+    cv2.ellipse(mask, (1164, 602), (38, 38), 0, 0, 360, 255, -1)
+    roi = pipeline.fixed_repair_roi(mask, 1280, 720)
+    if roi is None:
+        raise AssertionError("Compact fixed mark did not receive a high-resolution repair ROI")
+    x, y, width, height = roi
+    if not (x <= 1126 and y <= 564 and x + width > 1202 and y + height > 640):
+        raise AssertionError(f"Fixed repair ROI does not contain the selected mark: {roi}")
+    if width * height >= 1280 * 720 * 0.55:
+        raise AssertionError(f"Fixed repair ROI is too large to improve effective resolution: {roi}")
+    full_scale = min(832 / 1280, 480 / 720)
+    roi_scale = min(832 / width, 480 / height)
+    if roi_scale < full_scale * 2.0:
+        raise AssertionError(
+            f"Fixed repair ROI did not at least double effective diffusion resolution: "
+            f"full={full_scale:.3f}, roi={roi_scale:.3f}, geometry={roi}"
+        )
+
+
 def verify_vace_condition_mask(root: Path) -> None:
     source_path = root / "condition_source.mp4"
     mask_path = root / "condition_mask.mp4"
@@ -184,6 +205,70 @@ def verify_vace_condition_mask(root: Path) -> None:
         raise AssertionError(
             f"Black mask did not retain source pixels: actual={retained_mean.tolist()}"
         )
+
+
+def verify_sam2_flow_envelope() -> None:
+    flow = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    cv2.ellipse(flow, (280, 150), (18, 13), 0, 0, 360, 255, -1)
+    semantic = np.zeros_like(flow)
+    cv2.rectangle(semantic, (220, 95), (319, 179), 255, -1)
+    fused = sam2_refinement.fuse_semantic_mask(flow, semantic)
+
+    envelope = cv2.dilate(
+        flow,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25)),
+        iterations=1,
+    )
+    if np.any((fused > 24) & (envelope == 0)):
+        raise AssertionError("SAM2 refinement escaped the optical-flow safety envelope")
+    core = cv2.erode(
+        flow,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    if np.any((core > 24) & (fused == 0)):
+        raise AssertionError("SAM2 refinement removed pixels from the authoritative flow core")
+
+
+def verify_patch_harmonizer() -> None:
+    yy, xx = np.mgrid[0:HEIGHT, 0:WIDTH]
+    pristine = np.zeros((HEIGHT, WIDTH, 3), dtype=np.float32)
+    pristine[:, :, 0] = 32 + xx * 0.22 + 5 * np.sin(xx / 4.0)
+    pristine[:, :, 1] = 48 + yy * 0.28 + 4 * np.cos(yy / 3.0)
+    pristine[:, :, 2] = 72 + xx * 0.10 + yy * 0.12
+    checker = (((xx // 3 + yy // 3) % 2) * 5 - 2.5)[:, :, None]
+    pristine = np.clip(pristine + checker, 0, 255).astype(np.uint8)
+
+    mask = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    cv2.ellipse(mask, (276, 145), (23, 18), 0, 0, 360, 255, -1)
+    source = pristine.copy()
+    cv2.putText(source, "TV", (258, 153), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 240), 2, cv2.LINE_AA)
+    repair = cv2.GaussianBlur(pristine, (0, 0), 1.8).astype(np.int16)
+    repair += np.asarray([8, -6, 11], dtype=np.int16).reshape(1, 1, 3)
+    repair = np.clip(repair, 0, 255).astype(np.uint8)
+
+    harmonized, _state, metrics = pipeline.harmonize_composite_frame(source, repair, mask)
+    outside = mask == 0
+    inside = mask > 0
+    if not np.array_equal(harmonized[outside], source[outside]):
+        raise AssertionError("Patch harmonizer changed source pixels outside the matte")
+
+    raw_error = float(np.abs(repair[inside].astype(np.float32) - pristine[inside].astype(np.float32)).mean())
+    harmonized_error = float(
+        np.abs(harmonized[inside].astype(np.float32) - pristine[inside].astype(np.float32)).mean()
+    )
+    if harmonized_error >= raw_error * 0.88:
+        raise AssertionError(
+            f"Patch harmonizer did not materially improve the repair: raw={raw_error:.3f}, "
+            f"harmonized={harmonized_error:.3f}, metrics={metrics}"
+        )
+
+    pristine_lap = np.abs(cv2.Laplacian(cv2.cvtColor(pristine, cv2.COLOR_BGR2GRAY), cv2.CV_32F))[inside]
+    repair_lap = np.abs(cv2.Laplacian(cv2.cvtColor(repair, cv2.COLOR_BGR2GRAY), cv2.CV_32F))[inside]
+    output_lap = np.abs(cv2.Laplacian(cv2.cvtColor(harmonized, cv2.COLOR_BGR2GRAY), cv2.CV_32F))[inside]
+    target_detail = float(pristine_lap.mean())
+    if abs(float(output_lap.mean()) - target_detail) >= abs(float(repair_lap.mean()) - target_detail):
+        raise AssertionError("Patch harmonizer did not restore high-frequency texture toward the source")
 
 
 def verify_full_pipeline_with_stubbed_diffusion(root: Path) -> None:
@@ -300,6 +385,8 @@ def verify_full_pipeline_with_stubbed_diffusion(root: Path) -> None:
         "audio_preserving_export",
         "validation",
     ]
+    if "High-resolution fixed-mark ROI enabled" not in stage_log:
+        raise AssertionError(f"Full pipeline did not use the fixed-mark ROI path:\n{stage_log}")
     positions = [stage_log.find(f'"name":"{stage}"') for stage in expected_stages]
     if any(position < 0 for position in positions) or positions != sorted(positions):
         raise AssertionError(f"Pipeline stages were missing or out of order: {positions}\n{stage_log}")
@@ -345,12 +432,15 @@ def main() -> None:
     try:
         verify_moving_mask_tracking(root)
         verify_fixed_screen_selection(root)
+        verify_fixed_roi_geometry()
         verify_vace_condition_mask(root)
+        verify_sam2_flow_envelope()
+        verify_patch_harmonizer()
         verify_full_pipeline_with_stubbed_diffusion(root)
         verify_vace_frame_contract()
         print(
             "Optical-flow VACE regression passed: moving masks track, fixed inset masks do not drift, "
-            "and diffusion chunks obey the 4n+1/81-frame contract."
+            "SAM2 stays inside the flow envelope, harmonized patches preserve source pixels, and diffusion chunks obey the 4n+1/81-frame contract."
         )
     finally:
         shutil.rmtree(root, ignore_errors=True)

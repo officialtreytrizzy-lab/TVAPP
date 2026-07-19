@@ -15,6 +15,7 @@ const requiredFiles = [
   'gpu-worker/modal_app.py',
   'gpu-worker/main.py',
   'gpu-worker/pipelines/optical_flow_vace_inpaint.py',
+  'gpu-worker/pipelines/sam2_refinement.py',
   'gpu-worker/requirements.txt',
   'scripts/verify_optical_flow_vace_pipeline.py',
   'vercel.json',
@@ -96,7 +97,7 @@ requireText('gpu-worker/modal_app.py', 'flash_attn-2.7.4.post1+cu12torch2.5cxx11
 requireText('gpu-worker/modal_app.py', 'pip install einops==0.8.1', 'Wan VACE must receive its explicit tensor-rearrangement dependency');
 requireText('gpu-worker/modal_app.py', 'import flash_attn', 'worker startup must verify Flash Attention imports');
 forbidText('gpu-worker/modal_app.py', '/opt/ProPainter', 'production image must not install the retired ProPainter stack');
-forbidText('gpu-worker/modal_app.py', '/opt/sam2', 'production image must not install the retired SAM2 stack');
+requireText('gpu-worker/modal_app.py', '/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt', 'production image must include SAM2-tiny for constrained matte refinement');
 forbidText('gpu-worker/modal_app.py', 'python /app/pipelines/sam2_propainter_verified.py', 'Modal must not execute the retired production entrypoint');
 
 // Worker status must expose the real four stages, not cosmetic labels.
@@ -125,7 +126,15 @@ requireText(pipeline, '"vace-1.3B"', 'stage 3 must execute Wan VACE diffusion');
 requireText(pipeline, '"--src_video"', 'diffusion must receive the source video');
 requireText(pipeline, '"--src_mask"', 'diffusion must receive the tracked temporal mask');
 requireText(pipeline, 'def run_diffusion_inpainting(', 'long clips must be processed as overlapping diffusion chunks');
+requireText(pipeline, 'def fixed_repair_roi(', 'compact fixed marks must render through a higher-resolution context crop');
+requireText(pipeline, 'def crop_source_for_fixed_roi(', 'fixed-mark source video must be cropped losslessly before diffusion');
+requireText(pipeline, 'def crop_masks_for_fixed_roi(', 'tracked masks must map exactly into the fixed repair ROI');
 requireText(pipeline, 'def source_preserving_composite(', 'only repaired mask pixels may replace source pixels');
+requireText(pipeline, 'def harmonize_composite_frame(', 'final patches must receive adaptive color and texture harmonization');
+requireText(pipeline, 'cv2.seamlessClone', 'patch boundaries must use gradient-domain blending');
+requireText(pipeline, 'cv2.VideoWriter_fourcc(*\"FFV1\")', 'the intermediate composite must remain lossless');
+requireText('gpu-worker/pipelines/sam2_refinement.py', 'def fuse_semantic_mask(', 'SAM2 output must be constrained to the optical-flow envelope');
+requireText('gpu-worker/pipelines/sam2_refinement.py', 'not fixed_screen_position', 'SAM2 must not alter moving-object tracking');
 requireText(pipeline, 'def mux_original_audio(', 'stage 4 must restore the original soundtrack');
 requireText(pipeline, '"1:a?"', 'audio export must map original audio when present');
 requireText(pipeline, 'Original audio stream copied without re-encoding', 'compatible source audio must be stream-copied');
@@ -135,12 +144,13 @@ requireText(pipeline, 'emit_stage("frame_extraction"', 'stage order must be mach
 requireText(pipeline, 'emit_stage("optical_flow_tracking"', 'optical-flow stage must be machine-readable');
 requireText(pipeline, 'emit_stage("diffusion_inpainting"', 'diffusion stage must be machine-readable');
 requireText(pipeline, '"audio_preserving_export"', 'export stage must be machine-readable');
-forbidText(pipeline, 'import sam2', 'the exact production pipeline must not import SAM2');
+requireText(pipeline, 'build_semantic_composite_masks', 'SAM2 may refine the composite matte without replacing optical-flow tracking');
 forbidText(pipeline, 'ProPainter', 'the exact production pipeline must not execute ProPainter');
 forbidText(pipeline, 'cv2.inpaint', 'the diffusion stage must not secretly fall back to local OpenCV inpaint');
 
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_moving_mask_tracking', 'regression test must cover moving optical-flow tracking');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_fixed_screen_selection', 'regression test must cover fixed inset marks');
+requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_fixed_roi_geometry', 'regression test must prove fixed marks gain effective diffusion resolution');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_vace_condition_mask', 'regression test must verify gray generated regions and retained black-mask pixels');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_full_pipeline_with_stubbed_diffusion', 'regression test must exercise the complete four-stage path and audio export');
 requireText('scripts/verify_optical_flow_vace_pipeline.py', 'verify_vace_frame_contract', 'regression test must cover VACE frame-count constraints');
