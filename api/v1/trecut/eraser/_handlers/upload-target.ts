@@ -17,6 +17,15 @@ export default async function handler(req: any, res: any) {
   if (req.method !== 'GET') return methodNotAllowed(res, ['GET']);
 
   try {
+    // This endpoint is runtime configuration, not a cacheable document. A 304
+    // has no JSON body and caused the browser client to treat the GPU worker as
+    // unavailable, which immediately failed otherwise valid eraser jobs.
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.setHeader('CDN-Cache-Control', 'no-store');
+    res.setHeader('Vercel-CDN-Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
     const base = (modalBaseUrl() || DEFAULT_WORKER_BASE).replace(/\/$/, '');
     if (!base) return error(res, 503, 'GPU worker is not configured.', 'worker_not_configured');
 
