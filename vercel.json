@@ -3,7 +3,10 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "git": {
-    "deploymentEnabled": false
+    "deploymentEnabled": {
+      "main": true,
+      "*": false
+    }
   },
   "env": {
     "VITE_ERASER_GPU_WORKER_URL": "https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run",
