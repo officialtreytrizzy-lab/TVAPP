@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  MODAL_EXPECTED_WORKSPACE: wthemif
+  MODAL_EXPECTED_WORKSPACE: officialtreytrizzy-lab
 
 jobs:
   modal-auth:
@@ -31,7 +31,7 @@ jobs:
       - name: Install Modal CLI quietly
         run: python -m pip install --quiet --upgrade modal
 
-      - name: Validate wthemif Modal token
+      - name: Validate officialtreytrizzy-lab Modal token
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -66,7 +66,7 @@ jobs:
       - name: Install Modal CLI
         run: python -m pip install --quiet --upgrade modal
 
-      - name: Confirm wthemif deployment workspace
+      - name: Confirm officialtreytrizzy-lab deployment workspace
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -77,7 +77,7 @@ jobs:
             exit 1
           }
 
-      - name: Deploy A10G worker to wthemif
+      - name: Deploy A10G worker to officialtreytrizzy-lab
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}

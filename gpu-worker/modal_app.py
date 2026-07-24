@@ -5,13 +5,13 @@ import modal
 
 # Deploy with:
 #   pip install modal
-#   modal token new --profile wthemif --activate
-#   MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
+#   modal token new --profile officialtreytrizzy-lab --activate
+#   MODAL_PROFILE=officialtreytrizzy-lab modal deploy gpu-worker/modal_app.py
 #
 # The deployed URL becomes VITE_ERASER_GPU_WORKER_URL in Vercel.
 # Wan model weights live in the Modal volume mounted at /models.
 # Download/update weights with:
-#   MODAL_PROFILE=wthemif modal run gpu-worker/modal_app.py::download_models
+#   MODAL_PROFILE=officialtreytrizzy-lab modal run gpu-worker/modal_app.py::download_models
 
 wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
 
@@ -123,7 +123,7 @@ def download_models():
     image=worker_image,
     gpu="A10G",
     timeout=60 * 45,
-    scaledown_window=60 * 50,
+    scaledown_window=60,
     max_containers=1,
     volumes={"/models": wan_models},
 )
@@ -159,7 +159,7 @@ def fastapi_app():
     image=worker_image,
     gpu="A10G",
     timeout=60 * 20,
-    scaledown_window=60 * 20,
+    scaledown_window=60,
     max_containers=1,
 )
 @modal.concurrent(max_inputs=1)

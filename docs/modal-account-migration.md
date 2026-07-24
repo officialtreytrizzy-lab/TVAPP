@@ -29,17 +29,17 @@ Run these commands from the repo root on the computer that should deploy to the 
 
 ```bash
 python -m pip install --upgrade modal
-modal token new --profile wthemif --activate
+modal token new --profile officialtreytrizzy-lab --activate
 modal profile current
 modal token info
 ```
 
-Stop if `modal profile current` does not show `wthemif`.
+Stop if `modal profile current` does not show `officialtreytrizzy-lab`.
 
 ### 2. Deploy the worker into the new Modal account
 
 ```bash
-MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
+MODAL_PROFILE=officialtreytrizzy-lab modal deploy gpu-worker/modal_app.py
 ```
 
 Modal will print the new web URL. It should look like this:
@@ -52,13 +52,15 @@ Copy that exact URL.
 
 ### 3. Populate the model volume in the new Modal account
 
-The new Modal account starts with a fresh `tvapp-wan-models` volume. Run:
+Transfer the existing weights through your local computer. These volume commands do not launch a Modal container or GPU:
 
 ```bash
-MODAL_PROFILE=wthemif modal run gpu-worker/modal_app.py::download_models
+MODAL_PROFILE=wthemif modal volume get tvapp-wan-models /Wan2.1-VACE-1.3B ./Wan2.1-VACE-1.3B
+MODAL_PROFILE=officialtreytrizzy-lab modal volume create tvapp-wan-models
+MODAL_PROFILE=officialtreytrizzy-lab modal volume put tvapp-wan-models ./Wan2.1-VACE-1.3B /Wan2.1-VACE-1.3B
 ```
 
-This downloads `Wan-AI/Wan2.1-VACE-1.3B` into `/models/Wan2.1-VACE-1.3B` inside the Modal volume.
+This copies the existing `Wan-AI/Wan2.1-VACE-1.3B` files into `/models/Wan2.1-VACE-1.3B` in the new workspace without running the model downloader function.
 
 ### 4. Update Vercel environment variables
 
@@ -94,7 +96,7 @@ A `404` for a fake job ID is acceptable. A DNS, auth, or connection error means 
 ## Important notes
 
 - The old Modal account's volume contents do not automatically move to the new account.
-- The new account must rebuild the Modal image and download model weights again.
+- The new account must build its own Modal image, but the existing model volume files can be copied with `modal volume get`/`put` without starting a GPU.
 - Keep the old Modal app live until the new worker URL is confirmed from Vercel health and one real job test.
 - Do not set Modal token values in `VITE_` variables. Anything beginning with `VITE_` may become browser-visible.
 - The browser/API only needs the deployed worker URL, not the Modal token.
