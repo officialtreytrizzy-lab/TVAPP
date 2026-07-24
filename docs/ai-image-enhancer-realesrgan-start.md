@@ -40,7 +40,7 @@ The new Modal ASGI app exposes:
 Redeploy the Modal worker:
 
 ```bash
-MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
+MODAL_PROFILE=officialtreytrizzy-lab modal deploy gpu-worker/modal_app.py
 ```
 
 Modal should show an additional web endpoint for `image_enhancer_app`.
