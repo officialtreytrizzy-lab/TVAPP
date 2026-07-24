@@ -84,6 +84,8 @@ requireText('src/components/eraser/Editor.tsx', 'const recoverableOutputUrl = ou
 requireText('src/lib/eraser/api.ts', 'await requestPersistentDeviceStorage();', 'durable storage must be requested before writing the completed output');
 requireText('src/lib/eraser/api.ts', "caches.open(OUTPUT_CACHE)", 'large mobile outputs need Cache Storage as a fallback when IndexedDB rejects the Blob');
 requireText('src/components/AppLayout.tsx', 'Save to this device', 'completed jobs with a failed first save must expose a retry action');
+requireText('src/components/AppLayout.tsx', 'Recover & save to device', 'legacy completed jobs must remain recoverable');
+requireText('src/lib/eraser/api.ts', 'discoverWorkerOutputUrl(job.job_id)', 'legacy completed records must reconstruct the worker output route');
 requireText('src/lib/eraser/api.ts', 'pruneCompletedJobsForCurrentDevice', 'saving a fourth completed job must evict the oldest');
 requireText('src/lib/eraser/api.ts', 'deleteOutput(job.final_output_key)', 'eviction must remove the saved IndexedDB video, not only metadata');
 requireText('src/lib/eraser/api.ts', 'listRecentCompletedJobs', 'the library must expose only recent completed jobs');

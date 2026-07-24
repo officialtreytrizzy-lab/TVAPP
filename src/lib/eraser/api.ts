@@ -380,6 +380,22 @@ async function deleteOutput(key: string | null): Promise<void> {
   ]);
 }
 
+async function discoverWorkerOutputUrl(jobId: string): Promise<string | null> {
+  try {
+    const response = await fetch('/api/v1/trecut/eraser/upload-target', {
+      method: 'GET',
+      cache: 'no-store',
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const workerBase = String(payload.worker_base || payload.workerBase || '').replace(/\/$/, '');
+    if (!workerBase) return null;
+    return `${workerBase}/v1/video-eraser/jobs/${encodeURIComponent(jobId)}/output`;
+  } catch {
+    return null;
+  }
+}
+
 async function requestPersistentDeviceStorage(): Promise<void> {
   try {
     if (typeof navigator !== 'undefined' && navigator.storage?.persist) {
@@ -583,14 +599,14 @@ export const eraserApi = {
     await pruneCompletedJobsForCurrentDevice();
     const deviceId = currentDeviceId();
     return readJobs()
-      .filter((job) => job.device_id === deviceId && job.phase === 'completed' && (!!job.final_output_key || !!job.final_output_url))
+      .filter((job) => job.device_id === deviceId && job.phase === 'completed')
       .sort((a, b) => completedSortTime(b) - completedSortTime(a))
       .slice(0, MAX_RECENT_COMPLETED_JOBS);
   },
 
   getDeviceIdentity: (): DeviceIdentity => getDeviceIdentity(),
 
-  resolveOutputUrl: async (job: Pick<LocalJob, 'final_output_key' | 'final_output_url'>): Promise<string | null> => {
+  resolveOutputUrl: async (job: Pick<LocalJob, 'job_id' | 'final_output_key' | 'final_output_url'>): Promise<string | null> => {
     if (job.final_output_key) {
       try {
         const stored = await getOutput(job.final_output_key);
@@ -599,7 +615,10 @@ export const eraserApi = {
         // Fall back to the retained worker URL so the user can retry the device save.
       }
     }
-    return job.final_output_url ?? null;
+    if (job.final_output_url) return job.final_output_url;
+    // Compatibility recovery for jobs completed before the durable-save fix.
+    // Those records were marked completed but stored neither a key nor URL.
+    return discoverWorkerOutputUrl(job.job_id);
   },
 
   deleteJob: async (jobId: string): Promise<void> => {
