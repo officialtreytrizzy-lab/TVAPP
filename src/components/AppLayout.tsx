@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import Editor from './eraser/Editor';
 import { ERASER_LIBRARY_EVENT, eraserApi, type DeviceIdentity, type LocalJob } from '@/lib/eraser/api';
-import { Wand2, MousePointerClick, Scan, Film, Sparkles, Github, Mail, History, X, Play, Download, Trash2, Smartphone, Clapperboard, Code2 } from 'lucide-react';
+import { Wand2, MousePointerClick, Scan, Film, Sparkles, Github, Mail, History, X, Play, Download, Trash2, Smartphone, Clapperboard, Code2, Save } from 'lucide-react';
 
 const HERO = 'https://d64gsuwffb70l.cloudfront.net/6a407d389662950bf1dfa607_1782611760246_970a59e4.jpg';
 const STEPS = [
@@ -22,14 +22,18 @@ function HistoryDrawer({
   onClose,
   onReopen,
   onDownload,
+  onSaveToDevice,
   onDelete,
+  savingJobId,
 }: {
   jobs: LocalJob[];
   device: DeviceIdentity;
   onClose: () => void;
   onReopen: (job: LocalJob) => void;
   onDownload: (job: LocalJob) => void;
+  onSaveToDevice: (job: LocalJob) => void;
   onDelete: (job: LocalJob) => void;
+  savingJobId: string | null;
 }) {
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/60" onClick={onClose}>
@@ -56,7 +60,7 @@ function HistoryDrawer({
         </div>
 
         <p className="mb-4 text-xs leading-5 text-slate-400">
-          The three newest completed eraser videos are stored privately on this device. Saving a fourth automatically removes the oldest.
+          The three newest completed eraser videos are kept here. If the first device write fails, the completed job stays visible so you can retry without running the GPU again.
         </p>
 
         {jobs.length === 0 && (
@@ -84,6 +88,9 @@ function HistoryDrawer({
               <p className="mt-2 text-xs text-slate-500">
                 Completed {new Date(job.completed_at || job.updated_at).toLocaleString()}
               </p>
+              <p className={`mt-2 text-xs ${job.final_output_key ? 'text-emerald-300' : 'text-amber-300'}`}>
+                {job.final_output_key ? 'Saved on this device' : 'Completed — device save needs retry'}
+              </p>
               <div className="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2">
                 <button onClick={() => onReopen(job)} className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-violet-600 px-3 py-2 text-xs font-medium text-white hover:bg-violet-500">
                   <Play className="h-3.5 w-3.5" /> Preview
@@ -95,6 +102,15 @@ function HistoryDrawer({
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
               </div>
+              {!job.final_output_key && job.final_output_url && (
+                <button
+                  onClick={() => onSaveToDevice(job)}
+                  disabled={savingJobId === job.id}
+                  className="mt-2 inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-amber-500/15 px-3 py-2 text-xs font-medium text-amber-200 ring-1 ring-amber-500/30 hover:bg-amber-500/25 disabled:cursor-wait disabled:opacity-60"
+                >
+                  <Save className="h-3.5 w-3.5" /> {savingJobId === job.id ? 'Saving…' : 'Save to this device'}
+                </button>
+              )}
             </li>
           ))}
         </ul>
@@ -114,6 +130,7 @@ export default function AppLayout() {
   const [device] = useState<DeviceIdentity>(() => eraserApi.getDeviceIdentity());
   const [reopen, setReopen] = useState<ReopenState | null>(null);
   const [reopenError, setReopenError] = useState<string | null>(null);
+  const [savingJobId, setSavingJobId] = useState<string | null>(null);
 
   const loadJobs = useCallback(async () => {
     const rows = await eraserApi.listRecentCompletedJobs();
@@ -163,6 +180,25 @@ export default function AppLayout() {
       window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
     } catch (error) {
       setReopenError((error as Error).message);
+    }
+  };
+
+  const saveJobToDevice = async (job: LocalJob) => {
+    setReopenError(null);
+    setSavingJobId(job.id);
+    try {
+      const sourceUrl = await eraserApi.resolveOutputUrl(job);
+      if (!sourceUrl) throw new Error('The completed worker copy is no longer available.');
+      const response = await fetch(sourceUrl);
+      if (!response.ok) throw new Error(`Could not download the completed video again (HTTP ${response.status}).`);
+      const blob = await response.blob();
+      if (!blob.size) throw new Error('The completed worker copy was empty.');
+      await eraserApi.uploadOutput(job.job_id, blob, job.output_mime || blob.type || 'video/mp4');
+      await loadJobs();
+    } catch (error) {
+      setReopenError(`Could not save this completed job to the device: ${(error as Error).message}`);
+    } finally {
+      setSavingJobId(null);
     }
   };
 
@@ -272,7 +308,9 @@ export default function AppLayout() {
           onClose={() => setShowHistory(false)}
           onReopen={reopenJob}
           onDownload={downloadJob}
+          onSaveToDevice={saveJobToDevice}
           onDelete={deleteJob}
+          savingJobId={savingJobId}
         />
       )}
     </div>

@@ -236,17 +236,21 @@ export default function Editor() {
         }).catch(() => undefined);
       }
 
+      // Never hide a successful render just because the first device write failed.
+      // Preserve the worker URL so Recent Jobs can show the completed item and retry
+      // the local save without running the GPU pipeline again.
+      const recoverableOutputUrl = out.remoteUrl || out.finalUrl;
       await eraserApi.complete({
         jobId,
-        previewUrl: savedLibraryUrl || undefined,
-        finalOutputUrl: savedLibraryUrl || undefined,
+        previewUrl: savedLibraryUrl || recoverableOutputUrl || undefined,
+        finalOutputUrl: savedLibraryUrl || recoverableOutputUrl || undefined,
         outputMime: out.mimeType,
         audioPreserved: out.hasAudio,
       });
 
       const completedOutput: PipelineOutput = {
         ...out,
-        finalUrl: savedLibraryUrl || out.finalUrl,
+        finalUrl: savedLibraryUrl || recoverableOutputUrl,
       };
       outputRef.current = completedOutput;
       setFinalUrl(completedOutput.finalUrl);

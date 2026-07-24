@@ -9,6 +9,8 @@ const DEVICE_CREDENTIAL_KEY = 'etreyser.device.credential.v1';
 const DB_NAME = 'eraserai-local-output-db';
 const DB_VERSION = 1;
 const OUTPUT_STORE = 'outputs';
+const OUTPUT_CACHE = 'etreyser-local-output-cache-v1';
+const OUTPUT_CACHE_PATH = '/__etreyser-local-output__/';
 const MAX_RECENT_COMPLETED_JOBS = 3;
 export const ERASER_LIBRARY_EVENT = 'etreyser:library-updated';
 
@@ -265,40 +267,117 @@ function openOutputDb(): Promise<IDBDatabase> {
   });
 }
 
-async function putOutput(key: string, blob: Blob, mimeType: string): Promise<void> {
+function outputCacheRequest(key: string): Request {
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://local.invalid';
+  return new Request(`${origin}${OUTPUT_CACHE_PATH}${encodeURIComponent(key)}`, { method: 'GET' });
+}
+
+async function putOutputIndexedDb(key: string, blob: Blob, mimeType: string): Promise<void> {
   const db = await openOutputDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(OUTPUT_STORE, 'readwrite');
-    tx.objectStore(OUTPUT_STORE).put({ key, blob, mimeType, createdAt: nowIso() });
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error('Could not save cleaned video locally.'));
-  });
-  db.close();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(OUTPUT_STORE, 'readwrite');
+      tx.objectStore(OUTPUT_STORE).put({ key, blob, mimeType, createdAt: nowIso() });
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB aborted the cleaned-video write.'));
+      tx.onerror = () => reject(tx.error ?? new Error('Could not save cleaned video in IndexedDB.'));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function putOutputCache(key: string, blob: Blob, mimeType: string): Promise<void> {
+  if (typeof caches === 'undefined') throw new Error('Cache Storage is not available in this browser.');
+  const cache = await caches.open(OUTPUT_CACHE);
+  await cache.put(outputCacheRequest(key), new Response(blob, {
+    headers: {
+      'Content-Type': mimeType || blob.type || 'video/mp4',
+      'X-ETreyser-Created-At': nowIso(),
+    },
+  }));
+}
+
+async function putOutput(key: string, blob: Blob, mimeType: string): Promise<void> {
+  let indexedDbError: Error | null = null;
+  try {
+    await putOutputIndexedDb(key, blob, mimeType);
+    return;
+  } catch (error) {
+    indexedDbError = error instanceof Error ? error : new Error(String(error));
+  }
+
+  try {
+    await putOutputCache(key, blob, mimeType);
+    return;
+  } catch (cacheError) {
+    const cacheMessage = cacheError instanceof Error ? cacheError.message : String(cacheError);
+    throw new Error(`Device storage failed. IndexedDB: ${indexedDbError.message}. Cache Storage: ${cacheMessage}`);
+  }
+}
+
+async function getOutputIndexedDb(key: string): Promise<{ blob: Blob; mimeType: string } | null> {
+  const db = await openOutputDb();
+  try {
+    return await new Promise<{ blob: Blob; mimeType: string } | null>((resolve, reject) => {
+      const tx = db.transaction(OUTPUT_STORE, 'readonly');
+      const req = tx.objectStore(OUTPUT_STORE).get(key);
+      req.onsuccess = () => resolve(req.result ? { blob: req.result.blob, mimeType: req.result.mimeType } : null);
+      req.onerror = () => reject(req.error ?? new Error('Could not read cleaned video from IndexedDB.'));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function getOutputCache(key: string): Promise<{ blob: Blob; mimeType: string } | null> {
+  if (typeof caches === 'undefined') return null;
+  const cache = await caches.open(OUTPUT_CACHE);
+  const response = await cache.match(outputCacheRequest(key));
+  if (!response) return null;
+  const blob = await response.blob();
+  return { blob, mimeType: response.headers.get('content-type') || blob.type || 'video/mp4' };
 }
 
 async function getOutput(key: string): Promise<{ blob: Blob; mimeType: string } | null> {
-  const db = await openOutputDb();
-  const result = await new Promise<{ blob: Blob; mimeType: string } | null>((resolve, reject) => {
-    const tx = db.transaction(OUTPUT_STORE, 'readonly');
-    const req = tx.objectStore(OUTPUT_STORE).get(key);
-    req.onsuccess = () => resolve(req.result ? { blob: req.result.blob, mimeType: req.result.mimeType } : null);
-    req.onerror = () => reject(req.error ?? new Error('Could not read cleaned video locally.'));
-  });
-  db.close();
-  return result;
+  try {
+    const indexed = await getOutputIndexedDb(key);
+    if (indexed?.blob) return indexed;
+  } catch {
+    // Some mobile browsers reject large Blob values in IndexedDB. Try Cache Storage.
+  }
+  try {
+    return await getOutputCache(key);
+  } catch {
+    return null;
+  }
 }
 
+async function deleteOutputIndexedDb(key: string): Promise<void> {
+  const db = await openOutputDb();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(OUTPUT_STORE, 'readwrite');
+      tx.objectStore(OUTPUT_STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error('IndexedDB aborted the delete.'));
+      tx.onerror = () => reject(tx.error ?? new Error('Could not delete the IndexedDB video.'));
+    });
+  } finally {
+    db.close();
+  }
+}
 
 async function deleteOutput(key: string | null): Promise<void> {
   if (!key) return;
-  const db = await openOutputDb();
-  await new Promise<void>((resolve, reject) => {
-    const tx = db.transaction(OUTPUT_STORE, 'readwrite');
-    tx.objectStore(OUTPUT_STORE).delete(key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error('Could not delete the saved video.'));
-  });
-  db.close();
+  await Promise.all([
+    deleteOutputIndexedDb(key).catch(() => undefined),
+    (async () => {
+      if (typeof caches === 'undefined') return;
+      const cache = await caches.open(OUTPUT_CACHE);
+      await cache.delete(outputCacheRequest(key));
+    })().catch(() => undefined),
+  ]);
 }
 
 async function requestPersistentDeviceStorage(): Promise<void> {
@@ -488,6 +567,7 @@ export const eraserApi = {
       appendLog(cur, `saved output locally key=${key}`);
       return cur;
     });
+    notifyLibraryUpdated();
 
     return objectUrl;
   },
@@ -503,7 +583,7 @@ export const eraserApi = {
     await pruneCompletedJobsForCurrentDevice();
     const deviceId = currentDeviceId();
     return readJobs()
-      .filter((job) => job.device_id === deviceId && job.phase === 'completed' && !!job.final_output_key)
+      .filter((job) => job.device_id === deviceId && job.phase === 'completed' && (!!job.final_output_key || !!job.final_output_url))
       .sort((a, b) => completedSortTime(b) - completedSortTime(a))
       .slice(0, MAX_RECENT_COMPLETED_JOBS);
   },
@@ -512,8 +592,12 @@ export const eraserApi = {
 
   resolveOutputUrl: async (job: Pick<LocalJob, 'final_output_key' | 'final_output_url'>): Promise<string | null> => {
     if (job.final_output_key) {
-      const stored = await getOutput(job.final_output_key);
-      if (stored?.blob) return URL.createObjectURL(stored.blob);
+      try {
+        const stored = await getOutput(job.final_output_key);
+        if (stored?.blob) return URL.createObjectURL(stored.blob);
+      } catch {
+        // Fall back to the retained worker URL so the user can retry the device save.
+      }
     }
     return job.final_output_url ?? null;
   },

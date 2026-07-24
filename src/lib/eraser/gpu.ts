@@ -393,7 +393,7 @@ async function materializeOutput(outputUrl: string, input: GpuRemovalInput): Pro
     // Could not even reach the output via fetch (CORS/network). Fall back to
     // letting the <video> element try progressive playback directly, so we do
     // not regress desktop browsers that handle it fine.
-    return makePipelineOutput(outputUrl, input);
+    return makePipelineOutput(outputUrl, input, undefined, outputUrl);
   }
   if (!res.ok) {
     throw new Error(
@@ -403,14 +403,15 @@ async function materializeOutput(outputUrl: string, input: GpuRemovalInput): Pro
   }
   const blob = await res.blob();
   if (!blob.size) throw new Error('eTreyser returned an empty output video (0 bytes).');
-  return makePipelineOutput(URL.createObjectURL(blob), input, blob);
+  return makePipelineOutput(URL.createObjectURL(blob), input, blob, outputUrl);
 }
 
-function makePipelineOutput(outputUrl: string, input: GpuRemovalInput, outputBlob?: Blob): PipelineOutput {
+function makePipelineOutput(outputUrl: string, input: GpuRemovalInput, outputBlob?: Blob, remoteUrl?: string): PipelineOutput {
   return {
     finalUrl: outputUrl,
     localUrl: outputUrl,
     outputBlob,
+    remoteUrl,
     mimeType: 'video/mp4',
     hasAudio: true,
     outW: input.width,
