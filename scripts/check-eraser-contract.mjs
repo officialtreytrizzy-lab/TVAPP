@@ -101,7 +101,8 @@ requireText('api/v1/direct-upload.ts', 'chunked_upload_url', 'licensed discovery
 requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'legacy base64 relay must remain size guarded');
 
 // Modal production routing and GPU constraints.
-requireText('vercel.json', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'Vercel must target the wthemif Modal worker');
+requireText('vercel.json', 'https://officialtreytrizzy-lab--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'Vercel must target the OfficialTreyTrizzy-lab Modal worker');
+forbidText('vercel.json', 'wthemif--tvapp-video-eraser-gpu', 'production must not route to the previous Modal workspace');
 forbidText('api/v1/direct-upload.ts', '.modal.run', 'direct upload discovery must not hide a hardcoded worker fallback');
 forbidText('api/v1/trecut/eraser/_handlers/upload-target.ts', '.modal.run', 'upload discovery must not hide a hardcoded worker fallback');
 forbidText('vercel.json', 'californiatrey--tvapp-video-eraser-gpu', 'production must not route to the retired Modal account');
