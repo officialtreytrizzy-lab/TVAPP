@@ -213,7 +213,7 @@ function buildRemovalForm(input: GpuRemovalInput, maskBlob: Blob): FormData {
   form.append('duration', String(duration));
   form.append('width', String(width));
   form.append('height', String(height));
-  form.append('pipeline', 'optical-flow-vace-diffusion');
+  form.append('pipeline', 'sam2-propainter');
   form.append('mask_semantics', 'alpha_gt_0_remove');
   form.append('quality', outputQuality);
   form.append('preserve_resolution', 'true');
@@ -369,7 +369,7 @@ async function runChunkedWorkerUpload(
       duration: input.duration,
       width: input.width,
       height: input.height,
-      pipeline: 'optical-flow-vace-diffusion',
+      pipeline: 'sam2-propainter',
       quality: input.outputQuality || 'source',
       preserve_resolution: true,
       preserve_fps: true,
@@ -545,7 +545,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
       duration,
       width,
       height,
-      pipeline: 'optical-flow-vace-diffusion',
+      pipeline: 'sam2-propainter',
       mask_semantics: 'alpha_gt_0_remove',
       preserve_resolution: true,
       preserve_fps: true,
@@ -568,7 +568,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
         duration,
         width,
         height,
-        pipeline: 'optical-flow-vace-diffusion',
+        pipeline: 'sam2-propainter',
         mask_semantics: 'alpha_gt_0_remove',
       },
     }),

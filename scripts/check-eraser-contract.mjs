@@ -54,9 +54,9 @@ requireText('src/lib/eraser/gpu.ts', 'selected_frame_index', 'the exact painted 
 requireText('src/lib/eraser/gpu.ts', 'preserve_resolution: true', 'source resolution must be requested');
 requireText('src/lib/eraser/gpu.ts', 'preserve_fps: true', 'source FPS must be requested');
 requireText('src/lib/eraser/gpu.ts', 'preserve_audio: true', 'original audio must be requested');
-requireText('src/lib/eraser/gpu.ts', "form.append('pipeline', 'optical-flow-vace-diffusion')", 'frontend must request the exact production pipeline');
+requireText('src/lib/eraser/gpu.ts', "form.append('pipeline', 'sam2-propainter')", 'frontend must request the SAM2 + ProPainter production pipeline');
 forbidText('src/lib/eraser/gpu.ts', 'VITE_ERASER_GPU_API_KEY', 'server credentials must never enter browser code');
-forbidText('src/lib/eraser/gpu.ts', "'sam2-propainter'", 'frontend must not request the retired SAM2/ProPainter path');
+forbidText('src/lib/eraser/gpu.ts', "'optical-flow-vace-diffusion'", 'frontend must not request the generative VACE eraser path');
 requireText('src/lib/eraser/gpu.ts', "raw.includes('frame_extraction')", 'frontend must preserve the frame-extraction phase');
 requireText('src/lib/eraser/gpu.ts', "raw.includes('optical_flow_tracking')", 'frontend must preserve the optical-flow phase');
 requireText('src/lib/eraser/gpu.ts', "raw.includes('diffusion_inpainting')", 'frontend must preserve the diffusion phase');
@@ -84,7 +84,7 @@ requireText('src/components/AppLayout.tsx', 'Recent eraser jobs', 'the user inte
 requireText('src/components/AppLayout.tsx', 'Unlocked by this device', 'the library must explain its possession-based device access');
 requireText('src/components/AppLayout.tsx', 'eraserApi.listRecentCompletedJobs()', 'the drawer must not show failed or unfinished jobs');
 
-requireText('api/_lib/modal.ts', "'optical-flow-vace-diffusion'", 'licensed API calls must use the exact production pipeline');
+requireText('api/_lib/modal.ts', "'sam2-propainter'", 'licensed API calls must use the SAM2 + ProPainter production pipeline');
 requireText('api/_lib/trecut-eraser-proxy.ts', 'TRECUT_ETREYSER_API_KEY', 'proxy must read the API key server-side');
 requireText('api/_lib/trecut-eraser-proxy.ts', 'Authorization', 'proxy must attach bearer authorization');
 requireText('api/_lib/trecut-eraser-proxy.ts', 'rewriteVideoRemovalJobPayload', 'worker URLs must be rewritten through the proxy');
@@ -95,34 +95,38 @@ requireText('src/lib/eraser/gpu.ts', 'upload-target', 'large files must upload d
 requireText('src/lib/eraser/gpu.ts', 'runChunkedWorkerUpload', 'mobile uploads must use retryable chunks');
 requireText('src/lib/eraser/gpu.ts', 'X-Chunk-SHA256', 'each upload chunk must be checksummed');
 requireText('gpu-worker/main.py', '/v1/video-eraser/uploads/{upload_id}/chunks/{chunk_index}', 'worker must accept numbered upload chunks');
-requireText('gpu-worker/main.py', 'Chunked upload verified; queued optical-flow diffusion removal', 'worker must verify the assembled upload before processing');
+requireText('gpu-worker/main.py', 'Chunked upload verified; queued SAM2 + ProPainter removal', 'worker must verify the assembled upload before processing');
 requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'chunked_upload_url', 'first-party discovery must expose chunked upload');
 requireText('api/v1/direct-upload.ts', 'chunked_upload_url', 'licensed discovery must expose chunked upload');
 requireText('src/lib/eraser/gpu.ts', 'MAX_PROXY_JSON_BYTES', 'legacy base64 relay must remain size guarded');
 
 // Modal production routing and GPU constraints.
 requireText('vercel.json', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'Vercel must target the wthemif Modal worker');
-requireText('api/v1/direct-upload.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'direct uploads must target wthemif');
-requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run', 'upload discovery must target wthemif');
+requireText('api/v1/direct-upload.ts', 'modalBaseUrl()', 'direct uploads must use configured worker URL only');
+requireText('api/v1/direct-upload.ts', 'worker_not_configured', 'direct uploads must fail clearly when worker URL is missing');
+requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'modalBaseUrl()', 'upload discovery must use configured worker URL only');
+requireText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'worker_not_configured', 'upload discovery must fail clearly when worker URL is missing');
+forbidText('api/v1/direct-upload.ts', 'modal.run', 'direct uploads must not silently fall back to a hardcoded worker');
+forbidText('api/v1/trecut/eraser/_handlers/upload-target.ts', 'modal.run', 'upload discovery must not silently fall back to a hardcoded worker');
 forbidText('vercel.json', 'californiatrey--tvapp-video-eraser-gpu', 'production must not route to the retired Modal account');
-requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'diffusion inpainting requires a real GPU');
+requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'ProPainter inpainting requires a real GPU');
 requireText('gpu-worker/modal_app.py', 'max_containers=1', 'in-memory status requires one active worker container');
-requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'one diffusion render may run per GPU container');
-requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'diffusion jobs need a long worker timeout');
-requireText('gpu-worker/modal_app.py', 'python /app/pipelines/optical_flow_vace_inpaint.py', 'Modal must execute the exact four-stage pipeline');
+requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'one ProPainter render may run per GPU container');
+requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'ProPainter jobs need a long worker timeout');
+requireText('gpu-worker/modal_app.py', 'python /app/pipelines/sam2_propainter.py', 'Modal must execute the SAM2 + ProPainter eraser pipeline');
+requireText('gpu-worker/modal_app.py', '/opt/ProPainter', 'production image must install ProPainter');
 requireText('gpu-worker/modal_app.py', 'flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl', 'Modal image must include the verified Flash Attention CUDA wheel');
 requireText('gpu-worker/modal_app.py', 'pip install einops==0.8.1', 'Wan VACE must receive its explicit tensor-rearrangement dependency');
 requireText('gpu-worker/modal_app.py', 'import flash_attn', 'worker startup must verify Flash Attention imports');
-forbidText('gpu-worker/modal_app.py', '/opt/ProPainter', 'production image must not install the retired ProPainter stack');
 requireText('gpu-worker/modal_app.py', '/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt', 'production image must include SAM2-tiny for constrained matte refinement');
 forbidText('gpu-worker/modal_app.py', 'python /app/pipelines/sam2_propainter_verified.py', 'Modal must not execute the retired production entrypoint');
 
-// Worker status must expose the real four stages, not cosmetic labels.
-requireText('gpu-worker/main.py', 'python /app/pipelines/optical_flow_vace_inpaint.py', 'worker default must be the optical-flow VACE pipeline');
+// Worker status must expose the real ProPainter path, not the generative VACE eraser.
+requireText('gpu-worker/main.py', 'python /app/pipelines/sam2_propainter.py', 'worker default must be the SAM2 + ProPainter pipeline');
 requireText('gpu-worker/main.py', 'PIPELINE_STAGE:', 'worker must parse pipeline-emitted stage events');
 requireText('gpu-worker/main.py', 'frame_extraction', 'job status must begin with frame extraction');
-requireText('gpu-worker/main.py', 'Optical-flow diffusion removal complete', 'completion status must identify the real path');
-requireText('gpu-worker/main.py', 'optical-flow-vace-diffusion', 'job endpoint must default to the exact pipeline ID');
+requireText('gpu-worker/main.py', 'SAM2 + ProPainter removal complete', 'completion status must identify the real path');
+requireText('gpu-worker/main.py', 'sam2-propainter', 'job endpoint must default to the exact pipeline ID');
 requireText('gpu-worker/main.py', 'ERASER_PRESERVE_RESOLUTION', 'worker must pass source-resolution preservation');
 requireText('gpu-worker/main.py', 'ERASER_PRESERVE_FPS', 'worker must pass source-FPS preservation');
 requireText('gpu-worker/main.py', 'ERASER_PRESERVE_AUDIO', 'worker must pass audio preservation');
@@ -190,4 +194,4 @@ if (failures.length) {
   process.exit(1);
 }
 
-console.log('Eraser contract check passed. Frame extraction, optical-flow tracking, Wan VACE diffusion inpainting, source-preserving compositing, and audio-preserving export are locked as the production path.');
+console.log('Eraser contract check passed. SAM2 + ProPainter removal is locked as the production eraser path; Wan VACE remains available for AI Remix.');

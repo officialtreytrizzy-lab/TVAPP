@@ -240,7 +240,7 @@ export async function submitRemovalToModal(jobId: string, input: RemovalJobReque
   form.append('duration', metadataValue(input, 'duration', 0));
   form.append('width', metadataValue(input, 'width', 0));
   form.append('height', metadataValue(input, 'height', 0));
-  form.append('pipeline', input.pipeline || String(input.metadata?.pipeline || 'optical-flow-vace-diffusion'));
+  form.append('pipeline', input.pipeline || String(input.metadata?.pipeline || 'sam2-propainter'));
   form.append('mask_semantics', input.mask_semantics || String(input.metadata?.mask_semantics || 'alpha_gt_0_remove'));
   form.append('quality', input.quality || 'source');
   form.append('preserve_resolution', String(input.preserve_resolution !== false));

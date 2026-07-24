@@ -21,6 +21,8 @@ worker_image = (
     .pip_install("torch", "torchvision", index_url="https://download.pytorch.org/whl/cu121")
     .pip_install_from_requirements("gpu-worker/requirements.txt")
     .run_commands(
+        "rm -rf /opt/ProPainter && git clone --depth 1 https://github.com/sczhou/ProPainter.git /opt/ProPainter",
+        "pip install -r /opt/ProPainter/requirements.txt",
         "rm -rf /opt/sam2 && git clone --depth 1 https://github.com/facebookresearch/sam2.git /opt/sam2",
         "pip install -e /opt/sam2",
         "mkdir -p /opt/sam2_checkpoints && python - <<'PY'\nfrom pathlib import Path\nfrom urllib.request import urlretrieve\ncheckpoint = Path('/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt')\nurl = 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt'\nif not checkpoint.exists() or checkpoint.stat().st_size < 1000000:\n    print(f'Downloading SAM2 checkpoint: {url}')\n    urlretrieve(url, checkpoint)\nprint(f'SAM2 checkpoint ready: {checkpoint} ({checkpoint.stat().st_size} bytes)')\nPY",
@@ -129,15 +131,14 @@ def fastapi_app():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["ERASER_REQUIRE_CUDA"] = "true"
-    os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/optical_flow_vace_inpaint.py"
+    os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter.py"
     os.environ["SAM2_ROOT"] = "/opt/sam2"
     os.environ["SAM2_CHECKPOINT"] = "/opt/sam2_checkpoints/sam2.1_hiera_tiny.pt"
     os.environ["SAM2_MODEL_CFG"] = "configs/sam2.1/sam2.1_hiera_t.yaml"
-    os.environ.setdefault("ERASER_SAM2_REFINEMENT", "true")
-    os.environ.setdefault("ERASER_MASK_DILATION_PX", "2")
-    os.environ.setdefault("ERASER_TRACK_MAX_SIDE", "960")
-    os.environ.setdefault("ERASER_DIFFUSION_FPS", "16")
-    os.environ.setdefault("ERASER_DIFFUSION_STEPS", "24")
+    os.environ.setdefault("SAM2_PROMPT_MODE", "hybrid")
+    os.environ.setdefault("ERASER_MASK_DILATION_PX", "1")
+    os.environ.setdefault("ERASER_TRACK_REANCHOR_FRAMES", "48")
+    os.environ.setdefault("ERASER_ALLOW_OPENCV_FALLBACK", "false")
     gpu_details = require_gpu_runtime()
 
     sys.path.insert(0, "/app")
