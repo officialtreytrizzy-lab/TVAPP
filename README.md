@@ -45,7 +45,7 @@ The job creation request is multipart form data with:
 - `selected_time`: selected timestamp in seconds
 - `selected_frame_index`: selected frame index
 - `fps`, `duration`, `width`, `height`
-- `pipeline`: `optical-flow-vace-diffusion`
+- `pipeline`: `sam2-propainter`
 - `quality`: `commercial`
 
 The worker can either return a completed video immediately or return a job id/status URL.
@@ -76,11 +76,11 @@ Expected JSON examples:
 The production worker runs this exact pipeline:
 
 1. **Frame extraction:** decode the original clip into source-timed frames while retaining the original media metadata.
-2. **Optical-flow tracking:** propagate the painted removal mask forward and backward with dense Farneback flow, sparse Lucas-Kanade recovery, scene-cut detection, and fixed screen-space handling.
-3. **Diffusion inpainting:** convert the tracked mask sequence into a Wan VACE temporal mask where white means generate and black means preserve, then reconstruct the missing background in overlapping diffusion chunks.
+2. **SAM2 tracking:** propagate the exact painted selection forward and backward through the full clip, with re-anchoring and fixed screen-space handling.
+3. **ProPainter inpainting:** reconstruct the missing background from neighboring video frames in bounded temporal chunks, then reject unchanged, frozen, or visibly patched results.
 4. **Audio-preserving export:** composite only the repaired mask region over the original source frames, restore the original resolution and FPS, and mux the original soundtrack into the final MP4.
 
-The production route does not execute SAM2 or ProPainter.
+The production eraser route executes the verified SAM2 + ProPainter pipeline. Wan VACE remains available only for AI Remix.
 
 ## What is local now
 

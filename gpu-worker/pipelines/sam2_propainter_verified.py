@@ -37,6 +37,11 @@ TIMELINE_CONTEXT_MIN_GAIN = float(os.environ.get("ERASER_CONTEXT_MIN_GAIN", "0.7
 TIMELINE_MIN_VERIFIABLE_FRAMES = max(2, int(os.environ.get("ERASER_MIN_VERIFIABLE_FRAMES", "3")))
 
 
+def emit_stage(name: str, progress: int, message: str) -> None:
+    payload = {"name": name, "progress": progress, "message": message}
+    print(f"PIPELINE_STAGE:{json.dumps(payload, separators=(',', ':'))}", flush=True)
+
+
 class SelectionNotRemovedError(RuntimeError):
     """The selected frame rendered, but the painted region stayed unchanged."""
 
@@ -498,12 +503,14 @@ def main() -> None:
     mask_dir = work_dir / "sam2_remove_masks"
     result_root = work_dir / "propainter_results"
 
+    emit_stage("frame_extraction", 10, "Preparing source frames")
     locked_core.prepare_source_mp4(input_video, source_mp4)
     fps, width, height = locked_core.read_video_meta(source_mp4)
     frame_count = pipeline.video_frame_count(source_mp4)
     anchor_index = locked_core.selected_frame_index(fps, frame_count)
     anchor_mask = verification_mask(input_mask, width, height)
 
+    emit_stage("sam2_tracking", 30, "Tracking the painted selection with SAM2")
     tracked_masks = locked_core.build_tracked_masks(
         source_mp4,
         input_mask,
@@ -516,6 +523,7 @@ def main() -> None:
     used_fallback = False
     active_masks = tracked_masks
     try:
+        emit_stage("propainter_inpainting", 55, "Removing the selection with ProPainter")
         inpainted = pipeline.run_propainter(
             source_mp4,
             tracked_masks,
@@ -571,6 +579,7 @@ def main() -> None:
             output_quality,
         )
 
+    emit_stage("audio_preserving_export", 88, "Preserving source pixels and restoring audio")
     composite_video = locked_core.composite_inpainted_region(
         source_mp4,
         inpainted,
@@ -589,6 +598,7 @@ def main() -> None:
     )
 
     try:
+        emit_stage("validation", 95, "Validating removal quality and video playback")
         pipeline.validate_video_liveness(source_mp4, output_video, "Final eraser output", active_masks)
         validate_selection_changed(
             source_mp4,

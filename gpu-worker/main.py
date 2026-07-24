@@ -26,7 +26,7 @@ TRANSITION_WORK_DIR = Path(os.environ.get("TRANSITION_WORK_DIR", "/tmp/video-tra
 REMIX_WORK_DIR = Path(os.environ.get("AI_REMIX_WORK_DIR", "/tmp/ai-remix-jobs"))
 UPLOAD_WORK_DIR = Path(os.environ.get("ERASER_UPLOAD_WORK_DIR", str(WORK_DIR / "_chunked_uploads")))
 PUBLIC_BASE_URL = os.environ.get("ERASER_PUBLIC_BASE_URL", "").rstrip("/")
-PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/optical_flow_vace_inpaint.py").strip()
+PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2_propainter_verified.py").strip()
 AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pipelines/wan_vace_remix.py").strip()
 
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,7 +34,7 @@ TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
@@ -135,7 +135,7 @@ class ChunkUploadComplete(BaseModel):
     duration: str | float | int = "0"
     width: str | int = "0"
     height: str | int = "0"
-    pipeline: str = "optical-flow-vace-diffusion"
+    pipeline: str = "sam2-propainter"
     quality: str = "source"
     preserve_resolution: bool = True
     preserve_fps: bool = True
@@ -349,7 +349,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
         )
         if not PIPELINE_CMD:
             raise RuntimeError(
-                "ERASER_PIPELINE_CMD is not configured. Point it at the optical-flow VACE diffusion pipeline."
+                "ERASER_PIPELINE_CMD is not configured. Point it at the verified SAM2 + ProPainter pipeline."
             )
         env = os.environ.copy()
         env.update({
@@ -369,6 +369,12 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             "ERASER_PRESERVE_AUDIO": "true",
             "PYTHONUNBUFFERED": "1",
         })
+        set_job(
+            job_id,
+            phase="inpainting",
+            progress=35,
+            statusMessage="Running SAM2 + ProPainter removal",
+        )
         process = subprocess.Popen(
             PIPELINE_CMD,
             shell=True,
@@ -406,7 +412,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             job_id,
             phase="completed",
             progress=100,
-            statusMessage="Optical-flow diffusion removal complete",
+            statusMessage="SAM2 + ProPainter removal complete",
             outputUrl=final_url,
             finalCompositeUrl=final_url,
             compositeOutputUrl=final_url,
@@ -425,7 +431,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             job_id,
             phase="failed",
             progress=100,
-            statusMessage="Optical-flow diffusion removal failed",
+            statusMessage="SAM2 + ProPainter removal failed",
             error=str(exc),
         )
 
@@ -568,7 +574,21 @@ def process_mix_transition(job_id: str, duration: str, quality: str) -> None:
 async def health(request: Request):
     wan_root = Path(WAN_ROOT)
     wan_ckpt_dir = Path(WAN_CKPT_DIR)
-    return {"ok": True, "worker": WORKER_NAME, "version": APP_VERSION, "has_wan_root": wan_root.exists(), "has_wan_generate": (wan_root / "generate.py").exists(), "has_wan_checkpoint": wan_ckpt_dir.exists(), "wan_root": str(wan_root), "wan_ckpt_dir": str(wan_ckpt_dir), "public_base_url": absolute_base_url(request), "ai_remix_pipeline_cmd": AI_REMIX_PIPELINE_CMD, "work_dir": str(WORK_DIR), "remix_work_dir": str(REMIX_WORK_DIR)}
+    return {
+        "ok": True,
+        "worker": WORKER_NAME,
+        "version": APP_VERSION,
+        "eraser_pipeline_cmd": PIPELINE_CMD,
+        "ai_remix_pipeline_cmd": AI_REMIX_PIPELINE_CMD,
+        "has_wan_root": wan_root.exists(),
+        "has_wan_generate": (wan_root / "generate.py").exists(),
+        "has_wan_checkpoint": wan_ckpt_dir.exists(),
+        "wan_root": str(wan_root),
+        "wan_ckpt_dir": str(wan_ckpt_dir),
+        "public_base_url": absolute_base_url(request),
+        "work_dir": str(WORK_DIR),
+        "remix_work_dir": str(REMIX_WORK_DIR),
+    }
 
 
 @app.get("/v1/ai-remix/debug")
@@ -678,7 +698,7 @@ async def complete_chunked_upload(upload_id: str, payload: ChunkUploadComplete):
         remote_job_id,
         phase="queued",
         progress=5,
-        statusMessage="Chunked upload verified; queued optical-flow diffusion removal",
+        statusMessage="Chunked upload verified; queued SAM2 + ProPainter removal",
     )
     Thread(
         target=process_job,
@@ -708,13 +728,13 @@ async def complete_chunked_upload(upload_id: str, payload: ChunkUploadComplete):
 
 
 @app.post("/v1/video-eraser/jobs")
-async def create_job(video: UploadFile = File(...), mask: UploadFile = File(...), job_id: str = Form(default=""), selected_time: str = Form(default="0"), selected_frame_index: str = Form(default="0"), fps: str = Form(default="30"), duration: str = Form(default="0"), width: str = Form(default="0"), height: str = Form(default="0"), pipeline: str = Form(default="optical-flow-vace-diffusion"), quality: str = Form(default="source"), preserve_resolution: str = Form(default="true"), preserve_fps: str = Form(default="true"), preserve_audio: str = Form(default="true")):
+async def create_job(video: UploadFile = File(...), mask: UploadFile = File(...), job_id: str = Form(default=""), selected_time: str = Form(default="0"), selected_frame_index: str = Form(default="0"), fps: str = Form(default="30"), duration: str = Form(default="0"), width: str = Form(default="0"), height: str = Form(default="0"), pipeline: str = Form(default="sam2-propainter"), quality: str = Form(default="source"), preserve_resolution: str = Form(default="true"), preserve_fps: str = Form(default="true"), preserve_audio: str = Form(default="true")):
     remote_job_id = job_id.strip() or str(uuid.uuid4())
     job_dir = WORK_DIR / remote_job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     save_upload(video, job_dir / "input_video")
     save_upload(mask, job_dir / "mask.png")
-    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued optical-flow diffusion removal")
+    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued SAM2 + ProPainter removal")
     Thread(target=process_job, args=(remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, quality), daemon=True).start()
     payload = dump_job_payload(state)
     payload["statusUrl"] = payload["status_url"] = f"/v1/video-eraser/jobs/{remote_job_id}"

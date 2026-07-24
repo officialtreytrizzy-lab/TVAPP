@@ -56,7 +56,7 @@ The worker should fail fast if the model command is not configured. Do not silen
 ```bash
 ERASER_WORK_DIR=/tmp/video-eraser-jobs
 ERASER_PUBLIC_BASE_URL=https://your-worker.example.com
-ERASER_PIPELINE_CMD="python /app/pipelines/sam2_propainter.py"
+ERASER_PIPELINE_CMD="python /app/pipelines/sam2_propainter_verified.py"
 ```
 
 The pipeline command receives these environment variables:

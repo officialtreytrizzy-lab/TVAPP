@@ -7,6 +7,8 @@ const PHASE_LABEL: Record<string, string> = {
   mask_ready: 'Mask ready',
   segmenting: 'Uploading',
   frame_extraction: 'Frame extraction',
+  sam2_tracking: 'SAM2 tracking',
+  propainter_inpainting: 'ProPainter inpainting',
   optical_flow_tracking: 'Optical-flow tracking',
   diffusion_inpainting: 'Diffusion inpainting',
   audio_preserving_export: 'Audio-preserving export',

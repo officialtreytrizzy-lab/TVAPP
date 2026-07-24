@@ -74,8 +74,8 @@ export function isGpuRemovalConfigured(): boolean {
 }
 
 export function gpuRemovalLabel(): string {
-  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser GPU · Optical-flow diffusion';
-  if (DIRECT_WORKER_URL) return 'GPU optical-flow diffusion worker';
+  if (USE_ERASER_API_PROXY && ERASER_API_PROXY_URL) return 'eTreyser GPU · SAM2 + ProPainter';
+  if (DIRECT_WORKER_URL) return 'GPU SAM2 + ProPainter worker';
   return 'GPU pipeline unavailable';
 }
 
@@ -155,6 +155,8 @@ function getStatusUrl(payload: WorkerJobResponse, baseUrl: string, pathPrefix: s
 function normalizePhase(payload: WorkerJobResponse): string {
   const raw = String(payload.phase || payload.status || '').toLowerCase();
   if (raw.includes('frame_extraction')) return 'frame_extraction';
+  if (raw.includes('sam2_tracking')) return 'sam2_tracking';
+  if (raw.includes('propainter_inpainting')) return 'propainter_inpainting';
   if (raw.includes('optical_flow_tracking')) return 'optical_flow_tracking';
   if (raw.includes('diffusion_inpainting')) return 'diffusion_inpainting';
   if (raw.includes('audio_preserving_export')) return 'audio_preserving_export';
@@ -213,7 +215,7 @@ function buildRemovalForm(input: GpuRemovalInput, maskBlob: Blob): FormData {
   form.append('duration', String(duration));
   form.append('width', String(width));
   form.append('height', String(height));
-  form.append('pipeline', 'optical-flow-vace-diffusion');
+  form.append('pipeline', 'sam2-propainter');
   form.append('mask_semantics', 'alpha_gt_0_remove');
   form.append('quality', outputQuality);
   form.append('preserve_resolution', 'true');
@@ -369,7 +371,7 @@ async function runChunkedWorkerUpload(
       duration: input.duration,
       width: input.width,
       height: input.height,
-      pipeline: 'optical-flow-vace-diffusion',
+      pipeline: 'sam2-propainter',
       quality: input.outputQuality || 'source',
       preserve_resolution: true,
       preserve_fps: true,
@@ -545,7 +547,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
       duration,
       width,
       height,
-      pipeline: 'optical-flow-vace-diffusion',
+      pipeline: 'sam2-propainter',
       mask_semantics: 'alpha_gt_0_remove',
       preserve_resolution: true,
       preserve_fps: true,
@@ -568,7 +570,7 @@ async function runLegacyJsonProxyRemoval(input: GpuRemovalInput, maskBlob: Blob)
         duration,
         width,
         height,
-        pipeline: 'optical-flow-vace-diffusion',
+        pipeline: 'sam2-propainter',
         mask_semantics: 'alpha_gt_0_remove',
       },
     }),

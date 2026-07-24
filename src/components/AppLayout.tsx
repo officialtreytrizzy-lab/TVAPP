@@ -7,7 +7,7 @@ const HERO = 'https://d64gsuwffb70l.cloudfront.net/6a407d389662950bf1dfa607_1782
 const STEPS = [
   { icon: Film, title: 'Upload', body: 'Drop a clip up to 30s. We read its real FPS, duration & resolution.' },
   { icon: MousePointerClick, title: 'Scribble', body: 'Pause on a frame and brush over the object you want gone.' },
-  { icon: Scan, title: 'Track', body: 'Optical-flow tracking follows the target across every frame.' },
+  { icon: Scan, title: 'Track', body: 'SAM2 follows the painted target across every frame.' },
   { icon: Wand2, title: 'Inpaint & Export', body: 'Diffusion inpainting fills the hole; export with original audio.' },
 ];
 
@@ -258,7 +258,7 @@ export default function AppLayout() {
             <div className="flex items-center gap-2"><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-violet-600 to-blue-600"><Wand2 className="h-4 w-4 text-white" /></div><span className="font-bold">Video ETreyser</span></div>
             <p className="mt-3 text-sm text-slate-400">Video object removal that runs from one local app folder and exposes a protected API.</p>
           </div>
-          <div><h4 className="mb-3 text-sm font-semibold text-white">Pipeline</h4><ul className="space-y-2 text-sm text-slate-400"><li>Frame extraction</li><li>Optical-flow tracking</li><li>Diffusion inpainting</li><li>Audio-preserving export</li></ul></div>
+          <div><h4 className="mb-3 text-sm font-semibold text-white">Pipeline</h4><ul className="space-y-2 text-sm text-slate-400"><li>Frame extraction</li><li>SAM2 tracking</li><li>ProPainter inpainting</li><li>Audio-preserving export</li></ul></div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Specs</h4><ul className="space-y-2 text-sm text-slate-400"><li>MP4 · MOV · WebM</li><li>Up to 30 seconds</li><li>Original FPS & audio</li><li>Aspect ratio preserved</li></ul></div>
           <div><h4 className="mb-3 text-sm font-semibold text-white">Studio</h4><div className="flex gap-3 text-slate-400"><a href="/studio" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Clapperboard className="h-4 w-4" /></a><a href="/api-docs" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Code2 className="h-4 w-4" /></a><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Github className="h-4 w-4" /></a><a href="#" className="rounded-lg bg-slate-900 p-2 hover:text-white"><Mail className="h-4 w-4" /></a></div></div>
         </div>

@@ -1,8 +1,6 @@
 import { error, handleOptions, json, methodNotAllowed } from '../../../../_lib/http.js';
 import { modalBaseUrl } from '../../../../_lib/modal.js';
 
-const DEFAULT_WORKER_BASE = 'https://wthemif--tvapp-video-eraser-gpu-fastapi-app.modal.run';
-
 /**
  * First-party discovery of the GPU worker's direct upload endpoint.
  *
@@ -26,7 +24,7 @@ export default async function handler(req: any, res: any) {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
 
-    const base = (modalBaseUrl() || DEFAULT_WORKER_BASE).replace(/\/$/, '');
+    const base = modalBaseUrl().replace(/\/$/, '');
     if (!base) return error(res, 503, 'GPU worker is not configured.', 'worker_not_configured');
 
     json(res, 200, {
