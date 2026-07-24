@@ -474,6 +474,10 @@ export const eraserApi = {
 
     const ext = /mp4/i.test(mimeType) ? 'mp4' : 'webm';
     const key = `${currentDeviceId()}/${job.job_id}-${Date.now()}.${ext}`;
+    // Ask the browser for durable storage before the potentially large write.
+    // This is especially important on iOS, where temporary site storage can be
+    // reclaimed aggressively after memory-heavy video processing.
+    await requestPersistentDeviceStorage();
     await putOutput(key, blob, mimeType);
 
     const objectUrl = URL.createObjectURL(blob);

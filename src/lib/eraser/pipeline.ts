@@ -24,6 +24,7 @@ export interface PipelineInput {
 export interface PipelineOutput {
   finalUrl: string;       // permanent storage URL (refresh/cross-device safe)
   localUrl: string;       // in-session blob URL for instant preview/download
+  outputBlob?: Blob;      // already-downloaded result, reused for durable device storage
   mimeType: string;       // real recorder MIME (drives download extension)
   hasAudio: boolean;      // honest: was original audio actually muxed in
   outW: number;           // exported (source) width

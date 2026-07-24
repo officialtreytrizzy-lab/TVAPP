@@ -1,4 +1,4 @@
-﻿import type { PipelineOutput } from './pipeline';
+import type { PipelineOutput } from './pipeline';
 
 export type EraserOutputQuality = 'source' | 'higher';
 
@@ -403,13 +403,14 @@ async function materializeOutput(outputUrl: string, input: GpuRemovalInput): Pro
   }
   const blob = await res.blob();
   if (!blob.size) throw new Error('eTreyser returned an empty output video (0 bytes).');
-  return makePipelineOutput(URL.createObjectURL(blob), input);
+  return makePipelineOutput(URL.createObjectURL(blob), input, blob);
 }
 
-function makePipelineOutput(outputUrl: string, input: GpuRemovalInput): PipelineOutput {
+function makePipelineOutput(outputUrl: string, input: GpuRemovalInput, outputBlob?: Blob): PipelineOutput {
   return {
     finalUrl: outputUrl,
     localUrl: outputUrl,
+    outputBlob,
     mimeType: 'video/mp4',
     hasAudio: true,
     outW: input.width,

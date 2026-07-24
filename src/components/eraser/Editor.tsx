@@ -216,9 +216,15 @@ export default function Editor() {
       let savedLibraryUrl = '';
       let librarySaveError = '';
       try {
-        const outputResponse = await fetch(out.localUrl || out.finalUrl);
-        if (!outputResponse.ok) throw new Error(`Could not read completed video (HTTP ${outputResponse.status}).`);
-        const outputBlob = await outputResponse.blob();
+        // The GPU pipeline already downloaded the completed video for preview.
+        // Reuse that exact Blob for IndexedDB instead of fetching the full MP4
+        // a second time, which can exhaust mobile memory after a long render.
+        let outputBlob = out.outputBlob;
+        if (!outputBlob) {
+          const outputResponse = await fetch(out.localUrl || out.finalUrl);
+          if (!outputResponse.ok) throw new Error(`Could not read completed video (HTTP ${outputResponse.status}).`);
+          outputBlob = await outputResponse.blob();
+        }
         if (!outputBlob.size) throw new Error('Completed video was empty.');
         savedLibraryUrl = await eraserApi.uploadOutput(jobId, outputBlob, out.mimeType);
       } catch (saveError) {

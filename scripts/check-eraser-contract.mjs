@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 
 const requiredFiles = [
   'src/lib/eraser/gpu.ts',
+  'src/lib/eraser/pipeline.ts',
   'src/lib/eraser/api.ts',
   'src/components/AppLayout.tsx',
   'src/components/eraser/Editor.tsx',
@@ -75,6 +76,10 @@ requireText('src/lib/eraser/api.ts', "DEVICE_CREDENTIAL_KEY = 'etreyser.device.c
 requireText('src/lib/eraser/api.ts', 'MAX_RECENT_COMPLETED_JOBS = 3', 'the device library must retain exactly three completed jobs');
 requireText('src/lib/eraser/api.ts', 'device_id: currentDeviceId()', 'new eraser jobs must be scoped to the current device');
 requireText('src/lib/eraser/api.ts', 'navigator.storage.persist()', 'the browser should request durable device storage when available');
+requireText('src/lib/eraser/pipeline.ts', 'outputBlob?: Blob', 'the downloaded GPU result must remain available for durable device storage');
+requireText('src/lib/eraser/gpu.ts', 'makePipelineOutput(URL.createObjectURL(blob), input, blob)', 'the first completed-video download must be reused instead of downloaded twice');
+requireText('src/components/eraser/Editor.tsx', 'let outputBlob = out.outputBlob', 'the editor must persist the GPU result Blob without a redundant full-video fetch');
+requireText('src/lib/eraser/api.ts', 'await requestPersistentDeviceStorage();', 'durable storage must be requested before writing the completed output');
 requireText('src/lib/eraser/api.ts', 'pruneCompletedJobsForCurrentDevice', 'saving a fourth completed job must evict the oldest');
 requireText('src/lib/eraser/api.ts', 'deleteOutput(job.final_output_key)', 'eviction must remove the saved IndexedDB video, not only metadata');
 requireText('src/lib/eraser/api.ts', 'listRecentCompletedJobs', 'the library must expose only recent completed jobs');
