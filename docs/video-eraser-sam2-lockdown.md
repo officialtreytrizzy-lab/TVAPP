@@ -42,7 +42,7 @@ The expected good signals are:
 Redeploy Modal after worker changes:
 
 ```bash
-MODAL_PROFILE=wthemif modal deploy gpu-worker/modal_app.py
+MODAL_PROFILE=officialtreytrizzy-lab modal deploy gpu-worker/modal_app.py
 ```
 
 The Modal image must install:
