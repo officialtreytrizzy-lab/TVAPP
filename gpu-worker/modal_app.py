@@ -10,10 +10,13 @@ import modal
 #
 # The deployed URL becomes VITE_ERASER_GPU_WORKER_URL in Vercel.
 # Wan model weights live in the Modal volume mounted at /models.
+# Etreyser job state, uploads, logs, and outputs live in /jobs so they
+# survive Modal container restarts.
 # Download/update weights with:
 #   MODAL_PROFILE=officialtreytrizzy-lab modal run gpu-worker/modal_app.py::download_models
 
 wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
+eraser_jobs = modal.Volume.from_name("tvapp-video-eraser-jobs", create_if_missing=True)
 
 worker_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -123,9 +126,9 @@ def download_models():
     image=worker_image,
     gpu="A10G",
     timeout=60 * 45,
-    scaledown_window=60,
+    scaledown_window=60 * 20,
     max_containers=1,
-    volumes={"/models": wan_models},
+    volumes={"/models": wan_models, "/jobs": eraser_jobs},
 )
 @modal.concurrent(max_inputs=1)
 @modal.asgi_app()
@@ -135,6 +138,10 @@ def fastapi_app():
     os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     os.environ["ERASER_REQUIRE_CUDA"] = "true"
     os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_verified.py"
+    os.environ["ERASER_WORK_DIR"] = "/jobs/video-eraser"
+    os.environ["TRANSITION_WORK_DIR"] = "/jobs/video-transitions"
+    os.environ["AI_REMIX_WORK_DIR"] = "/jobs/ai-remix"
+    os.environ["ERASER_UPLOAD_WORK_DIR"] = "/jobs/video-eraser-uploads"
     os.environ["SAM2_ROOT"] = "/opt/sam2"
     os.environ["SAM2_CHECKPOINT"] = "/opt/sam2_checkpoints/sam2.1_hiera_small.pt"
     os.environ["SAM2_MODEL_CFG"] = "configs/sam2.1/sam2.1_hiera_s.yaml"
@@ -178,4 +185,3 @@ def image_enhancer_app():
         return {"ok": True, "worker": "tvapp-image-enhancer-gpu", **gpu_details}
 
     return fastapi_application
-
