@@ -122,6 +122,8 @@ requireText('gpu-worker/modal_app.py', 'max_containers=1', 'in-memory status req
 requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'one diffusion render may run per GPU container');
 requireText('gpu-worker/modal_app.py', 'def recover_eraser_job_remote', 'completed ProPainter candidates must recover without another GPU pass');
 requireText('gpu-worker/main.py', 'Recovering completed ProPainter render without rerunning GPU', 'failed completed candidates must use the no-GPU recovery queue');
+requireText('gpu-worker/pipelines/sam2_propainter_verified.py', 'validate_or_repair_isolated_timeline_failures', 'isolated failed removal frames must be repaired and revalidated');
+requireText('gpu-worker/main.py', 'job_dir / "recovery.log", job_dir / "pipeline.log"', 'recovery diagnostics must be readable through the job log endpoint');
 requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'scale={target_width}:{target_height}:flags=lanczos,setsar=1', 'all resilient ProPainter chunks must be normalized before concatenation');
 requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'diffusion jobs need a long worker timeout');
 requireText('gpu-worker/modal_app.py', 'python /app/pipelines/sam2_propainter_verified.py', 'Modal must execute the verified SAM2 + ProPainter pipeline');

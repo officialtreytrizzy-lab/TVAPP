@@ -46,6 +46,27 @@ class SelectionNotRemovedError(RuntimeError):
     """The selected frame rendered, but the painted region stayed unchanged."""
 
 
+class TimelineSelectionError(SelectionNotRemovedError):
+    """A small set of timeline frames failed the full-removal quality gate."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_frames: list[int],
+        missing_masks: list[int],
+        pass_ratio: float,
+        required_ratio: float,
+        static_overlay: bool,
+    ) -> None:
+        super().__init__(message)
+        self.failed_frames = sorted(set(failed_frames))
+        self.missing_masks = sorted(set(missing_masks))
+        self.pass_ratio = pass_ratio
+        self.required_ratio = required_ratio
+        self.static_overlay = static_overlay
+
+
 def read_frame(path: Path, frame_index: int) -> np.ndarray:
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
@@ -114,15 +135,12 @@ def selection_outcome(stats: dict[str, float], *, allow_inconclusive: bool) -> s
 
 
 
-def selection_change_metrics(
-    source_video: Path,
-    candidate_video: Path,
+def selection_change_metrics_frames(
+    source: np.ndarray,
+    candidate: np.ndarray,
     mask: np.ndarray,
     frame_index: int,
 ) -> dict[str, float]:
-    source = read_frame(source_video, frame_index)
-    candidate = read_frame(candidate_video, frame_index)
-
     height, width = source.shape[:2]
     if candidate.shape[1] != width or candidate.shape[0] != height:
         candidate = cv2.resize(candidate, (width, height), interpolation=cv2.INTER_LINEAR)
@@ -155,6 +173,17 @@ def selection_change_metrics(
         "candidate_context_residual": candidate_context_residual,
         "context_residual_ratio": context_residual_ratio,
     }
+
+
+def selection_change_metrics(
+    source_video: Path,
+    candidate_video: Path,
+    mask: np.ndarray,
+    frame_index: int,
+) -> dict[str, float]:
+    source = read_frame(source_video, frame_index)
+    candidate = read_frame(candidate_video, frame_index)
+    return selection_change_metrics_frames(source, candidate, mask, frame_index)
 
 
 def validate_selection_changed(
@@ -314,13 +343,257 @@ def validate_timeline_selection_changed(
             f"verifiable={verifiable_count}, checked={checked}"
         )
     if pass_ratio < required_ratio or (static_overlay and missing_masks):
-        raise SelectionNotRemovedError(
+        message = (
             f"{label} did not keep the selection removed for the full clip: "
             f"pass_ratio={pass_ratio:.3f}, required={required_ratio:.3f}, "
             f"failed_frames={sorted(set(failed_frames))}, "
             f"inconclusive_frames={inconclusive_frames}, missing_masks={missing_masks}"
         )
+        raise TimelineSelectionError(
+            message,
+            failed_frames=failed_frames,
+            missing_masks=missing_masks,
+            pass_ratio=pass_ratio,
+            required_ratio=required_ratio,
+            static_overlay=static_overlay,
+        )
     return summary
+
+
+def _temporal_neighbor_indexes(
+    frame_index: int,
+    frame_count: int,
+    failed_frames: set[int],
+    limit: int = 6,
+) -> list[int]:
+    indexes: list[int] = []
+    for distance in range(1, 7):
+        for candidate_index in (frame_index - distance, frame_index + distance):
+            if 0 <= candidate_index < frame_count and candidate_index not in failed_frames:
+                indexes.append(candidate_index)
+                if len(indexes) >= limit:
+                    return indexes
+    return indexes
+
+
+def _masked_temporal_patch(
+    current: np.ndarray,
+    replacement: np.ndarray,
+    mask: np.ndarray,
+) -> np.ndarray:
+    height, width = current.shape[:2]
+    if replacement.shape[1] != width or replacement.shape[0] != height:
+        replacement = cv2.resize(replacement, (width, height), interpolation=cv2.INTER_LANCZOS4)
+    if mask.shape[1] != width or mask.shape[0] != height:
+        mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    binary = (mask > 24).astype(np.uint8) * 255
+    if locked_core.mask_bbox(binary) is None:
+        return current.copy()
+    edge = cv2.dilate(
+        binary,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+        iterations=1,
+    )
+    alpha = cv2.GaussianBlur(edge, (0, 0), sigmaX=0.9, sigmaY=0.9).astype(np.float32) / 255.0
+    alpha[binary > 0] = 1.0
+    alpha = alpha[:, :, None]
+    return np.clip(
+        replacement.astype(np.float32) * alpha + current.astype(np.float32) * (1.0 - alpha),
+        0,
+        255,
+    ).astype(np.uint8)
+
+
+def repair_isolated_timeline_frames(
+    source_video: Path,
+    candidate_video: Path,
+    mask_dir: Path,
+    failed_frames: list[int],
+    destination: Path,
+    fps: float,
+) -> Path:
+    failed_set = set(failed_frames)
+    if not failed_set:
+        return candidate_video
+
+    source_count = pipeline.video_frame_count(source_video)
+    candidate_count = pipeline.video_frame_count(candidate_video)
+    frame_count = min(source_count, candidate_count)
+    if frame_count <= 0:
+        raise RuntimeError("Could not determine frame count for isolated timeline repair")
+
+    source_zero = read_frame(source_video, 0)
+    height, width = source_zero.shape[:2]
+    replacements: dict[int, np.ndarray] = {}
+    strategies: dict[int, str] = {}
+
+    for frame_index in sorted(failed_set):
+        if frame_index < 0 or frame_index >= frame_count:
+            raise RuntimeError(f"Timeline repair frame {frame_index} is outside the video")
+        source = read_frame(source_video, frame_index)
+        current = read_frame(candidate_video, frame_index)
+        mask = read_timeline_mask(mask_dir, frame_index, width, height)
+        if locked_core.mask_bbox(mask) is None:
+            raise RuntimeError(f"Timeline repair mask is empty at frame {frame_index}")
+
+        neighbor_indexes = _temporal_neighbor_indexes(frame_index, frame_count, failed_set)
+        neighbors = [read_frame(candidate_video, index) for index in neighbor_indexes]
+        candidate_strategies: list[tuple[str, np.ndarray]] = []
+        if neighbors:
+            stack = np.stack(
+                [
+                    cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
+                    if frame.shape[1] != width or frame.shape[0] != height
+                    else frame
+                    for frame in neighbors
+                ],
+                axis=0,
+            )
+            candidate_strategies.append(("temporal_median", np.median(stack, axis=0).astype(np.uint8)))
+            candidate_strategies.append((f"nearest_{neighbor_indexes[0]}", stack[0]))
+            if len(stack) > 1:
+                candidate_strategies.append((f"nearest_{neighbor_indexes[1]}", stack[1]))
+
+        binary = (mask > 24).astype(np.uint8) * 255
+        inpaint_radius = max(2, min(7, int(round(max(width, height) * 0.004))))
+        candidate_strategies.append(("source_context_inpaint", cv2.inpaint(source, binary, inpaint_radius, cv2.INPAINT_TELEA)))
+
+        passing: list[tuple[float, str, np.ndarray, dict[str, float]]] = []
+        attempted: list[dict[str, float | str]] = []
+        for strategy_name, replacement in candidate_strategies:
+            patched = _masked_temporal_patch(current, replacement, mask)
+            stats = selection_change_metrics_frames(source, patched, mask, frame_index)
+            outcome = selection_outcome(stats, allow_inconclusive=False)
+            attempted.append({**stats, "strategy": strategy_name, "outcome": outcome})
+            if outcome == "passed":
+                score = (
+                    stats["context_residual_ratio"]
+                    - min(stats["mean_change"], 30.0) * 0.01
+                    - min(stats["changed_ratio"], 1.0) * 0.1
+                )
+                passing.append((score, strategy_name, patched, stats))
+
+        print(
+            f"Isolated timeline repair frame {frame_index}: {json.dumps(attempted, sort_keys=True)}",
+            flush=True,
+        )
+        if not passing:
+            raise SelectionNotRemovedError(
+                f"No validated temporal repair strategy removed the selection at frame {frame_index}"
+            )
+        passing.sort(key=lambda row: row[0])
+        _, strategy_name, patched, stats = passing[0]
+        replacements[frame_index] = patched
+        strategies[frame_index] = strategy_name
+        print(
+            f"Selected isolated timeline repair strategy frame={frame_index} strategy={strategy_name} "
+            f"mean_change={stats['mean_change']:.3f} changed_ratio={stats['changed_ratio']:.3f}",
+            flush=True,
+        )
+
+    cap = cv2.VideoCapture(str(candidate_video))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open candidate for isolated timeline repair: {candidate_video}")
+    raw_destination = destination.with_suffix(".raw.mp4")
+    writer = cv2.VideoWriter(
+        str(raw_destination),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps if fps > 0 else 30.0,
+        (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))),
+    )
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError("Could not create isolated timeline repair video")
+
+    index = 0
+    written = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+        writer.write(replacements.get(index, frame))
+        index += 1
+        written += 1
+    cap.release()
+    writer.release()
+    if written < max(1, frame_count - 1):
+        raise RuntimeError(
+            f"Isolated timeline repair ended early: expected={frame_count}, written={written}"
+        )
+
+    locked_core.run([
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(raw_destination),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "12",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(destination),
+    ])
+    print(
+        f"Repaired isolated timeline frames {sorted(failed_set)} using {json.dumps(strategies, sort_keys=True)}",
+        flush=True,
+    )
+    return destination
+
+
+def validate_or_repair_isolated_timeline_failures(
+    source_video: Path,
+    candidate_video: Path,
+    mask_dir: Path,
+    anchor_index: int,
+    label: str,
+    repair_destination: Path,
+    fps: float,
+) -> Path:
+    try:
+        validate_timeline_selection_changed(
+            source_video,
+            candidate_video,
+            mask_dir,
+            anchor_index,
+            label,
+        )
+        return candidate_video
+    except TimelineSelectionError as exc:
+        repairable = (
+            exc.static_overlay
+            and not exc.missing_masks
+            and exc.pass_ratio >= 0.95
+            and 0 < len(exc.failed_frames) <= 4
+        )
+        if not repairable:
+            raise
+        print(
+            f"{label} has {len(exc.failed_frames)} isolated failed frames at "
+            f"{exc.failed_frames}; applying validated temporal repair",
+            flush=True,
+        )
+        repaired = repair_isolated_timeline_frames(
+            source_video,
+            candidate_video,
+            mask_dir,
+            exc.failed_frames,
+            repair_destination,
+            fps,
+        )
+        validate_timeline_selection_changed(
+            source_video,
+            repaired,
+            mask_dir,
+            anchor_index,
+            f"{label} isolated-frame repair",
+        )
+        return repaired
 
 
 def patch_quality_metrics(
@@ -554,12 +827,14 @@ def main() -> None:
             anchor_index,
             "ProPainter",
         )
-        validate_timeline_selection_changed(
+        inpainted = validate_or_repair_isolated_timeline_failures(
             source_mp4,
             inpainted,
             tracked_masks,
             anchor_index,
             "ProPainter",
+            work_dir / "propainter_isolated_timeline_repair.mp4",
+            fps,
         )
     except RuntimeError as exc:
         used_fallback = True

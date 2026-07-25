@@ -39,7 +39,7 @@ TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.12.2"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
@@ -235,7 +235,14 @@ def dump_job_payload(job: JobState, request: Request | None = None) -> dict[str,
 
 def set_job(job_id: str, **updates: Any) -> JobState:
     with jobs_lock:
-        current = jobs.get(job_id) or JobState(jobId=job_id)
+        current = jobs.get(job_id)
+    if current is None:
+        try:
+            current = get_job(job_id)
+        except Exception:
+            current = JobState(jobId=job_id)
+    with jobs_lock:
+        current = jobs.get(job_id) or current
         data = current.model_dump()
         data.update(updates)
         if str(data.get("phase") or "") == "queued" and not data.get("queuedAt"):
@@ -614,6 +621,7 @@ def recover_existing_eraser_job(job_id: str) -> None:
     recovery_log = job_dir / "recovery.log"
     output_path = job_dir / "output.mp4"
     try:
+        recovery_log.write_text("", encoding="utf-8")
         args = read_or_infer_eraser_request(job_id)
         selected_frame_index = max(0, int(float(args[2] or 0)))
         output_quality = "higher" if args[7] == "higher" else "source"
@@ -682,12 +690,14 @@ def recover_existing_eraser_job(job_id: str) -> None:
             selected_frame_index,
             "Recovered ProPainter candidate",
         )
-        verified_pipeline.validate_timeline_selection_changed(
+        normalized_candidate = verified_pipeline.validate_or_repair_isolated_timeline_failures(
             source_mp4,
             normalized_candidate,
             active_masks,
             selected_frame_index,
             "Recovered ProPainter candidate",
+            job_dir / "propainter_isolated_timeline_repair.mp4",
+            fps,
         )
 
         set_job(
@@ -1284,7 +1294,7 @@ async def retry_video_job(job_id: str):
 async def get_video_job_log(job_id: str):
     reload_job_volume()
     job_dir = WORK_DIR / job_id
-    for candidate in (job_dir / "error.log", job_dir / "pipeline.log"):
+    for candidate in (job_dir / "error.log", job_dir / "recovery.log", job_dir / "pipeline.log"):
         if candidate.exists():
             return PlainTextResponse(candidate.read_text(encoding="utf-8", errors="replace"), media_type="text/plain")
     return JSONResponse(status_code=404, content={"error": "No eraser log found", "job_id": job_id})
