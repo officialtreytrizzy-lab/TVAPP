@@ -34,7 +34,7 @@ TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.11.1"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
@@ -172,17 +172,18 @@ def set_job(job_id: str, **updates: Any) -> JobState:
     try:
         path = status_path_for(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(dump_job_payload(updated), indent=2, sort_keys=True), encoding="utf-8")
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.{get_ident()}.tmp")
+        temp_path.write_text(json.dumps(dump_job_payload(updated), indent=2, sort_keys=True), encoding="utf-8")
+        temp_path.replace(path)
     except Exception:
         pass
     return updated
 
 
 def get_job(job_id: str) -> JobState:
-    with jobs_lock:
-        job = jobs.get(job_id)
-    if job:
-        return job
+    # Persistent status is the source of truth. Modal may route polling requests
+    # to a different warm container whose in-memory cache is behind the worker
+    # container that completed the render.
     path = status_path_for(job_id)
     if path.exists():
         try:
@@ -193,7 +194,15 @@ def get_job(job_id: str) -> JobState:
                 jobs[job_id] = job
             return job
         except Exception as exc:
+            with jobs_lock:
+                cached_job = jobs.get(job_id)
+            if cached_job:
+                return cached_job
             raise HTTPException(status_code=500, detail=f"Could not read job status: {exc}")
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if job:
+        return job
     raise HTTPException(status_code=404, detail="Job not found")
 
 
