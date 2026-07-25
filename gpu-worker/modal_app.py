@@ -193,6 +193,24 @@ def process_eraser_job_remote(
 
 @app.function(
     image=worker_image,
+    timeout=60 * 30,
+    scaledown_window=60,
+    max_containers=1,
+    volumes={"/jobs": eraser_jobs},
+)
+@modal.concurrent(max_inputs=1)
+def recover_eraser_job_remote(job_id: str):
+    worker_main = load_worker_main()
+    eraser_jobs.reload()
+    try:
+        worker_main.recover_existing_eraser_job(job_id)
+        return worker_main.dump_job_payload(worker_main.get_job(job_id))
+    finally:
+        eraser_jobs.commit()
+
+
+@app.function(
+    image=worker_image,
     gpu="A10G",
     timeout=60 * 20,
     scaledown_window=60,
@@ -242,6 +260,7 @@ def process_ai_remix_job_remote(
 def fastapi_app():
     os.environ["ERASER_MODAL_APP_NAME"] = "tvapp-video-eraser-gpu"
     os.environ["ERASER_MODAL_FUNCTION"] = "process_eraser_job_remote"
+    os.environ["ERASER_MODAL_RECOVERY_FUNCTION"] = "recover_eraser_job_remote"
     os.environ["AI_REMIX_MODAL_FUNCTION"] = "process_ai_remix_job_remote"
     worker_main = load_worker_main()
     fastapi_application = worker_main.app
@@ -253,6 +272,7 @@ def fastapi_app():
             "worker": "tvapp-video-eraser-gpu",
             "dispatch": "tracked-modal-function",
             "eraser_function": "process_eraser_job_remote",
+            "eraser_recovery_function": "recover_eraser_job_remote",
             "ai_remix_function": "process_ai_remix_job_remote",
             "max_parallel_eraser_jobs": 1,
             "status_backend": "modal-dict",

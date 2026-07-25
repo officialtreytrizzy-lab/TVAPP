@@ -30,6 +30,7 @@ PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2
 AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pipelines/wan_vace_remix.py").strip()
 MODAL_APP_NAME = os.environ.get("ERASER_MODAL_APP_NAME", "").strip()
 MODAL_ERASER_FUNCTION = os.environ.get("ERASER_MODAL_FUNCTION", "").strip()
+MODAL_RECOVERY_FUNCTION = os.environ.get("ERASER_MODAL_RECOVERY_FUNCTION", "").strip()
 MODAL_REMIX_FUNCTION = os.environ.get("AI_REMIX_MODAL_FUNCTION", "").strip()
 ERASER_JOB_TIMEOUT_SECONDS = int(os.environ.get("ERASER_JOB_TIMEOUT_SECONDS", str(60 * 40)))
 
@@ -38,7 +39,7 @@ TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
@@ -205,6 +206,14 @@ async def dispatch_remix_job(args: tuple[Any, ...]) -> str | None:
     if call_id:
         return call_id
     Thread(target=process_ai_remix_job, args=args, daemon=True).start()
+    return None
+
+
+async def dispatch_recovery_job(job_id: str) -> str | None:
+    call_id = await spawn_modal_function(MODAL_RECOVERY_FUNCTION, (job_id,))
+    if call_id:
+        return call_id
+    Thread(target=recover_existing_eraser_job, args=(job_id,), daemon=True).start()
     return None
 
 
@@ -542,6 +551,227 @@ def read_or_infer_eraser_request(job_id: str) -> tuple[str, str, str, str, str, 
     if eraser_request_path(job_id).exists():
         return read_eraser_request(job_id)
     return infer_legacy_eraser_request(job_id)
+
+
+def load_eraser_pipeline_modules() -> tuple[Any, Any, Any]:
+    import sys
+
+    pipeline_dir = Path(__file__).resolve().parent / "pipelines"
+    pipeline_dir_text = str(pipeline_dir)
+    if pipeline_dir_text not in sys.path:
+        sys.path.insert(0, pipeline_dir_text)
+    import sam2_propainter as locked_core
+    import sam2_propainter_resilient as resilient_pipeline
+    import sam2_propainter_verified as verified_pipeline
+
+    return locked_core, resilient_pipeline, verified_pipeline
+
+
+def normalize_existing_propainter_candidate(
+    candidate: Path,
+    destination: Path,
+    target_width: int,
+    target_height: int,
+    fps: float,
+) -> Path:
+    completed = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(candidate),
+            "-vf",
+            f"scale={target_width}:{target_height}:flags=lanczos,setsar=1,fps={fps:.6f}",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "12",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr[-4000:] or "Could not normalize the completed ProPainter candidate")
+    assert_playable_mp4(destination)
+    return destination
+
+
+def recover_existing_eraser_job(job_id: str) -> None:
+    job_dir = WORK_DIR / job_id
+    recovery_log = job_dir / "recovery.log"
+    output_path = job_dir / "output.mp4"
+    try:
+        args = read_or_infer_eraser_request(job_id)
+        selected_frame_index = max(0, int(float(args[2] or 0)))
+        output_quality = "higher" if args[7] == "higher" else "source"
+        source_mp4 = job_dir / "source_for_propainter.mp4"
+        if not source_mp4.exists():
+            raise RuntimeError("The saved source_for_propainter.mp4 is missing")
+
+        raw_candidate = job_dir / "propainter_chunked_joined.mp4"
+        if not raw_candidate.exists() or raw_candidate.stat().st_size <= 0:
+            raise RuntimeError("The completed ProPainter candidate is missing")
+
+        locked_core, resilient_pipeline, verified_pipeline = load_eraser_pipeline_modules()
+        fps, width, height = locked_core.read_video_meta(source_mp4)
+        frame_count = resilient_pipeline.video_frame_count(source_mp4)
+        if frame_count <= 0:
+            raise RuntimeError("Could not determine the saved source frame count")
+        selected_frame_index = min(selected_frame_index, frame_count - 1)
+        anchor_mask = verified_pipeline.verification_mask(job_dir / "mask.png", width, height)
+
+        recovery_masks = job_dir / "sam2_remove_masks_recovery"
+        base_masks = job_dir / "sam2_remove_masks"
+        active_masks = recovery_masks if any(recovery_masks.glob("*.png")) else base_masks
+        if not active_masks.exists() or not any(active_masks.glob("*.png")):
+            raise RuntimeError("The saved SAM2 tracked masks are missing")
+
+        plan = resilient_pipeline.long_clip_chunk_plan(frame_count, width, height, output_quality)
+        target_width = int(plan["processing_width"])
+        target_height = int(plan["processing_height"])
+        normalized_candidate = job_dir / "propainter_chunked_normalized.mp4"
+
+        set_job(
+            job_id,
+            phase="validation",
+            progress=88,
+            statusMessage="Recovering the completed ProPainter render without rerunning the GPU",
+            error=None,
+        )
+        append_text_log(
+            recovery_log,
+            f"Normalizing mixed-resolution candidate to {target_width}x{target_height} at {fps:.6f} fps",
+        )
+        normalize_existing_propainter_candidate(
+            raw_candidate,
+            normalized_candidate,
+            target_width,
+            target_height,
+            fps,
+        )
+        resilient_pipeline.validate_video_liveness(
+            source_mp4,
+            normalized_candidate,
+            "Recovered ProPainter candidate",
+            active_masks,
+        )
+        verified_pipeline.validate_selection_changed(
+            source_mp4,
+            normalized_candidate,
+            anchor_mask,
+            selected_frame_index,
+            "Recovered ProPainter candidate",
+        )
+        verified_pipeline.validate_patch_quality(
+            source_mp4,
+            normalized_candidate,
+            anchor_mask,
+            selected_frame_index,
+            "Recovered ProPainter candidate",
+        )
+        verified_pipeline.validate_timeline_selection_changed(
+            source_mp4,
+            normalized_candidate,
+            active_masks,
+            selected_frame_index,
+            "Recovered ProPainter candidate",
+        )
+
+        set_job(
+            job_id,
+            phase="audio_preserving_export",
+            progress=93,
+            statusMessage="Finishing the saved render and restoring audio",
+        )
+        composite_video = locked_core.composite_inpainted_region(
+            source_mp4,
+            normalized_candidate,
+            active_masks,
+            job_dir / "source_preserving_recovered_composite.mp4",
+            fps,
+        )
+        locked_core.mux_audio(
+            composite_video,
+            source_mp4,
+            output_path,
+            width,
+            height,
+            fps,
+            output_quality,
+        )
+
+        set_job(
+            job_id,
+            phase="validation",
+            progress=97,
+            statusMessage="Validating the recovered final video",
+        )
+        resilient_pipeline.validate_video_liveness(
+            source_mp4,
+            output_path,
+            "Recovered final eraser output",
+            active_masks,
+        )
+        verified_pipeline.validate_selection_changed(
+            source_mp4,
+            output_path,
+            anchor_mask,
+            selected_frame_index,
+            "Recovered final eraser output",
+        )
+        verified_pipeline.validate_patch_quality(
+            source_mp4,
+            output_path,
+            anchor_mask,
+            selected_frame_index,
+            "Recovered final eraser output",
+        )
+        verified_pipeline.validate_timeline_selection_changed(
+            source_mp4,
+            output_path,
+            active_masks,
+            selected_frame_index,
+            "Recovered final eraser output",
+        )
+        assert_playable_mp4(output_path)
+        final_url = public_output_url(job_id)
+        append_text_log(recovery_log, "Recovered saved ProPainter candidate successfully")
+        set_job(
+            job_id,
+            phase="completed",
+            progress=100,
+            statusMessage="SAM2 + ProPainter removal complete",
+            outputUrl=final_url,
+            finalCompositeUrl=final_url,
+            compositeOutputUrl=final_url,
+            fullVideoUrl=final_url,
+            finalOutputUrl=final_url,
+            outputKind="final_composite_video",
+            error=None,
+        )
+    except Exception as exc:
+        message = str(exc)
+        append_text_log(recovery_log, f"ERROR: {message}")
+        set_job(
+            job_id,
+            phase="failed",
+            progress=100,
+            statusMessage="Could not recover the saved ProPainter render",
+            error=(tail_text(recovery_log) or message)[-6000:],
+        )
 
 
 def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps: str, duration: str, width: str, height: str, quality: str) -> None:
@@ -1015,6 +1245,32 @@ async def retry_video_job(job_id: str):
     current = get_job(job_id)
     if current.phase == "completed":
         return dump_job_payload(current)
+    job_dir = WORK_DIR / job_id
+    completed_candidate = job_dir / "propainter_chunked_joined.mp4"
+    if completed_candidate.exists() and completed_candidate.stat().st_size > 0:
+        state = set_job(
+            job_id,
+            phase="queued",
+            progress=5,
+            statusMessage="Recovering completed ProPainter render without rerunning GPU",
+            error=None,
+            functionCallId=None,
+        )
+        commit_job_volume()
+        try:
+            call_id = await dispatch_recovery_job(job_id)
+            state = set_job(job_id, functionCallId=call_id)
+        except Exception as exc:
+            set_job(
+                job_id,
+                phase="failed",
+                progress=100,
+                statusMessage="Could not enter the render recovery queue",
+                error=str(exc),
+            )
+            raise HTTPException(status_code=503, detail=f"Could not queue render recovery: {exc}")
+        return dump_job_payload(state)
+
     args = read_or_infer_eraser_request(job_id)
     clear_eraser_derived_artifacts(job_id)
     state = set_job(job_id, phase="queued", progress=5, statusMessage="Retry waiting for the GPU queue", error=None, functionCallId=None)

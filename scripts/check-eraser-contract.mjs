@@ -120,6 +120,9 @@ forbidText('vercel.json', 'californiatrey--tvapp-video-eraser-gpu', 'production 
 requireText('gpu-worker/modal_app.py', 'gpu="A10G"', 'diffusion inpainting requires a real GPU');
 requireText('gpu-worker/modal_app.py', 'max_containers=1', 'in-memory status requires one active worker container');
 requireText('gpu-worker/modal_app.py', '@modal.concurrent(max_inputs=1)', 'one diffusion render may run per GPU container');
+requireText('gpu-worker/modal_app.py', 'def recover_eraser_job_remote', 'completed ProPainter candidates must recover without another GPU pass');
+requireText('gpu-worker/main.py', 'Recovering completed ProPainter render without rerunning GPU', 'failed completed candidates must use the no-GPU recovery queue');
+requireText('gpu-worker/pipelines/sam2_propainter_resilient.py', 'scale={target_width}:{target_height}:flags=lanczos,setsar=1', 'all resilient ProPainter chunks must be normalized before concatenation');
 requireText('gpu-worker/modal_app.py', 'timeout=60 * 45', 'diffusion jobs need a long worker timeout');
 requireText('gpu-worker/modal_app.py', 'python /app/pipelines/sam2_propainter_verified.py', 'Modal must execute the verified SAM2 + ProPainter pipeline');
 requireText('gpu-worker/modal_app.py', 'flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl', 'Modal image must include the verified Flash Attention CUDA wheel');

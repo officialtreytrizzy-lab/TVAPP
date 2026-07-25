@@ -443,6 +443,8 @@ def trim_propainter_chunk(
     destination: Path,
     keep_start: int,
     keep_end: int,
+    target_width: int,
+    target_height: int,
 ) -> Path:
     if keep_end <= keep_start:
         raise RuntimeError(
@@ -455,7 +457,7 @@ def trim_propainter_chunk(
             "-i",
             str(candidate),
             "-vf",
-            f"trim=start_frame={keep_start}:end_frame={keep_end},setpts=PTS-STARTPTS",
+            f"trim=start_frame={keep_start}:end_frame={keep_end},setpts=PTS-STARTPTS,scale={target_width}:{target_height}:flags=lanczos,setsar=1",
             "-an",
             "-c:v",
             "libx264",
@@ -539,6 +541,8 @@ def run_propainter_chunked(
             chunk_root / "completed.mp4",
             keep_start,
             keep_end,
+            int(plan["processing_width"]),
+            int(plan["processing_height"]),
         )
         outputs.append(completed)
         if core_end < frame_count:
@@ -548,6 +552,10 @@ def run_propainter_chunked(
     if joined.exists():
         joined.unlink()
     core.concatenate_propainter_chunks(outputs, joined)
+    print(
+        f"Normalized every ProPainter segment to {int(plan['processing_width'])}x{int(plan['processing_height'])} before concatenation",
+        flush=True,
+    )
     manifest = {
         "frame_count": frame_count,
         "core_frames": core_frames,
