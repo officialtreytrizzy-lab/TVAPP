@@ -28,13 +28,17 @@ UPLOAD_WORK_DIR = Path(os.environ.get("ERASER_UPLOAD_WORK_DIR", str(WORK_DIR / "
 PUBLIC_BASE_URL = os.environ.get("ERASER_PUBLIC_BASE_URL", "").rstrip("/")
 PIPELINE_CMD = os.environ.get("ERASER_PIPELINE_CMD", "python /app/pipelines/sam2_propainter_verified.py").strip()
 AI_REMIX_PIPELINE_CMD = os.environ.get("AI_REMIX_PIPELINE_CMD", "python /app/pipelines/wan_vace_remix.py").strip()
+MODAL_APP_NAME = os.environ.get("ERASER_MODAL_APP_NAME", "").strip()
+MODAL_ERASER_FUNCTION = os.environ.get("ERASER_MODAL_FUNCTION", "").strip()
+MODAL_REMIX_FUNCTION = os.environ.get("AI_REMIX_MODAL_FUNCTION", "").strip()
+ERASER_JOB_TIMEOUT_SECONDS = int(os.environ.get("ERASER_JOB_TIMEOUT_SECONDS", str(60 * 40)))
 
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 TRANSITION_WORK_DIR.mkdir(parents=True, exist_ok=True)
 REMIX_WORK_DIR.mkdir(parents=True, exist_ok=True)
 UPLOAD_WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-APP_VERSION = "1.11.1"
+APP_VERSION = "1.12.0"
 WORKER_NAME = "tvapp-video-eraser-gpu"
 WAN_ROOT = os.environ.get("WAN_ROOT", "/opt/Wan2.1")
 WAN_CKPT_DIR = os.environ.get("WAN_CKPT_DIR", "/models/Wan2.1-VACE-1.3B")
@@ -116,6 +120,9 @@ class JobState(BaseModel):
     prompt: str | None = None
     intent: str | None = None
     strength: str | None = None
+    functionCallId: str | None = None
+    queuedAt: str | None = None
+    updatedAt: str | None = None
 
 
 class ChunkUploadCreate(BaseModel):
@@ -144,6 +151,61 @@ class ChunkUploadComplete(BaseModel):
 
 jobs: dict[str, JobState] = {}
 jobs_lock = Lock()
+job_volume: Any | None = None
+job_status_store: Any | None = None
+
+
+def utc_timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def configure_modal_resources(volume: Any | None = None, status_store: Any | None = None) -> None:
+    global job_volume, job_status_store
+    job_volume = volume
+    job_status_store = status_store
+
+
+def commit_job_volume() -> None:
+    if job_volume is None:
+        return
+    try:
+        job_volume.commit()
+    except Exception as exc:
+        print(f"Could not commit eraser job volume: {exc}", flush=True)
+
+
+def reload_job_volume() -> None:
+    if job_volume is None:
+        return
+    try:
+        job_volume.reload()
+    except Exception as exc:
+        print(f"Could not reload eraser job volume: {exc}", flush=True)
+
+
+async def spawn_modal_function(function_name: str, args: tuple[Any, ...]) -> str | None:
+    if not MODAL_APP_NAME or not function_name:
+        return None
+    import modal
+    function = modal.Function.from_name(MODAL_APP_NAME, function_name)
+    call = await function.spawn.aio(*args)
+    return call.object_id
+
+
+async def dispatch_eraser_job(args: tuple[Any, ...]) -> str | None:
+    call_id = await spawn_modal_function(MODAL_ERASER_FUNCTION, args)
+    if call_id:
+        return call_id
+    Thread(target=process_job, args=args, daemon=True).start()
+    return None
+
+
+async def dispatch_remix_job(args: tuple[Any, ...]) -> str | None:
+    call_id = await spawn_modal_function(MODAL_REMIX_FUNCTION, args)
+    if call_id:
+        return call_id
+    Thread(target=process_ai_remix_job, args=args, daemon=True).start()
+    return None
 
 
 def dump_job_payload(job: JobState, request: Request | None = None) -> dict[str, Any]:
@@ -167,23 +229,42 @@ def set_job(job_id: str, **updates: Any) -> JobState:
         current = jobs.get(job_id) or JobState(jobId=job_id)
         data = current.model_dump()
         data.update(updates)
+        if str(data.get("phase") or "") == "queued" and not data.get("queuedAt"):
+            data["queuedAt"] = utc_timestamp()
+        data["updatedAt"] = utc_timestamp()
         updated = JobState(**data)
         jobs[job_id] = updated
+    payload = dump_job_payload(updated)
     try:
         path = status_path_for(job_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_name(f".{path.name}.{os.getpid()}.{get_ident()}.tmp")
-        temp_path.write_text(json.dumps(dump_job_payload(updated), indent=2, sort_keys=True), encoding="utf-8")
+        temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
         temp_path.replace(path)
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"Could not persist job status file for {job_id}: {exc}", flush=True)
+    if job_status_store is not None:
+        try:
+            job_status_store[job_id] = payload
+        except Exception as exc:
+            print(f"Could not persist distributed job status for {job_id}: {exc}", flush=True)
     return updated
 
 
 def get_job(job_id: str) -> JobState:
-    # Persistent status is the source of truth. Modal may route polling requests
-    # to a different warm container whose in-memory cache is behind the worker
-    # container that completed the render.
+    # Modal Dict is the cross-container source of truth. The status file remains
+    # a durable fallback for older jobs and disaster recovery.
+    if job_status_store is not None:
+        try:
+            data = job_status_store.get(job_id)
+            if data:
+                data["jobId"] = data.get("jobId") or data.get("job_id") or job_id
+                job = JobState(**{k: v for k, v in data.items() if k in JobState.model_fields})
+                with jobs_lock:
+                    jobs[job_id] = job
+                return job
+        except Exception as exc:
+            print(f"Could not read distributed job status for {job_id}: {exc}", flush=True)
     path = status_path_for(job_id)
     if path.exists():
         try:
@@ -343,13 +424,140 @@ def assert_playable_mp4(path: Path) -> None:
         raise RuntimeError("Output exists but does not contain a playable video stream.")
 
 
+def eraser_request_path(job_id: str) -> Path:
+    return WORK_DIR / job_id / "request.json"
+
+
+def write_eraser_request(job_id: str, args: tuple[Any, ...]) -> None:
+    keys = ("job_id", "selected_time", "selected_frame_index", "fps", "duration", "width", "height", "quality")
+    payload = dict(zip(keys, args, strict=True))
+    path = eraser_request_path(job_id)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def read_eraser_request(job_id: str) -> tuple[str, str, str, str, str, str, str, str]:
+    path = eraser_request_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=409, detail="This legacy job does not contain retry metadata")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return (
+        str(payload.get("job_id") or job_id),
+        str(payload.get("selected_time") or "0"),
+        str(payload.get("selected_frame_index") or "0"),
+        str(payload.get("fps") or "30"),
+        str(payload.get("duration") or "0"),
+        str(payload.get("width") or "0"),
+        str(payload.get("height") or "0"),
+        "higher" if payload.get("quality") == "higher" else "source",
+    )
+
+
+def clear_eraser_derived_artifacts(job_id: str) -> None:
+    job_dir = WORK_DIR / job_id
+    keep = {"input_video", "mask.png", "request.json"}
+    for child in job_dir.iterdir():
+        if child.name in keep:
+            continue
+        if child.is_dir():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+
+
+def infer_legacy_eraser_request(job_id: str) -> tuple[str, str, str, str, str, str, str, str]:
+    import cv2
+    import numpy as np
+
+    job_dir = WORK_DIR / job_id
+    video_path = job_dir / "input_video"
+    mask_path = job_dir / "mask.png"
+    if not video_path.exists() or not mask_path.exists():
+        raise HTTPException(status_code=409, detail="The legacy job is missing its source video or mask")
+
+    width, height, fps = ffprobe_video(video_path)
+    duration = ffprobe_duration(video_path)
+    raw_anchor = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
+    if raw_anchor is None:
+        raise HTTPException(status_code=409, detail="The legacy job mask is unreadable")
+    if raw_anchor.ndim == 3 and raw_anchor.shape[2] == 4:
+        anchor_mask = raw_anchor[:, :, 3]
+    elif raw_anchor.ndim == 3:
+        anchor_mask = cv2.cvtColor(raw_anchor, cv2.COLOR_BGR2GRAY)
+    else:
+        anchor_mask = raw_anchor
+    if anchor_mask.shape[1] != width or anchor_mask.shape[0] != height:
+        anchor_mask = cv2.resize(anchor_mask, (width, height), interpolation=cv2.INTER_NEAREST)
+    anchor_binary = anchor_mask > 24
+    if not np.any(anchor_binary):
+        raise HTTPException(status_code=409, detail="The legacy job mask is empty")
+
+    best_index = 0
+    best_iou = -1.0
+    candidate_dirs = [
+        job_dir / "sam2_remove_masks_recovery",
+        job_dir / "sam2_remove_masks",
+    ]
+    for candidate_dir in candidate_dirs:
+        if not candidate_dir.exists():
+            continue
+        for candidate_path in candidate_dir.glob("*.png"):
+            try:
+                index = int(candidate_path.stem)
+            except ValueError:
+                continue
+            tracked = cv2.imread(str(candidate_path), cv2.IMREAD_GRAYSCALE)
+            if tracked is None:
+                continue
+            if tracked.shape[1] != width or tracked.shape[0] != height:
+                tracked = cv2.resize(tracked, (width, height), interpolation=cv2.INTER_NEAREST)
+            tracked_binary = tracked > 24
+            union = np.count_nonzero(anchor_binary | tracked_binary)
+            if union <= 0:
+                continue
+            intersection = np.count_nonzero(anchor_binary & tracked_binary)
+            iou = float(intersection) / float(union)
+            if iou > best_iou:
+                best_iou = iou
+                best_index = index
+
+    args = (
+        job_id,
+        f"{best_index / max(fps, 0.001):.6f}",
+        str(best_index),
+        f"{fps:.6f}",
+        f"{duration:.6f}",
+        str(width),
+        str(height),
+        "source",
+    )
+    write_eraser_request(job_id, args)
+    append_text_log(
+        job_dir / "recovery.log",
+        f"Recovered legacy request metadata: selected_frame_index={best_index} mask_iou={best_iou:.6f} fps={fps:.6f}",
+    )
+    return args
+
+
+def read_or_infer_eraser_request(job_id: str) -> tuple[str, str, str, str, str, str, str, str]:
+    if eraser_request_path(job_id).exists():
+        return read_eraser_request(job_id)
+    return infer_legacy_eraser_request(job_id)
+
+
 def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps: str, duration: str, width: str, height: str, quality: str) -> None:
     job_dir = WORK_DIR / job_id
     video_path = job_dir / "input_video"
     mask_path = job_dir / "mask.png"
     output_path = job_dir / "output.mp4"
+    pipeline_log_path = job_dir / "pipeline.log"
+    error_log_path = job_dir / "error.log"
+    started_at = time.monotonic()
+    last_heartbeat_at = started_at
     process: subprocess.Popen[str] | None = None
     try:
+        append_text_log(pipeline_log_path, f"timestamp={utc_timestamp()}")
+        append_text_log(pipeline_log_path, f"job_id={job_id}")
+        append_text_log(pipeline_log_path, f"worker_pid={os.getpid()} thread_id={get_ident()}")
         set_job(
             job_id,
             phase="frame_extraction",
@@ -397,10 +605,14 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
         )
         assert process.stdout is not None
         log_lines: list[str] = []
-        for raw_line in process.stdout:
+
+        def handle_pipeline_line(raw_line: str) -> None:
             line = raw_line.rstrip("\n")
+            if not line:
+                return
             log_lines.append(line)
-            print(line, flush=True)
+            append_text_log(pipeline_log_path, line)
+            print(f"[{job_id}] {line}", flush=True)
             if line.startswith("PIPELINE_STAGE:"):
                 try:
                     stage = json.loads(line.split(":", 1)[1])
@@ -411,12 +623,38 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
                         statusMessage=str(stage.get("message") or "Processing video"),
                     )
                 except Exception as stage_error:
-                    print(f"Could not parse pipeline stage update: {stage_error}", flush=True)
-        return_code = process.wait(timeout=60 * 60)
+                    append_text_log(pipeline_log_path, f"Could not parse stage update: {stage_error}")
+
+        while True:
+            ready, _, _ = select.select([process.stdout], [], [], 1.0)
+            if ready:
+                raw_line = process.stdout.readline()
+                if raw_line:
+                    handle_pipeline_line(raw_line)
+            if process.poll() is not None:
+                for raw_line in process.stdout:
+                    handle_pipeline_line(raw_line)
+                break
+            now = time.monotonic()
+            elapsed = now - started_at
+            if elapsed > ERASER_JOB_TIMEOUT_SECONDS:
+                raise TimeoutError(f"Eraser pipeline exceeded {ERASER_JOB_TIMEOUT_SECONDS} seconds")
+            if now - last_heartbeat_at >= 60:
+                current = get_job(job_id)
+                heartbeat_progress = min(85, max(current.progress, current.progress + 1))
+                set_job(
+                    job_id,
+                    phase=current.phase,
+                    progress=heartbeat_progress,
+                    statusMessage=f"{current.statusMessage} - GPU job is still active ({int(elapsed // 60)}m)",
+                )
+                last_heartbeat_at = now
+        return_code = int(process.returncode or 0)
         if return_code != 0:
             raise RuntimeError("\n".join(log_lines[-120:]) or f"Pipeline exited with {return_code}")
         assert_playable_mp4(output_path)
         final_url = public_output_url(job_id)
+        append_text_log(pipeline_log_path, "Eraser pipeline completed successfully")
         set_job(
             job_id,
             phase="completed",
@@ -431,6 +669,9 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             error=None,
         )
     except Exception as exc:
+        message = str(exc)
+        append_text_log(pipeline_log_path, f"ERROR: {message}")
+        error_log_path.write_text(tail_text(pipeline_log_path) or message, encoding="utf-8")
         if process is not None and process.poll() is None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
@@ -441,7 +682,7 @@ def process_job(job_id: str, selected_time: str, selected_frame_index: str, fps:
             phase="failed",
             progress=100,
             statusMessage="SAM2 + ProPainter removal failed",
-            error=str(exc),
+            error=(tail_text(pipeline_log_path) or message)[-6000:],
         )
 
 def process_ai_remix_job(job_id: str, prompt: str, intent: str, strength: str, preserve_audio: str, preserve_face: str, preserve_motion: str, quality: str) -> None:
@@ -703,26 +944,30 @@ async def complete_chunked_upload(upload_id: str, payload: ChunkUploadComplete):
     (job_dir / "mask.png").write_bytes(decode_mask_data_url(payload.mask_base64))
     shutil.rmtree(upload_dir, ignore_errors=True)
 
+    args = (
+        remote_job_id,
+        str(payload.selected_time),
+        str(payload.selected_frame_index),
+        str(payload.fps),
+        str(payload.duration),
+        str(payload.width),
+        str(payload.height),
+        "higher" if payload.quality == "higher" else "source",
+    )
+    write_eraser_request(remote_job_id, args)
     state = set_job(
         remote_job_id,
         phase="queued",
         progress=5,
-        statusMessage="Chunked upload verified; queued SAM2 + ProPainter removal",
+        statusMessage="Chunked upload verified; queued SAM2 + ProPainter removal - waiting for the GPU queue",
     )
-    Thread(
-        target=process_job,
-        args=(
-            remote_job_id,
-            str(payload.selected_time),
-            str(payload.selected_frame_index),
-            str(payload.fps),
-            str(payload.duration),
-            str(payload.width),
-            str(payload.height),
-            "higher" if payload.quality == "higher" else "source",
-        ),
-        daemon=True,
-    ).start()
+    commit_job_volume()
+    try:
+        call_id = await dispatch_eraser_job(args)
+        state = set_job(remote_job_id, functionCallId=call_id)
+    except Exception as exc:
+        set_job(remote_job_id, phase="failed", progress=100, statusMessage="Could not enter the GPU queue", error=str(exc))
+        raise HTTPException(status_code=503, detail=f"Could not queue eraser job: {exc}")
     response = dump_job_payload(state)
     response.update({
         "upload_id": upload_id,
@@ -743,8 +988,16 @@ async def create_job(video: UploadFile = File(...), mask: UploadFile = File(...)
     job_dir.mkdir(parents=True, exist_ok=True)
     save_upload(video, job_dir / "input_video")
     save_upload(mask, job_dir / "mask.png")
-    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued SAM2 + ProPainter removal")
-    Thread(target=process_job, args=(remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, quality), daemon=True).start()
+    args = (remote_job_id, selected_time, selected_frame_index, fps, duration, width, height, "higher" if quality == "higher" else "source")
+    write_eraser_request(remote_job_id, args)
+    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Waiting for the GPU queue")
+    commit_job_volume()
+    try:
+        call_id = await dispatch_eraser_job(args)
+        state = set_job(remote_job_id, functionCallId=call_id)
+    except Exception as exc:
+        set_job(remote_job_id, phase="failed", progress=100, statusMessage="Could not enter the GPU queue", error=str(exc))
+        raise HTTPException(status_code=503, detail=f"Could not queue eraser job: {exc}")
     payload = dump_job_payload(state)
     payload["statusUrl"] = payload["status_url"] = f"/v1/video-eraser/jobs/{remote_job_id}"
     payload["outputUrl"] = payload["output_url"] = f"/v1/video-eraser/jobs/{remote_job_id}/output"
@@ -756,8 +1009,34 @@ async def get_video_job(job_id: str):
     return dump_job_payload(get_job(job_id))
 
 
+@app.post("/v1/video-eraser/jobs/{job_id}/retry")
+async def retry_video_job(job_id: str):
+    reload_job_volume()
+    current = get_job(job_id)
+    if current.phase == "completed":
+        return dump_job_payload(current)
+    args = read_or_infer_eraser_request(job_id)
+    clear_eraser_derived_artifacts(job_id)
+    state = set_job(job_id, phase="queued", progress=5, statusMessage="Retry waiting for the GPU queue", error=None, functionCallId=None)
+    commit_job_volume()
+    call_id = await dispatch_eraser_job(args)
+    state = set_job(job_id, functionCallId=call_id)
+    return dump_job_payload(state)
+
+
+@app.get("/v1/video-eraser/jobs/{job_id}/log")
+async def get_video_job_log(job_id: str):
+    reload_job_volume()
+    job_dir = WORK_DIR / job_id
+    for candidate in (job_dir / "error.log", job_dir / "pipeline.log"):
+        if candidate.exists():
+            return PlainTextResponse(candidate.read_text(encoding="utf-8", errors="replace"), media_type="text/plain")
+    return JSONResponse(status_code=404, content={"error": "No eraser log found", "job_id": job_id})
+
+
 @app.get("/v1/video-eraser/jobs/{job_id}/output")
 async def get_video_job_output(job_id: str):
+    reload_job_volume()
     job_dir = WORK_DIR / job_id
     output = job_dir / "output.mp4"
     if not output.exists():
@@ -791,10 +1070,16 @@ async def create_ai_remix_job(request: Request, video: UploadFile = File(...), p
     metadata_path.write_text(f"prompt={prompt}\nintent={intent}\nstrength={normalized_strength}\npreserve_audio={preserve_audio}\npreserve_face={preserve_face}\npreserve_motion={preserve_motion}\nquality={normalized_quality}\n", encoding="utf-8")
     append_text_log(job_dir / "wan_pipeline.log", f"job_id={remote_job_id}")
     append_text_log(job_dir / "wan_pipeline.log", f"queued_at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
-    append_text_log(job_dir / "wan_pipeline.log", "queued AI Remix job; background worker thread will append lifecycle details")
-    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="Queued AI Remix", prompt=prompt, intent=intent, strength=normalized_strength)
-    thread = Thread(target=process_ai_remix_job, args=(remote_job_id, prompt, intent, normalized_strength, preserve_audio, preserve_face, preserve_motion, normalized_quality), daemon=True)
-    thread.start()
+    append_text_log(job_dir / "wan_pipeline.log", "queued AI Remix job; tracked Modal function will append lifecycle details")
+    state = set_job(remote_job_id, phase="queued", progress=5, statusMessage="AI Remix waiting for the GPU queue", prompt=prompt, intent=intent, strength=normalized_strength)
+    commit_job_volume()
+    remix_args = (remote_job_id, prompt, intent, normalized_strength, preserve_audio, preserve_face, preserve_motion, normalized_quality)
+    try:
+        call_id = await dispatch_remix_job(remix_args)
+        state = set_job(remote_job_id, functionCallId=call_id)
+    except Exception as exc:
+        set_job(remote_job_id, phase="failed", progress=100, statusMessage="Could not enter the AI Remix GPU queue", error=str(exc), prompt=prompt, intent=intent, strength=normalized_strength)
+        raise HTTPException(status_code=503, detail=f"Could not queue AI Remix job: {exc}")
     payload = dump_job_payload(state, request)
     status_path = f"/v1/ai-remix/jobs/{remote_job_id}"
     payload["statusUrl"] = payload["status_url"] = absolute_url(status_path, request)
@@ -817,6 +1102,7 @@ async def get_ai_remix_job(job_id: str, request: Request):
 
 @app.get("/v1/ai-remix/jobs/{job_id}/output")
 async def get_ai_remix_output(job_id: str):
+    reload_job_volume()
     job = get_job(job_id)
     output = REMIX_WORK_DIR / job_id / "output.mp4"
     if job.phase != "completed":
@@ -832,6 +1118,7 @@ async def get_ai_remix_output(job_id: str):
 
 @app.get("/v1/ai-remix/jobs/{job_id}/log")
 async def get_ai_remix_log(job_id: str):
+    reload_job_volume()
     job_dir = REMIX_WORK_DIR / job_id
     for candidate in (job_dir / "error.log", job_dir / "wan_pipeline.log"):
         if candidate.exists():

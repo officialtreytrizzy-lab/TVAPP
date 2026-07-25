@@ -17,6 +17,7 @@ import modal
 
 wan_models = modal.Volume.from_name("tvapp-wan-models", create_if_missing=True)
 eraser_jobs = modal.Volume.from_name("tvapp-video-eraser-jobs", create_if_missing=True)
+eraser_status = modal.Dict.from_name("tvapp-video-eraser-status", create_if_missing=True)
 
 worker_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -122,20 +123,7 @@ def download_models():
     print(download_wan_model.remote())
 
 
-@app.function(
-    image=worker_image,
-    gpu="A10G",
-    timeout=60 * 45,
-    scaledown_window=60 * 20,
-    max_containers=1,
-    volumes={"/models": wan_models, "/jobs": eraser_jobs},
-)
-@modal.concurrent(max_inputs=1)
-@modal.asgi_app()
-def fastapi_app():
-    import sys
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+def configure_worker_environment() -> None:
     os.environ["ERASER_REQUIRE_CUDA"] = "true"
     os.environ["ERASER_PIPELINE_CMD"] = "python /app/pipelines/sam2_propainter_verified.py"
     os.environ["ERASER_WORK_DIR"] = "/jobs/video-eraser"
@@ -150,14 +138,126 @@ def fastapi_app():
     os.environ.setdefault("ERASER_TRACK_REANCHOR_FRAMES", "48")
     os.environ.setdefault("ERASER_PROPAINTER_CHUNK_FRAMES", "120")
     os.environ.setdefault("ERASER_ALLOW_OPENCV_FALLBACK", "false")
-    gpu_details = require_gpu_runtime()
+    os.environ.setdefault("ERASER_JOB_TIMEOUT_SECONDS", str(60 * 40))
 
+
+def load_worker_main():
+    import sys
+
+    configure_worker_environment()
     sys.path.insert(0, "/app")
-    from main import app as fastapi_application
+    import main as worker_main
+
+    worker_main.configure_modal_resources(eraser_jobs, eraser_status)
+    return worker_main
+
+
+@app.function(
+    image=worker_image,
+    gpu="A10G",
+    timeout=60 * 45,
+    scaledown_window=60,
+    max_containers=1,
+    volumes={"/models": wan_models, "/jobs": eraser_jobs},
+)
+@modal.concurrent(max_inputs=1)
+def process_eraser_job_remote(
+    job_id: str,
+    selected_time: str,
+    selected_frame_index: str,
+    fps: str,
+    duration: str,
+    width: str,
+    height: str,
+    quality: str,
+):
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    require_gpu_runtime()
+    worker_main = load_worker_main()
+    eraser_jobs.reload()
+    try:
+        worker_main.process_job(
+            job_id,
+            selected_time,
+            selected_frame_index,
+            fps,
+            duration,
+            width,
+            height,
+            quality,
+        )
+        return worker_main.dump_job_payload(worker_main.get_job(job_id))
+    finally:
+        eraser_jobs.commit()
+
+
+@app.function(
+    image=worker_image,
+    gpu="A10G",
+    timeout=60 * 20,
+    scaledown_window=60,
+    max_containers=1,
+    volumes={"/models": wan_models, "/jobs": eraser_jobs},
+)
+@modal.concurrent(max_inputs=1)
+def process_ai_remix_job_remote(
+    job_id: str,
+    prompt: str,
+    intent: str,
+    strength: str,
+    preserve_audio: str,
+    preserve_face: str,
+    preserve_motion: str,
+    quality: str,
+):
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    require_gpu_runtime()
+    worker_main = load_worker_main()
+    eraser_jobs.reload()
+    try:
+        worker_main.process_ai_remix_job(
+            job_id,
+            prompt,
+            intent,
+            strength,
+            preserve_audio,
+            preserve_face,
+            preserve_motion,
+            quality,
+        )
+        return worker_main.dump_job_payload(worker_main.get_job(job_id))
+    finally:
+        eraser_jobs.commit()
+
+
+@app.function(
+    image=worker_image,
+    timeout=60 * 20,
+    scaledown_window=60 * 5,
+    max_containers=1,
+    volumes={"/models": wan_models, "/jobs": eraser_jobs},
+)
+@modal.concurrent(max_inputs=20, target_inputs=10)
+@modal.asgi_app()
+def fastapi_app():
+    os.environ["ERASER_MODAL_APP_NAME"] = "tvapp-video-eraser-gpu"
+    os.environ["ERASER_MODAL_FUNCTION"] = "process_eraser_job_remote"
+    os.environ["AI_REMIX_MODAL_FUNCTION"] = "process_ai_remix_job_remote"
+    worker_main = load_worker_main()
+    fastapi_application = worker_main.app
 
     @fastapi_application.get("/gpu-health", include_in_schema=False)
     async def gpu_health():
-        return {"ok": True, "worker": "tvapp-video-eraser-gpu", **gpu_details}
+        return {
+            "ok": True,
+            "worker": "tvapp-video-eraser-gpu",
+            "dispatch": "tracked-modal-function",
+            "eraser_function": "process_eraser_job_remote",
+            "ai_remix_function": "process_ai_remix_job_remote",
+            "max_parallel_eraser_jobs": 1,
+            "status_backend": "modal-dict",
+            "media_backend": "modal-volume",
+        }
 
     return fastapi_application
 
