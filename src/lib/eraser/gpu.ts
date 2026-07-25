@@ -96,6 +96,32 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function waitForPollOpportunity(ms: number): Promise<void> {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return sleep(ms);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timer);
+      window.removeEventListener('focus', onResume);
+      window.removeEventListener('pageshow', onResume);
+      window.removeEventListener('online', onResume);
+      document.removeEventListener('visibilitychange', onVisibility);
+      resolve();
+    };
+    const onResume = () => finish();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') finish();
+    };
+    const timer = window.setTimeout(finish, ms);
+    window.addEventListener('focus', onResume);
+    window.addEventListener('pageshow', onResume);
+    window.addEventListener('online', onResume);
+    document.addEventListener('visibilitychange', onVisibility);
+  });
+}
+
 function canvasToPngBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => {
@@ -192,7 +218,7 @@ async function parseWorkerResponse(res: Response): Promise<WorkerJobResponse> {
 }
 
 async function fetchStatus(statusUrl: string): Promise<WorkerJobResponse> {
-  const res = await fetch(statusUrl, { method: 'GET' });
+  const res = await fetch(statusUrl, { method: 'GET', cache: 'no-store' });
   return parseWorkerResponse(res);
 }
 
@@ -451,19 +477,38 @@ async function waitForRemovalOutput(options: {
   const statusUrl = getStatusUrl(payload, baseUrl, statusPathPrefix);
   if (!statusUrl) throw new Error('eTreyser did not return a status URL or output URL.');
 
+  let consecutiveStatusErrors = 0;
+  let lastPhase = 'segmenting';
+  let lastProgress = 24;
   for (let poll = 0; poll < MAX_POLLS; poll++) {
     if (cancelRef.cancelled) {
       if (onCancel) await onCancel(remoteJobId);
       throw new Error('__CANCELLED__');
     }
 
-    await sleep(POLL_MS);
-    payload = await fetchStatus(statusUrl);
+    // iOS can suspend timers and network work while the user switches apps.
+    // A focus/pageshow/visibility event wakes this poll immediately on return.
+    await waitForPollOpportunity(POLL_MS);
+    try {
+      payload = await fetchStatus(statusUrl);
+      consecutiveStatusErrors = 0;
+    } catch (statusError) {
+      consecutiveStatusErrors += 1;
+      if (consecutiveStatusErrors >= 12) throw statusError;
+      onPhase?.(
+        lastPhase,
+        lastProgress,
+        'Connection paused while the app was in the background. Rechecking the finished render...',
+      );
+      continue;
+    }
     remoteJobId = getRemoteJobId(payload) || remoteJobId;
     const phase = normalizePhase(payload);
     const progress = Math.max(24, Math.min(99, Number(payload.progress ?? (24 + poll * 2))));
     const msg = payload.statusMessage || payload.status_message || 'eTreyser is removing the selected object...';
-    onPhase?.(phase === 'completed' ? 'generating_preview' : phase, progress, msg);
+    lastPhase = phase === 'completed' ? 'generating_preview' : phase;
+    lastProgress = progress;
+    onPhase?.(lastPhase, progress, msg);
 
     if (phase === 'failed') throw new Error(payload.error || payload.error_message || payload.statusMessage || payload.status_message || 'AI video removal failed.');
 

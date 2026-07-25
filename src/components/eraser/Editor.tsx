@@ -15,7 +15,7 @@ const MAX_DURATION = 30;
 // Phases where the backend job is actively crunching — Process must be blocked + set_mask skipped.
 const ACTIVE_PROCESSING = new Set([
   'segmenting', 'tracking_mask', 'smoothing_masks', 'inpainting',
-  'frame_extraction', 'optical_flow_tracking', 'diffusion_inpainting',
+  'frame_extraction', 'sam2_tracking', 'propainter_inpainting', 'optical_flow_tracking', 'diffusion_inpainting',
   'audio_preserving_export', 'validation',
   'rebuilding_video', 'attaching_audio', 'generating_preview',
 ]);
@@ -43,6 +43,8 @@ export default function Editor() {
   const sourceFileRef = useRef<File | null>(null);
   // Synchronous lock — fires before setProcessing(true) renders, blocking double-tap/mobile dupes.
   const processingLockRef = useRef(false);
+  const recoveryInFlightRef = useRef(false);
+  const completionAdoptedRef = useRef(false);
   const maskAnchorTimeRef = useRef<number | null>(null);
 
   const [current, setCurrent] = useState(0);
@@ -148,6 +150,97 @@ export default function Editor() {
     setStatusMessage(`Mask locked to frame ${Math.round(maskAnchorTimeRef.current * meta.fps)}.`);
   };
 
+  const recoverRemoteState = useCallback(async () => {
+    if (!jobId || !meta || recoveryInFlightRef.current) return;
+    recoveryInFlightRef.current = true;
+    try {
+      const recovered = await eraserApi.reconcileRemoteJob(jobId);
+      if (!recovered) return;
+      const recoveredPhase = String(recovered.phase || '');
+      const recoveredProgress = Number(recovered.progress ?? 0);
+      const recoveredMessage = String(recovered.statusMessage || recovered.status_message || 'Checking render status...');
+      setPhase(recoveredPhase);
+      if (Number.isFinite(recoveredProgress)) setProgress(recoveredProgress);
+      setStatusMessage(recoveredMessage);
+
+      if (recoveredPhase === 'failed') {
+        setError(String(recovered.error_message || recoveredMessage || 'AI video removal failed.'));
+        processingLockRef.current = false;
+        setProcessing(false);
+        return;
+      }
+      if (recoveredPhase !== 'completed' || completionAdoptedRef.current) return;
+
+      completionAdoptedRef.current = true;
+      const resolvedUrl = await eraserApi.resolveOutputUrl(recovered);
+      if (!resolvedUrl) throw new Error('The worker completed this render but did not expose the output video.');
+      let outputBlob: Blob | undefined;
+      let localUrl = resolvedUrl;
+      try {
+        const response = await fetch(resolvedUrl, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        outputBlob = await response.blob();
+        if (!outputBlob.size) throw new Error('empty output');
+        localUrl = await eraserApi.uploadOutput(jobId, outputBlob, outputBlob.type || 'video/mp4');
+      } catch {
+        // The permanent worker URL still lets the user preview or download even
+        // when iOS refuses the device-storage write after resuming the app.
+      }
+      const recoveredOutput: PipelineOutput = {
+        finalUrl: localUrl,
+        localUrl,
+        remoteUrl: resolvedUrl,
+        outputBlob,
+        mimeType: outputBlob?.type || recovered.output_mime || 'video/mp4',
+        hasAudio: recovered.audio_preserved !== false,
+        outW: meta.width,
+        outH: meta.height,
+        effectiveFps: meta.fps,
+        frameCount: Math.round(meta.duration * meta.fps),
+        procW: meta.width,
+        procH: meta.height,
+        lowConfidenceFrames: [],
+        inpaintedFrames: [],
+        originalFrames: [],
+        timestamps: [],
+        confidence: [],
+      };
+      outputRef.current = recoveredOutput;
+      setFinalUrl(localUrl);
+      setPhase('completed');
+      setProgress(100);
+      setStatusMessage('Render recovered after returning to the app.');
+      processingLockRef.current = false;
+      setProcessing(false);
+    } catch (recoveryError) {
+      completionAdoptedRef.current = false;
+      console.warn('Could not reconcile eTreyser job after browser resume:', recoveryError);
+    } finally {
+      recoveryInFlightRef.current = false;
+    }
+  }, [jobId, meta]);
+
+  useEffect(() => {
+    if (!jobId || !meta) return;
+    const resume = () => {
+      if (document.visibilityState === 'visible') void recoverRemoteState();
+    };
+    const interval = window.setInterval(() => {
+      if (processing || ACTIVE_PROCESSING.has(phase)) void recoverRemoteState();
+    }, 10_000);
+    window.addEventListener('focus', resume);
+    window.addEventListener('pageshow', resume);
+    window.addEventListener('online', resume);
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', resume);
+      window.removeEventListener('pageshow', resume);
+      window.removeEventListener('online', resume);
+      document.removeEventListener('visibilitychange', resume);
+    };
+  }, [jobId, meta, phase, processing, recoverRemoteState]);
+
   const process = async (isRefine = false) => {
     if (!jobId || !meta || !videoRef.current || !maskRef.current) return;
     // Synchronous lock first — blocks a double-tap before setProcessing(true) renders.
@@ -155,6 +248,7 @@ export default function Editor() {
     const maskCanvas = maskRef.current.getMaskCanvas();
     if (!maskCanvas || !maskRef.current.hasMask()) return;
     processingLockRef.current = true;
+    completionAdoptedRef.current = false;
     setError(null);
     setFinalUrl(null);
     setProcessing(true);
@@ -210,8 +304,21 @@ export default function Editor() {
         maskCanvas,
         outputQuality,
         cancelRef: cancelRef.current,
-        onPhase: (ph, pr, msg) => { setPhase(ph); setProgress(pr); setStatusMessage(msg); },
+        onPhase: (ph, pr, msg) => {
+          setPhase(ph);
+          setProgress(pr);
+          setStatusMessage(msg);
+          void eraserApi.transition({
+            jobId,
+            to: ph,
+            progress: pr,
+            statusMessage: msg,
+            log: `remote phase=${ph} progress=${pr}`,
+          }).catch(() => undefined);
+        },
       });
+
+      if (completionAdoptedRef.current) return;
 
       let savedLibraryUrl = '';
       let librarySaveError = '';
@@ -307,6 +414,8 @@ export default function Editor() {
     setPhase('awaiting_mask'); setProgress(18); setProcessing(false); setHasMask(false);
     sourceFileRef.current = null;
     outputRef.current = null;
+    completionAdoptedRef.current = false;
+    recoveryInFlightRef.current = false;
     maskAnchorTimeRef.current = null;
   };
 

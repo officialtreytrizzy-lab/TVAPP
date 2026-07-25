@@ -17,6 +17,8 @@ export const ERASER_LIBRARY_EVENT = 'etreyser:library-updated';
 const ACTIVE_PROCESSING = new Set([
   'segmenting',
   'frame_extraction',
+  'sam2_tracking',
+  'propainter_inpainting',
   'optical_flow_tracking',
   'diffusion_inpainting',
   'audio_preserving_export',
@@ -380,7 +382,7 @@ async function deleteOutput(key: string | null): Promise<void> {
   ]);
 }
 
-async function discoverWorkerOutputUrl(jobId: string): Promise<string | null> {
+async function discoverWorkerBase(): Promise<string | null> {
   try {
     const response = await fetch('/api/v1/trecut/eraser/upload-target', {
       method: 'GET',
@@ -389,11 +391,103 @@ async function discoverWorkerOutputUrl(jobId: string): Promise<string | null> {
     if (!response.ok) return null;
     const payload = await response.json();
     const workerBase = String(payload.worker_base || payload.workerBase || '').replace(/\/$/, '');
-    if (!workerBase) return null;
-    return `${workerBase}/v1/video-eraser/jobs/${encodeURIComponent(jobId)}/output`;
+    return workerBase || null;
   } catch {
     return null;
   }
+}
+
+async function discoverWorkerOutputUrl(jobId: string): Promise<string | null> {
+  const workerBase = await discoverWorkerBase();
+  return workerBase ? `${workerBase}/v1/video-eraser/jobs/${encodeURIComponent(jobId)}/output` : null;
+}
+
+function normalizeRemotePhase(payload: Record<string, unknown>): string {
+  const raw = String(payload.phase || payload.status || '').toLowerCase();
+  if (raw.includes('complete') || raw.includes('done') || raw.includes('success')) return 'completed';
+  if (raw.includes('fail') || raw.includes('error')) return 'failed';
+  return raw || 'inpainting';
+}
+
+function remoteOutputUrl(payload: Record<string, unknown>, workerBase: string, jobId: string): string | null {
+  const raw = String(
+    payload.finalCompositeUrl || payload.final_composite_url
+      || payload.compositeOutputUrl || payload.composite_output_url
+      || payload.fullVideoUrl || payload.full_video_url
+      || payload.finalOutputUrl || payload.final_output_url
+      || payload.outputUrl || payload.output_url || '',
+  );
+  if (raw) return /^https?:\/\//i.test(raw) ? raw : `${workerBase}${raw.startsWith('/') ? '' : '/'}${raw}`;
+  return `${workerBase}/v1/video-eraser/jobs/${encodeURIComponent(jobId)}/output`;
+}
+
+async function reconcileRemoteJobRecord(jobId: string, workerBase?: string | null): Promise<LocalJob | null> {
+  const local = findJob(jobId);
+  if (!local || local.phase === 'cancelled') return local;
+  const base = workerBase || await discoverWorkerBase();
+  if (!base) return local;
+  try {
+    const response = await fetch(`${base}/v1/video-eraser/jobs/${encodeURIComponent(local.job_id)}`, {
+      method: 'GET',
+      cache: 'no-store',
+    });
+    if (response.status === 404) return local;
+    if (!response.ok) throw new Error(`Worker status HTTP ${response.status}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const remotePhase = normalizeRemotePhase(payload);
+    const remoteProgress = Number(payload.progress ?? local.progress ?? 0);
+    const remoteMessage = String(payload.statusMessage || payload.status_message || local.status_message || 'Processing video');
+    const remoteError = String(payload.error || payload.error_message || '');
+    const outputUrl = remotePhase === 'completed' ? remoteOutputUrl(payload, base, local.job_id) : null;
+    const changed = remotePhase !== local.phase
+      || (Number.isFinite(remoteProgress) && remoteProgress !== local.progress)
+      || remoteMessage !== local.status_message
+      || Boolean(outputUrl && outputUrl !== local.final_output_url)
+      || Boolean(remoteError && remoteError !== local.error_message);
+    if (!changed) return local;
+    const updated = updateJob(local.job_id, (cur) => {
+      cur.phase = remotePhase;
+      if (Number.isFinite(remoteProgress)) cur.progress = Math.max(0, Math.min(100, remoteProgress));
+      cur.status_message = remoteMessage;
+      if (remoteError) cur.error_message = remoteError;
+      if (remotePhase === 'completed') {
+        cur.progress = 100;
+        cur.status_message = remoteMessage || 'Done!';
+        cur.preview_url = outputUrl || cur.preview_url;
+        cur.final_output_url = outputUrl || cur.final_output_url;
+        cur.output_mime = cur.output_mime || 'video/mp4';
+        cur.audio_preserved = cur.audio_preserved ?? true;
+        cur.completed_at = cur.completed_at || nowIso();
+        cur.error_message = null;
+        appendLog(cur, 'recovered completed worker status after browser resume');
+      } else if (remotePhase === 'failed') {
+        cur.progress = 100;
+        cur.error_message = remoteError || remoteMessage;
+        appendLog(cur, `recovered failed worker status: ${cur.error_message}`);
+      } else {
+        appendLog(cur, `reconciled worker phase=${remotePhase} progress=${cur.progress}`);
+      }
+      return cur;
+    });
+    notifyLibraryUpdated();
+    return updated;
+  } catch {
+    return local;
+  }
+}
+
+async function reconcileRemoteJobsForCurrentDevice(): Promise<void> {
+  const deviceId = currentDeviceId();
+  const candidates = readJobs().filter((job) => (
+    job.device_id === deviceId
+    && job.phase !== 'completed'
+    && job.phase !== 'cancelled'
+    && job.selected_frame_index !== null
+  ));
+  if (!candidates.length) return;
+  const workerBase = await discoverWorkerBase();
+  if (!workerBase) return;
+  await Promise.all(candidates.slice(0, 8).map((job) => reconcileRemoteJobRecord(job.job_id, workerBase)));
 }
 
 async function requestPersistentDeviceStorage(): Promise<void> {
@@ -589,6 +683,7 @@ export const eraserApi = {
   },
 
   listJobs: async (): Promise<LocalJob[]> => {
+    await reconcileRemoteJobsForCurrentDevice();
     const deviceId = currentDeviceId();
     return readJobs()
       .filter((job) => job.device_id === deviceId)
@@ -596,12 +691,22 @@ export const eraserApi = {
   },
 
   listRecentCompletedJobs: async (): Promise<LocalJob[]> => {
+    await reconcileRemoteJobsForCurrentDevice();
     await pruneCompletedJobsForCurrentDevice();
     const deviceId = currentDeviceId();
     return readJobs()
       .filter((job) => job.device_id === deviceId && job.phase === 'completed')
       .sort((a, b) => completedSortTime(b) - completedSortTime(a))
       .slice(0, MAX_RECENT_COMPLETED_JOBS);
+  },
+
+  reconcileRemoteJob: async (jobId: string) => {
+    const reconciled = await reconcileRemoteJobRecord(jobId);
+    return reconciled ? publicJob(reconciled) : null;
+  },
+
+  reconcileRemoteJobs: async (): Promise<void> => {
+    await reconcileRemoteJobsForCurrentDevice();
   },
 
   getDeviceIdentity: (): DeviceIdentity => getDeviceIdentity(),
