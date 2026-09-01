@@ -11,7 +11,7 @@ on:
 
 concurrency:
   group: trizzy-audio-ace-production
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   MODAL_EXPECTED_WORKSPACE: officialtreytrizzy-lab
@@ -82,5 +82,18 @@ jobs:
             return 1
           }
 
-          check_ready "turbo" "https://officialtreytrizzy-lab--trizzy-audio-ace-turbo-api.modal.run"
-          check_ready "base" "https://officialtreytrizzy-lab--trizzy-audio-ace-base-api.modal.run"
+          check_ready "turbo" "https://officialtreytrizzy-lab--trizzy-audio-ace-turbo-api.modal.run" &
+          turbo_pid=$!
+          check_ready "base" "https://officialtreytrizzy-lab--trizzy-audio-ace-base-api.modal.run" &
+          base_pid=$!
+
+          turbo_status=0
+          base_status=0
+
+          wait "$turbo_pid" || turbo_status=$?
+          wait "$base_pid" || base_status=$?
+
+          if [ "$turbo_status" -ne 0 ] || [ "$base_status" -ne 0 ]; then
+            echo "ACE readiness failed: turbo=$turbo_status base=$base_status"
+            exit 1
+          fi
