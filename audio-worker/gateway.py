@@ -13,19 +13,33 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-SUPABASE_URL = os.environ.get(
+PRIMARY_SUPABASE_URL = os.environ.get(
     "TRIZZY_SUPABASE_URL",
+    "https://lxdpbxnnohtzcqetbzxo.supabase.co",
+).rstrip("/")
+PRIMARY_SUPABASE_KEY = os.environ.get(
+    "TRIZZY_SUPABASE_PUBLISHABLE_KEY",
+    "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
+)
+LEGACY_SUPABASE_URL = os.environ.get(
+    "TRIZZY_SUPABASE_LEGACY_URL",
     "https://sdibjsjokhadjzruehbu.supabase.co",
 ).rstrip("/")
-SUPABASE_PUBLISHABLE_KEY = os.environ.get(
-    "TRIZZY_SUPABASE_PUBLISHABLE_KEY",
+LEGACY_SUPABASE_KEY = os.environ.get(
+    "TRIZZY_SUPABASE_LEGACY_PUBLISHABLE_KEY",
     "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
 )
+
+SUPABASE_PROJECTS = [
+    (PRIMARY_SUPABASE_URL, PRIMARY_SUPABASE_KEY),
+    (LEGACY_SUPABASE_URL, LEGACY_SUPABASE_KEY),
+]
+
 ACE_URL = os.environ.get("TRIZZY_ACE_LOCAL_URL", "http://127.0.0.1:8001").rstrip("/")
 REF_DIR = Path(os.environ.get("TRIZZY_REFERENCE_DIR", "/tmp/trizzy-audio-refs"))
 REF_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Trizzy ACE Gateway", version="1.0.0")
+app = FastAPI(title="Trizzy ACE Gateway", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,16 +54,28 @@ async def require_user(authorization: str | None) -> dict:
         raise HTTPException(status_code=401, detail="Authentication required")
 
     async with httpx.AsyncClient(timeout=15.0) as client:
-        response = await client.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={
-                "apikey": SUPABASE_PUBLISHABLE_KEY,
-                "Authorization": authorization,
-            },
-        )
-    if response.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
-    return response.json()
+        for supabase_url, publishable_key in SUPABASE_PROJECTS:
+            if not supabase_url or not publishable_key:
+                continue
+
+            try:
+                response = await client.get(
+                    f"{supabase_url}/auth/v1/user",
+                    headers={
+                        "apikey": publishable_key,
+                        "Authorization": authorization,
+                    },
+                )
+            except httpx.HTTPError:
+                continue
+
+            if response.status_code == 200:
+                user = response.json()
+                if isinstance(user, dict):
+                    user["_trizzy_supabase_url"] = supabase_url
+                return user
+
+    raise HTTPException(status_code=401, detail="Invalid or expired session")
 
 
 def _public_https_url(url: str) -> str:
@@ -60,10 +86,17 @@ def _public_https_url(url: str) -> str:
     try:
         addresses = {
             item[4][0]
-            for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+            for item in socket.getaddrinfo(
+                parsed.hostname,
+                parsed.port or 443,
+                type=socket.SOCK_STREAM,
+            )
         }
     except socket.gaierror as exc:
-        raise HTTPException(status_code=400, detail="Reference-audio hostname could not be resolved") from exc
+        raise HTTPException(
+            status_code=400,
+            detail="Reference-audio hostname could not be resolved",
+        ) from exc
 
     for raw in addresses:
         ip = ipaddress.ip_address(raw)
@@ -75,7 +108,10 @@ def _public_https_url(url: str) -> str:
             or ip.is_reserved
             or ip.is_unspecified
         ):
-            raise HTTPException(status_code=400, detail="Reference-audio URL is not public")
+            raise HTTPException(
+                status_code=400,
+                detail="Reference-audio URL is not public",
+            )
     return url
 
 
@@ -98,7 +134,10 @@ async def download_reference(url: str) -> str:
                     async for chunk in response.aiter_bytes(1024 * 1024):
                         total += len(chunk)
                         if total > 300 * 1024 * 1024:
-                            raise HTTPException(status_code=413, detail="Reference audio exceeds 300 MB")
+                            raise HTTPException(
+                                status_code=413,
+                                detail="Reference audio exceeds 300 MB",
+                            )
                         handle.write(chunk)
         if target.stat().st_size == 0:
             raise HTTPException(status_code=400, detail="Reference audio is empty")
@@ -115,7 +154,10 @@ async def proxy_json(path: str, body: dict, authorization: str | None) -> dict:
     try:
         data = response.json()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail="ACE-Step returned a non-JSON response") from exc
+        raise HTTPException(
+            status_code=502,
+            detail="ACE-Step returned a non-JSON response",
+        ) from exc
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=data)
     return data
@@ -129,7 +171,15 @@ async def health():
         backend = "ready" if response.status_code == 200 else f"http_{response.status_code}"
     except Exception:
         backend = "starting"
-    return {"status": "ok", "gateway": "ready", "ace_backend": backend}
+    return {
+        "status": "ok",
+        "gateway": "ready",
+        "ace_backend": backend,
+        "supabase_primary": PRIMARY_SUPABASE_URL,
+        "legacy_auth_enabled": bool(
+            LEGACY_SUPABASE_URL and LEGACY_SUPABASE_KEY
+        ),
+    }
 
 
 @app.get("/ready")
@@ -186,7 +236,13 @@ async def release_task(
             local = await download_reference(str(src_url))
             downloaded.append(local)
             body["src_audio_path"] = local
-        elif reference_url and task_type in {"cover", "repaint", "lego", "extract", "complete"}:
+        elif reference_url and task_type in {
+            "cover",
+            "repaint",
+            "lego",
+            "extract",
+            "complete",
+        }:
             local = await download_reference(str(reference_url))
             downloaded.append(local)
             body["src_audio_path"] = local
@@ -202,13 +258,12 @@ async def release_task(
             raise HTTPException(status_code=response.status_code, detail=data)
         return data
     finally:
-        # ACE-Step may defer opening reference audio until a queued job begins. Keep
-        # the source available for up to one hour so backlog cannot invalidate it.
         if downloaded:
             async def cleanup(paths: list[str]):
                 await asyncio.sleep(3600)
                 for path in paths:
                     Path(path).unlink(missing_ok=True)
+
             asyncio.create_task(cleanup(downloaded))
 
 
@@ -253,7 +308,10 @@ async def audio(
     return Response(
         content=response.content,
         status_code=response.status_code,
-        media_type=response.headers.get("content-type", "application/octet-stream"),
+        media_type=response.headers.get(
+            "content-type",
+            "application/octet-stream",
+        ),
         headers={
             "Content-Disposition": response.headers.get(
                 "content-disposition",
