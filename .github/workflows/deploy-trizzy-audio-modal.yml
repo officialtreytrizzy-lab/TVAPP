@@ -54,3 +54,33 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: modal deploy audio-worker/modal_app.py
+
+      - name: Verify Turbo and Base model readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_ready() {
+            local name="$1"
+            local url="$2"
+            local body="/tmp/${name}-ready.json"
+
+            for attempt in $(seq 1 120); do
+              code="$(curl -sS -o "$body" -w "%{http_code}" --max-time 20 "$url/ready" || true)"
+              if [ "$code" = "200" ]; then
+                echo "$name is ready"
+                cat "$body"
+                return 0
+              fi
+
+              echo "$name readiness attempt $attempt/120 returned HTTP ${code:-none}"
+              sleep 10
+            done
+
+            echo "$name did not become ready"
+            cat "$body" 2>/dev/null || true
+            return 1
+          }
+
+          check_ready "turbo" "https://officialtreytrizzy-lab--trizzy-audio-ace-turbo-api.modal.run"
+          check_ready "base" "https://officialtreytrizzy-lab--trizzy-audio-ace-base-api.modal.run"
