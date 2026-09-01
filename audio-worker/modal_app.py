@@ -36,6 +36,8 @@ COMMON_ENV = {
     "HF_HOME": "/opt/ace-step/checkpoints/hf-cache",
     "TRIZZY_SUPABASE_URL": "https://lxdpbxnnohtzcqetbzxo.supabase.co",
     "TRIZZY_SUPABASE_PUBLISHABLE_KEY": "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
+    "TRIZZY_SUPABASE_LEGACY_URL": "https://sdibjsjokhadjzruehbu.supabase.co",
+    "TRIZZY_SUPABASE_LEGACY_PUBLISHABLE_KEY": "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
     "TRIZZY_ACE_LOCAL_URL": "http://127.0.0.1:8001",
 }
 
