@@ -36,6 +36,7 @@ COMMON_ENV = {
     "ACESTEP_API_WORKERS": "1",
     "ACESTEP_DEVICE": "cuda",
     "ACESTEP_INIT_LLM": "true",
+    "ACESTEP_NO_INIT": "false",
     "ACESTEP_LM_BACKEND": "vllm",
     "ACESTEP_LM_MODEL_PATH": "acestep-5Hz-lm-1.7B",
     "ACESTEP_QUEUE_WORKERS": "1",
