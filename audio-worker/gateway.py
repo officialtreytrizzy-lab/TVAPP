@@ -132,6 +132,40 @@ async def health():
     return {"status": "ok", "gateway": "ready", "ace_backend": backend}
 
 
+@app.get("/ready")
+async def ready():
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{ACE_URL}/health")
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=503,
+                detail=f"ACE-Step health returned HTTP {response.status_code}",
+            )
+
+        payload = response.json()
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        if isinstance(data, dict) and data.get("models_initialized") is False:
+            raise HTTPException(
+                status_code=503,
+                detail="ACE-Step models are still initializing",
+            )
+
+        return {
+            "status": "ready",
+            "gateway": "ready",
+            "ace_backend": "ready",
+            "ace_health": payload,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"ACE-Step backend is not ready: {type(exc).__name__}: {exc}",
+        ) from exc
+
+
 @app.post("/release_task")
 async def release_task(
     request: Request,
@@ -168,11 +202,11 @@ async def release_task(
             raise HTTPException(status_code=response.status_code, detail=data)
         return data
     finally:
-        # ACE-Step copies/loads uploaded audio during task submission. Delay cleanup
-        # slightly so its in-process queue can open the path even under load.
+        # ACE-Step may defer opening reference audio until a queued job begins. Keep
+        # the source available for up to one hour so backlog cannot invalidate it.
         if downloaded:
             async def cleanup(paths: list[str]):
-                await asyncio.sleep(30)
+                await asyncio.sleep(3600)
                 for path in paths:
                     Path(path).unlink(missing_ok=True)
             asyncio.create_task(cleanup(downloaded))
