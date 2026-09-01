@@ -36,6 +36,8 @@ SUPABASE_PROJECTS = [
 ]
 
 ACE_URL = os.environ.get("TRIZZY_ACE_LOCAL_URL", "http://127.0.0.1:8001").rstrip("/")
+EXPECTED_ACE_MODEL = os.environ.get("TRIZZY_EXPECTED_ACE_MODEL", "").strip()
+EXPECTED_LM_MODEL = os.environ.get("TRIZZY_EXPECTED_LM_MODEL", "").strip()
 REF_DIR = Path(os.environ.get("TRIZZY_REFERENCE_DIR", "/tmp/trizzy-audio-refs"))
 REF_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -199,6 +201,38 @@ async def ready():
             raise HTTPException(
                 status_code=503,
                 detail="ACE-Step models are still initializing",
+            )
+
+        if isinstance(data, dict) and data.get("llm_initialized") is False:
+            raise HTTPException(
+                status_code=503,
+                detail="ACE-Step language model is not initialized",
+            )
+
+        if (
+            EXPECTED_ACE_MODEL
+            and isinstance(data, dict)
+            and data.get("loaded_model") != EXPECTED_ACE_MODEL
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "ACE-Step loaded unexpected DiT model: "
+                    f"{data.get('loaded_model')!r}; expected {EXPECTED_ACE_MODEL!r}"
+                ),
+            )
+
+        if (
+            EXPECTED_LM_MODEL
+            and isinstance(data, dict)
+            and data.get("loaded_lm_model") != EXPECTED_LM_MODEL
+        ):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "ACE-Step loaded unexpected LM model: "
+                    f"{data.get('loaded_lm_model')!r}; expected {EXPECTED_LM_MODEL!r}"
+                ),
             )
 
         return {

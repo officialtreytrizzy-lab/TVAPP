@@ -49,6 +49,7 @@ COMMON_ENV = {
     "TRIZZY_SUPABASE_LEGACY_URL": "https://sdibjsjokhadjzruehbu.supabase.co",
     "TRIZZY_SUPABASE_LEGACY_PUBLISHABLE_KEY": "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
     "TRIZZY_ACE_LOCAL_URL": "http://127.0.0.1:8001",
+    "TRIZZY_EXPECTED_LM_MODEL": "acestep-5Hz-lm-1.7B",
 }
 
 
@@ -112,6 +113,7 @@ def start_stack(config_path: str) -> None:
 
     env = _ace_env()
     env["ACESTEP_CONFIG_PATH"] = config_path
+    env["TRIZZY_EXPECTED_ACE_MODEL"] = config_path
 
     subprocess.Popen(
         [
@@ -123,6 +125,9 @@ def start_stack(config_path: str) -> None:
             "127.0.0.1",
             "--port",
             "8001",
+            "--init-llm",
+            "--lm-model-path",
+            env["ACESTEP_LM_MODEL_PATH"],
         ],
         cwd=ACE_ROOT,
         env=env,
