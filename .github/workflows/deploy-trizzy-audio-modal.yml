@@ -49,6 +49,15 @@ jobs:
             exit 1
           }
 
+      - name: Warm persistent ACE model volume
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal run audio-worker/modal_app.py::warm_models
+          echo "Top-level model volume contents:"
+          modal volume ls trizzy-audio-ace-models /
+
       - name: Deploy authenticated Turbo and Base ACE APIs
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -56,6 +65,9 @@ jobs:
         run: modal deploy audio-worker/modal_app.py
 
       - name: Verify Turbo and Base model readiness
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +77,7 @@ jobs:
             local url="$2"
             local body="/tmp/${name}-ready.json"
 
-            for attempt in $(seq 1 120); do
+            for attempt in $(seq 1 60); do
               code="$(curl -sS -o "$body" -w "%{http_code}" --max-time 20 "$url/ready" || true)"
               if [ "$code" = "200" ]; then
                 echo "$name is ready"
@@ -73,7 +85,10 @@ jobs:
                 return 0
               fi
 
-              echo "$name readiness attempt $attempt/120 returned HTTP ${code:-none}"
+              echo "$name readiness attempt $attempt/60 returned HTTP ${code:-none}"
+              if [ $((attempt % 5)) -eq 0 ]; then
+                cat "$body" 2>/dev/null || true
+              fi
               sleep 10
             done
 
@@ -95,5 +110,7 @@ jobs:
 
           if [ "$turbo_status" -ne 0 ] || [ "$base_status" -ne 0 ]; then
             echo "ACE readiness failed: turbo=$turbo_status base=$base_status"
+            echo "Recent Modal application logs:"
+            modal app logs trizzy-audio-ace --tail 500 --timestamps || true
             exit 1
           fi
