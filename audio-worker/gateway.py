@@ -15,11 +15,11 @@ from fastapi.responses import Response
 
 SUPABASE_URL = os.environ.get(
     "TRIZZY_SUPABASE_URL",
-    "https://sdibjsjokhadjzruehbu.supabase.co",
+    "https://lxdpbxnnohtzcqetbzxo.supabase.co",
 ).rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = os.environ.get(
     "TRIZZY_SUPABASE_PUBLISHABLE_KEY",
-    "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
+    "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
 )
 ACE_URL = os.environ.get("TRIZZY_ACE_LOCAL_URL", "http://127.0.0.1:8001").rstrip("/")
 REF_DIR = Path(os.environ.get("TRIZZY_REFERENCE_DIR", "/tmp/trizzy-audio-refs"))
