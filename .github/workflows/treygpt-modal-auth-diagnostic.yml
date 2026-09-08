@@ -1,0 +1,107 @@
+name: TreyGPT Modal Auth Diagnostic
+
+on:
+  push:
+    paths:
+      - '.github/workflows/treygpt-modal-auth-diagnostic.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - name: Install Modal CLI
+        run: python -m pip install --quiet --upgrade modal
+
+      - name: Show redacted Modal identity and app inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal config show --redact || true
+          modal app list --json > /tmp/apps.json
+          python - <<'PY'
+          import json
+          data=json.load(open('/tmp/apps.json'))
+          print(json.dumps(data, indent=2))
+          PY
+
+      - name: List secret names only
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal secret list --json > /tmp/secrets.json
+          python - <<'PY'
+          import json
+          data=json.load(open('/tmp/secrets.json'))
+          if isinstance(data, dict):
+              rows=data.get('secrets') or data.get('items') or data.get('data') or []
+          else:
+              rows=data
+          names=[]
+          for row in rows or []:
+              if isinstance(row, dict):
+                  name=row.get('name') or row.get('label')
+                  if name: names.append(name)
+              elif isinstance(row, str):
+                  names.append(row)
+          print('SECRET_NAMES=' + json.dumps(sorted(set(names))))
+          PY
+
+      - name: Warm TreyGPT and inspect container metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS --max-time 30 'https://treytrizzyofficial--trey-gpt-trey-gpt.modal.run/health' >/tmp/health.json || true
+          python - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/health.json'))
+              keep={k:d.get(k) for k in ('status','release','display_model','model_provider','server_mode','gpu','qwen_id') if k in d}
+              print('HEALTH=' + json.dumps(keep, sort_keys=True))
+          except Exception as e:
+              print('HEALTH_PARSE_ERROR=' + str(e))
+          PY
+          sleep 2
+          modal container list --json > /tmp/containers.json || true
+          python - <<'PY'
+          import json
+          try:
+              data=json.load(open('/tmp/containers.json'))
+              print(json.dumps(data, indent=2))
+          except Exception as e:
+              print('CONTAINER_PARSE_ERROR=' + str(e))
+          PY
+
+      - name: Inspect OAuth-related environment variable names only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, subprocess
+          try:
+              data=json.load(open('/tmp/containers.json'))
+          except Exception:
+              data=[]
+          rows=data.get('containers', data.get('items', [])) if isinstance(data,dict) else data
+          candidates=[]
+          for row in rows or []:
+              if not isinstance(row,dict): continue
+              text=json.dumps(row).lower()
+              cid=row.get('container_id') or row.get('id')
+              if cid and ('trey-gpt' in text or 'trey_gpt' in text): candidates.append(cid)
+          if not candidates:
+              for row in rows or []:
+                  if isinstance(row,dict):
+                      cid=row.get('container_id') or row.get('id')
+                      if cid: candidates.append(cid)
+          if not candidates:
+              print('NO_RUNNING_CONTAINER_FOUND')
+              raise SystemExit(0)
+          cid=candidates[0]
+          code="import os; print('OAUTH_ENV_NAMES=' + ','.join(sorted(k for k in os.environ if any(x in k.upper() for x in ('GOOGLE','OAUTH','AUTH_CLIENT')))))"
+          subprocess.run(['modal','container','exec',cid,'python','-c',code], check=False)
+          PY
