@@ -1,0 +1,32 @@
+name: TreyGPT Auth JS Diagnostic
+
+on:
+  push:
+    paths:
+      - '.github/workflows/treygpt-auth-js-diagnostic.yml'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Extract auth-related production client snippets
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL 'https://treygpt-web.vercel.app/app.js' -o /tmp/app.js
+          python - <<'PY'
+          import re
+          s=open('/tmp/app.js',encoding='utf-8',errors='replace').read()
+          print('APP_JS_BYTES='+str(len(s)))
+          terms=['google/start','google/callback','migrate-session','google_enabled','surface=','auth/status','legacy']
+          for term in terms:
+              print('\n=== '+term+' ===')
+              starts=[m.start() for m in re.finditer(re.escape(term),s,re.I)]
+              print('COUNT='+str(len(starts)))
+              for p in starts[:8]:
+                  lo=max(0,p-700); hi=min(len(s),p+1200)
+                  snippet=s[lo:hi].replace('\n',' ')
+                  print(snippet)
+                  print('---')
+          PY
