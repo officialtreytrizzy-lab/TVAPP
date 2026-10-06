@@ -45,10 +45,12 @@ COMMON_ENV = {
     "ACESTEP_CHECKPOINTS_DIR": CHECKPOINTS,
     "ACESTEP_DOWNLOAD_SOURCE": "huggingface",
     "HF_HOME": f"{CHECKPOINTS}/hf-cache",
-    "TRIZZY_SUPABASE_URL": "https://lxdpbxnnohtzcqetbzxo.supabase.co",
-    "TRIZZY_SUPABASE_PUBLISHABLE_KEY": "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
-    "TRIZZY_SUPABASE_LEGACY_URL": "https://sdibjsjokhadjzruehbu.supabase.co",
-    "TRIZZY_SUPABASE_LEGACY_PUBLISHABLE_KEY": "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
+    "TRIZZY_SUPABASE_URL": "https://zskarujbvzhwwunlubsh.supabase.co",
+    "TRIZZY_SUPABASE_PUBLISHABLE_KEY": "sb_publishable_sJJXw5gTRqXK1mwW4Uo-qA_RlNqWe97",
+    "TRIZZY_SUPABASE_LEGACY_URL": "https://lxdpbxnnohtzcqetbzxo.supabase.co",
+    "TRIZZY_SUPABASE_LEGACY_PUBLISHABLE_KEY": "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
+    "TRIZZY_SUPABASE_LEGACY_2_URL": "https://sdibjsjokhadjzruehbu.supabase.co",
+    "TRIZZY_SUPABASE_LEGACY_2_PUBLISHABLE_KEY": "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
     "TRIZZY_ACE_LOCAL_URL": "http://127.0.0.1:8001",
     "TRIZZY_EXPECTED_LM_MODEL": "acestep-5Hz-lm-1.7B",
 }
@@ -83,14 +85,14 @@ def warm_models():
     # The main bundle contains VAE, text encoder, Turbo DiT, and the 1.7B LM.
     _run_download([])
 
-    # Base is distributed separately and must be present for final/repaint work.
-    _run_download(["--model", "acestep-v15-base", "--skip-main"])
+    # XL Base is distributed separately and is the quality/final cover lane.
+    _run_download(["--model", "acestep-v15-xl-base", "--skip-main"])
 
     models.commit()
 
     required = [
         "acestep-v15-turbo",
-        "acestep-v15-base",
+        "acestep-v15-xl-base",
         "acestep-5Hz-lm-1.7B",
         "vae",
     ]
@@ -178,4 +180,4 @@ def turbo_api():
 )
 @modal.web_server(8000, startup_timeout=60 * 15)
 def base_api():
-    start_stack("acestep-v15-base")
+    start_stack("acestep-v15-xl-base")
