@@ -3,8 +3,8 @@
 Production ACE-Step 1.5 worker for Trizzy Canvas.
 
 - `turbo_api`: fast previews and normal generation.
-- `base_api`: higher-quality/final/editing workloads.
-- The public gateway requires a valid Supabase bearer token for generation,
+- `base_api`: stock ACE-Step 1.5 XL Base for higher-quality/final cover and editing workloads.
+- The public gateway requires a valid current or legacy Trizzy Supabase bearer token for generation,
   polling, models, formatting, and audio download.
 - ACE-Step itself listens only on localhost inside the Modal container.
 - Reference audio URLs are downloaded by the gateway after public-HTTPS/SSRF checks.
