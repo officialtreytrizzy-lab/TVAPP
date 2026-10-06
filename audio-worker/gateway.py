@@ -15,24 +15,33 @@ from fastapi.responses import Response
 
 PRIMARY_SUPABASE_URL = os.environ.get(
     "TRIZZY_SUPABASE_URL",
-    "https://lxdpbxnnohtzcqetbzxo.supabase.co",
+    "https://zskarujbvzhwwunlubsh.supabase.co",
 ).rstrip("/")
 PRIMARY_SUPABASE_KEY = os.environ.get(
     "TRIZZY_SUPABASE_PUBLISHABLE_KEY",
-    "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
+    "sb_publishable_sJJXw5gTRqXK1mwW4Uo-qA_RlNqWe97",
 )
 LEGACY_SUPABASE_URL = os.environ.get(
     "TRIZZY_SUPABASE_LEGACY_URL",
-    "https://sdibjsjokhadjzruehbu.supabase.co",
+    "https://lxdpbxnnohtzcqetbzxo.supabase.co",
 ).rstrip("/")
 LEGACY_SUPABASE_KEY = os.environ.get(
     "TRIZZY_SUPABASE_LEGACY_PUBLISHABLE_KEY",
+    "sb_publishable_nQN7Ns7ldNX5Xl7o8bxZiA_ynYR_qIE",
+)
+LEGACY_2_SUPABASE_URL = os.environ.get(
+    "TRIZZY_SUPABASE_LEGACY_2_URL",
+    "https://sdibjsjokhadjzruehbu.supabase.co",
+).rstrip("/")
+LEGACY_2_SUPABASE_KEY = os.environ.get(
+    "TRIZZY_SUPABASE_LEGACY_2_PUBLISHABLE_KEY",
     "sb_publishable_GZT1zi2PQt-8-0QM6sl5yA_1nCM867H",
 )
 
 SUPABASE_PROJECTS = [
     (PRIMARY_SUPABASE_URL, PRIMARY_SUPABASE_KEY),
     (LEGACY_SUPABASE_URL, LEGACY_SUPABASE_KEY),
+    (LEGACY_2_SUPABASE_URL, LEGACY_2_SUPABASE_KEY),
 ]
 
 ACE_URL = os.environ.get("TRIZZY_ACE_LOCAL_URL", "http://127.0.0.1:8001").rstrip("/")
